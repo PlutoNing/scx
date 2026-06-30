@@ -6,7 +6,7 @@ fn main() {
     // which eliminates ALL stats/telemetry code at compile time (zero overhead).
     // Debug builds retain full --verbose/TUI support via volatile RODATA toggle.
     let profile = std::env::var("PROFILE").unwrap_or_default();
-    let base_flags = "-O2 -mcpu=v4 -fno-stack-protector -fno-asynchronous-unwind-tables";
+    let base_flags = "-O2 -mcpu=v3 -fno-stack-protector -fno-asynchronous-unwind-tables";
     let cflags = if profile == "release" {
         format!("{} -DCAKE_RELEASE=1", base_flags)
     } else {
