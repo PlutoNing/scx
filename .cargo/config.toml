@@ -1,2 +1,4 @@
 [alias]
 xtask = "run --package xtask --"
+[patch.crates-io]
+libbpf-sys = { path = "local_crates/libbpf-sys" }

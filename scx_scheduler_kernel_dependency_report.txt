@@ -1,0 +1,445 @@
+================================================================================
+scx_cake / scx_lavd / scx_layered 内核依赖与 tkernel5 支持情况分析报告
+================================================================================
+生成时间       : 2026-07-05
+分析对象       : sched-ext 用户态调度器 scx_cake、scx_lavd、scx_layered
+scx 代码库     : /data/home/paulning/tk5/scx (HEAD 4501c090，2026-06-30)
+下游内核仓库   : /data/home/paulning/tk5/tkernel5
+下游当前分支   : paul/scx-scheduler-set3
+下游基线内核   : Linux 6.6 (VERSION=6, PATCHLEVEL=6)
+下游 sched_ext : 回合到 v6.16 附近（含 sched_ext: idle: Handle migration-
+                 disabled tasks in idle selection 等一系列 v6.16-rc 补丁）
+
+
+================================================================================
+一、调度器版本、用途摘要
+================================================================================
+
+1. scx_cake  (scheds/rust/scx_cake, 版本 1.1.2)
+   - 面向 AMD/Intel 现代游戏平台的 CPU 调度器，思想借鉴网络 CAKE (DRR++)
+   - 4 类任务：GAME / NORMAL / HOG / BG，自动识别 Steam/Wine/Proton 进程
+   - Per-LLC DSQ 分片、EEVDF 风格加权、无全局原子操作
+   - README 明确要求 Linux 6.12+
+
+2. scx_lavd  (scheds/rust/scx_lavd, 版本 1.1.1)
+   - Latency-criticality Aware Virtual Deadline 调度器
+   - 主要为交互 / 游戏工作负载设计，兼顾吞吐与尾延时
+   - 依赖 futex 追踪（ftrace 或 tracepoint）提供 lock holder 时间片扩展
+   - CI 里将 stable/6_12 列入 blocklist（issue #3046），暗示实际最小可用
+     内核版本 > 6.12
+
+3. scx_layered  (scheds/rust/scx_layered, 版本 1.1.1)
+   - 多层可配置的 BPF/用户态混合调度器（Meta 出品）
+   - 按 cgroup / 匹配规则将任务分层，每层独立策略
+   - 支持 GPU 感知、antistall、util-compensation、queued wakeup 等
+
+
+================================================================================
+二、每个调度器最低可运行的内核版本
+================================================================================
+
+【结论】
+
+  调度器          官方 README 门槛   实际最低（含硬依赖）   备注
+  ---------------------------------------------------------------------------
+  scx_cake        v6.12+             v6.12 + BPF Arena       硬编译期依赖 BPF
+                                     （即 ≥ v6.12 sched_ext  Arena（v6.10 引入）
+                                       + ≥ v6.10 BPF Arena）
+  scx_lavd        v6.12+             同上                    同上；且 CI 已排除
+                                                             stable/6.12
+  scx_layered     v6.12+             v6.12 sched_ext         不硬依赖 BPF Arena
+                                     （建议 ≥ v6.15/6.16）    （build.rs 未链接
+                                                             lib/arena.bpf.c）
+
+【依据】
+
+- scx 上游 README.md 第 34 行：
+    “sched_ext is supported by the upstream kernel starting from version 6.12”
+
+- scx_cake/README.md 明确写：Kernel = Linux 6.12+
+
+- 三者 build.rs 差异（关键）：
+    scx_cake/build.rs   显式添加 lib/arena.bpf.c、lib/sdt_alloc.bpf.c，
+                        cake.bpf.c 亦 #include <lib/arena_map.h>
+    scx_lavd/build.rs   显式添加 lib/arena.bpf.c、lib/sdt_alloc.bpf.c，
+                        使用 ArenaLib::init() 加载
+    scx_layered/build.rs 只链接 timer/util/pmu，没有 arena.bpf.c，
+                        主 BPF 代码不引用 arena_map.h / __arena，
+                        任务上下文用 BPF_MAP_TYPE_TASK_STORAGE 完成
+
+- 三者共享的 lib/ 头文件包含 scx_bpf_now、scx_bpf_select_cpu_and、
+  scx_bpf_cpu_curr、scx_bpf_dsq_peek、bpf_cpumask_populate 等 kfunc。
+  上游 scheds/include/scx/compat.bpf.h 已给出 __COMPAT_ 宏，对多数运行时
+  kfunc 缺失做了回退；因此 v6.12 sched_ext 基线即可加载调度器骨架，但
+  编译期 BPF Arena 属性（addr_space_cast、__arena 指针、BPF_MAP_TYPE_ARENA
+  map 类型）是一个**加载期硬门槛**。
+
+
+================================================================================
+三、三个调度器依赖的关键 BPF / 调度器特性
+================================================================================
+
+按上游引入版本汇总（源自 scheds/include/scx/compat.bpf.h 与 compat.h 中的
+注释以及 kernel/sched/ext.c 中的历史）：
+
+── 共同用到的 sched_ext kfunc 与 struct_ops ──
+
+  版本      特性                                              使用者
+  ------------------------------------------------------------------------
+  v6.12    sched_ext 主线上游合并；SCX_OPS_KEEP_BUILTIN_IDLE   全部
+           SCX_OPS_ENQ_LAST / ENQ_EXITING / SWITCH_PARTIAL     全部
+           scx_bpf_dsq_insert（原 scx_bpf_dispatch）           全部
+           scx_bpf_dsq_insert_vtime                            cake/lavd/
+                                                               layered
+           scx_bpf_kick_cpu / SCX_KICK_PREEMPT/IDLE            全部
+           scx_bpf_cpuperf_set / _cur / _cap                   cake/lavd/
+                                                               layered
+           scx_bpf_task_cgroup                                 lavd/layered
+           scx_bpf_reenqueue_local                             layered/lavd
+           scx_bpf_dsq_nr_queued                               全部
+           ops.select_cpu / enqueue / dispatch / running /     全部
+                stopping / init_task / exit_task / init / exit
+           SCX_DSQ_LOCAL / _LOCAL_ON                           全部
+           BPF task_storage（BPF_MAP_TYPE_TASK_STORAGE）        全部
+
+  v6.13    scx_bpf_dsq_move[_vtime] / _to_local / _set_slice   全部
+           kfunc 命名从 dispatch → dsq 迁移，旧名 __compat      -
+
+  v6.14    scx_bpf_now()                                       全部（有回退到
+                                                               bpf_ktime_get_ns）
+           SCX_OPS_ENQ_MIGRATION_DISABLED                      lavd
+           SCX_ENQ_CPU_SELECTED                                cake/layered
+
+  v6.15    bpf_cpumask_populate                                cake/lavd
+                                                               （scx_bitmap_to_bpf）
+           NUMA per-node idle 系列 kfunc：                     lavd
+             scx_bpf_cpu_node / nr_node_ids
+             scx_bpf_get_idle_cpumask_node / smtmask_node
+             scx_bpf_pick_idle_cpu_node / pick_any_cpu_node
+           SCX_OPS_BUILTIN_IDLE_PER_NODE                       lavd
+           SCX_OPS_ALLOW_QUEUED_WAKEUP                         layered
+           scx_bpf_events                                      util 库
+           SCHED_DEBUG 无条件化                                 -
+
+  v6.16    scx_bpf_cpu_rq()                                    作为 cpu_curr
+                                                               fallback 使用
+           scx_bpf_select_cpu_dfl 与相关重构                    全部
+
+  v6.17    scx_bpf_select_cpu_and()（cake 中直接测试            cake/layered
+                __COMPAT_HAS_scx_bpf_select_cpu_and 选择路径）
+           ops.cgroup_set_bandwidth                            lavd
+           验证器改进（可减少 layered 中的 layer_id 重检查）    layered (可选)
+
+  v6.18    scx_bpf_cpu_curr()（cake_layered/lavd 通过           layered/lavd
+                __COMPAT_scx_bpf_cpu_curr fallback）
+
+  v6.19    scx_bpf_dsq_peek()（lavd 通过 __COMPAT_ 回退到       lavd
+                bpf_iter_scx_dsq）
+           scx_bpf_dsq_insert / _vtime 使用结构体参数变体      compat 层
+           scx_bpf_task_set_slice / _set_dsq_vtime             未使用
+           SCX_OPS_ALWAYS_ENQ_IMMED                            未使用
+           ops.cgroup_set_idle                                 未使用
+
+  v6.20    scx_bpf_dsq_reenq                                   未使用
+
+  v7.1     ops.sub_attach / sub_detach / sub_cgroup_id         未使用
+
+── BPF 核心特性 ──
+
+  版本      特性                                              使用者
+  ------------------------------------------------------------------------
+  v6.10    BPF_MAP_TYPE_ARENA、addr_space_cast、__arena       cake、lavd
+           指针、bpf_arena_alloc_pages                        （layered 未编译进
+                                                              arena.bpf.c 与
+                                                              sdt_alloc.bpf.c，
+                                                              不依赖）
+  v6.10    may_goto 指令                                      全部（间接）
+  v6.9-11  bpf_cpumask kfunc 家族、iter kfunc、struct_ops     全部（间接）
+           改进等（大部分在 sched_ext 依赖链之外）
+
+── 其他运行时/内核配置需求 ──
+
+  CONFIG_SCHED_CLASS_EXT=y
+  CONFIG_BPF / BPF_SYSCALL / BPF_JIT / BPF_JIT_ALWAYS_ON
+  CONFIG_DEBUG_INFO_BTF=y（BTF 必须可用，pahole >= 1.26）
+  CONFIG_FUNCTION_TRACER=y   （scx_lavd 用于 futex 追踪）
+  CONFIG_KALLSYMS_ALL=y      （scx_layered 通过 /proc/kallsyms 读取
+                              ext_sched_class 与 idle_sched_class 地址）
+  CONFIG_NUMA=y、SCHED_MC=y、SCHED_CORE=y
+
+
+================================================================================
+四、tkernel5 (paul/scx-scheduler-set3) 当前实际支持情况
+================================================================================
+
+【已具备的关键特性】
+
+  在 kernel/sched/ext.c 与 kernel/sched/ext_idle.c 中已确认实现：
+
+    · scx_bpf_dsq_insert / _vtime / _move / _move_to_local /
+      _move_set_slice / _move_set_vtime / _move_vtime
+    · scx_bpf_consume（旧名兼容）+ scx_bpf_dispatch（旧名兼容）
+    · scx_bpf_reenqueue_local（v6.12 版，无 v2 变体）
+    · scx_bpf_now、scx_bpf_events
+    · scx_bpf_cpuperf_set / _cur / _cap
+    · scx_bpf_task_cgroup、scx_bpf_task_running、scx_bpf_task_cpu
+    · scx_bpf_kick_cpu、scx_bpf_dsq_nr_queued
+    · scx_bpf_get_idle_cpumask / _smtmask（含 _node 变体）
+    · scx_bpf_pick_idle_cpu、scx_bpf_pick_idle_cpu_node、
+      scx_bpf_pick_any_cpu_node
+    · scx_bpf_cpu_node、scx_bpf_nr_node_ids
+    · scx_bpf_select_cpu_dfl、scx_bpf_select_cpu_and
+    · scx_bpf_cpu_rq
+    · SCX_OPS_KEEP_BUILTIN_IDLE / ENQ_LAST / ENQ_EXITING /
+      SWITCH_PARTIAL / ENQ_MIGRATION_DISABLED /
+      ALLOW_QUEUED_WAKEUP / BUILTIN_IDLE_PER_NODE
+    · SCX_ENQ_CPU_SELECTED
+    · ops.cgroup_set_bandwidth（v6.17 特性，已回合）
+
+  同时 include/linux/sched/ext.h 里已见 SCX_OPS_ENQ_NOLOAD、
+  __SCX_OPS_INTERNAL_MASK 等下游自研位。
+
+【尚未回合，可能影响运行的特性】
+
+  经 grep 全内核 C 源文件确认，下述 kfunc/接口在当前分支未出现：
+
+    1. BPF Arena 全系（*硬缺失*，影响加载）：
+         · kernel/bpf/arena.c 源文件缺失（Makefile 未编入，只有旧的
+           arena.o 遗留）
+         · 无 addr_space_cast 指令、无 PROBE_MEM32 JIT 支持
+         · 无 bpf_arena_alloc_pages / bpf_arena_free_pages
+         · 无 __arg_arena、btf_decl_tag("arg: Arena")
+         · 无 BPF_MAP_TYPE_ARENA / BPF_F_MMAPABLE 配套 arena 处理
+
+       备注：paul/scx-scheduler-set2 分支上已经引入过上述 BPF Arena
+       系列补丁（dc5fb07a9a63 “bpf: Introduce bpf_arena.” 等约 40
+       个提交），但在 set3 上尚未合并/带过来。
+
+    2. bpf_cpumask_populate（v6.15）
+         · scx_bitmap_to_bpf 会退回到 __COMPAT_ 分支并返回
+           -EOPNOTSUPP。lavd/cake 中若 scx_bitmap_to_bpf 被实际调用
+           将 bpf_printk 报错。
+
+    3. scx_bpf_cpu_curr（v6.18）
+         · lavd/layered 通过 __COMPAT_scx_bpf_cpu_curr 走 fallback，
+           读 scx_bpf_cpu_rq(cpu)->curr。因为 scx_bpf_cpu_rq 已存在，
+           **fallback 可用**，不阻塞。
+
+    4. scx_bpf_dsq_peek（v6.19）
+         · lavd 通过 __COMPAT_scx_bpf_dsq_peek 使用
+           bpf_iter_scx_dsq_new + _next + _destroy 回退，**可用**，
+           仅性能略差。
+
+    5. scx_bpf_dsq_reenq（v6.20）
+         · 三者未使用，不影响。
+
+    6. scx_bpf_task_set_slice / _set_dsq_vtime（v6.19）
+         · 三者未使用，不影响。
+
+    7. ops.cgroup_set_idle（v6.19）、ops.sub_attach/detach/
+       sub_cgroup_id（v7.1）
+         · 三者未使用，不影响。scx_utils::compat.h 的 SCX_OPS_OPEN
+           在字段缺失时会 WARN 并 NULL 掉，属于软兼容。
+
+    8. SCX_OPS_ALWAYS_ENQ_IMMED（v6.19）
+         · 三者未使用。
+
+
+================================================================================
+五、可否在 tkernel5 (set3) 上运行 —— 结论
+================================================================================
+
+  scx_layered
+     可以运行（预期）。所需 kfunc、struct_ops 字段以及 SCX_OPS_ 标志
+     tkernel5 均已具备；不依赖 BPF Arena；scx_bpf_cpu_curr 的缺失通过
+     scx_bpf_cpu_rq 的 fallback 可正常工作；lo_fb / antistall / queued
+     wakeup 等功能开关本身可关闭。首次上线需 `-t` 关闭 topology 时可
+     绕过一些 NUMA 特殊路径便于验证。
+
+  scx_cake
+     **不能加载**。cake.bpf.c 直接 #include <lib/arena_map.h> 声明
+     BPF_MAP_TYPE_ARENA map，且 build.rs 显式链接 lib/arena.bpf.c 与
+     lib/sdt_alloc.bpf.c，编译期即依赖 BPF Arena。内核 verifier 将拒绝
+     未知 map 类型。
+
+  scx_lavd
+     **不能加载**。同 scx_cake，build.rs 链接 arena.bpf.c 与
+     sdt_alloc.bpf.c；main.rs 中 `ArenaLib::init()` 亦直接调用 arena
+     初始化程序。此外 CI 已把 stable/6.12 拉黑（issue #3046），实际
+     稳定运行建议 ≥ v6.14/6.15。
+
+
+================================================================================
+六、要在 tkernel5 上完整运行三个调度器需要补齐的内容
+================================================================================
+
+按优先级排序：
+
+  P0 —— 使 scx_cake / scx_lavd 能加载
+    · 回合 BPF Arena 全套上游补丁（v6.10 引入）
+      建议直接把 paul/scx-scheduler-set2 上已有的以下提交挑到 set3：
+        dc5fb07a9a63 bpf: Introduce bpf_arena.
+        057c55e01eba bpf: Add x86-64 JIT support for bpf_addr_space_cast
+        d9ad59c5676e bpf: Add x86-64 JIT support for PROBE_MEM32
+        a4c305b09bbb bpf: Recognize addr_space_cast in verifier
+        ca58d88104f2 bpf: Recognize btf_decl_tag("arg: Arena")
+        1c6918cdd8eb bpf: Recognize '__map' suffix in kfunc arguments
+        c13f098d75df bpf: Plumb get_unmapped_area() callback
+        ccbfb7c7d720 bpf: Tell bpf programs kernel's PAGE_SIZE
+        e42878407c9c libbpf: Allow specifying 64-bit integers in map BTF
+        fb2eebb351d6 bpf: Add helper macro bpf_addr_space_cast()
+        f9796dd3ef81 libbpf: Add __arg_arena to bpf_helpers.h
+        f48143108032 libbpf: Add support for bpf_arena.
+        9639cb90a4c7 libbpf: Add support for bpf_arena.
+        848646ffc89e bpftool: Recognize arena map type
+        （以及若干 arena 修 bug 类：80b89d0226a0、3ac1a467e376、
+          2845989f2eba 等）
+      同时需要打开：CONFIG_BPF_JIT=y、arch/x86/net/bpf_jit_comp.c 中
+      PROBE_MEM32 相关分支能够生效（x86-64 JIT）。
+
+  P1 —— 减少 warning、避免特定路径失败
+    · 回合 bpf_cpumask_populate（v6.15，950ad93df2fc “bpf: add kfunc
+      for populating cpumask bits”），否则 lavd/cake 中通过
+      scx_bitmap_to_bpf 修改 BPF cpumask 会失败。
+    · 回合 scx_bpf_cpu_curr（v6.18，避免依赖 scx_bpf_cpu_rq 的
+      间接 fallback，且未来上游 compat 会移除该 fallback）。
+    · 回合 scx_bpf_dsq_peek（v6.19）以获得 lavd 无锁 peek 的性能优势。
+
+  P2 —— 未来上游追齐（现阶段可不做）
+    · scx_bpf_dsq_reenq（v6.20）
+    · scx_bpf_task_set_slice / _set_dsq_vtime（v6.19）
+    · ops.cgroup_set_idle（v6.19）
+    · ops.sub_attach / sub_detach / sub_cgroup_id（v7.1）
+    · SCX_OPS_ALWAYS_ENQ_IMMED（v6.19）
+
+
+================================================================================
+七、验证与后续建议
+================================================================================
+
+  1. 用户态 compat 探测：三个调度器加载时会调用 scx_utils::compat 的
+     SCX_OPS_OPEN 宏，自动 print WARNING 说明哪些字段被 NULL 掉。可
+     用于快速摸清一台实际机器上 sched_ext_ops 缺哪些字段。
+
+  2. 在 tkernel5 编好 CONFIG_IKHEADERS=y、CONFIG_IKCONFIG_PROC=y 后，
+     调度器的 build.rs 会依赖 vmlinux BTF；确认 /sys/kernel/btf/vmlinux
+     存在且 pahole ≥ 1.26。
+
+  3. 建议先在 tkernel5 上跑 scx_layered 验证 sched_ext 基线是否稳定
+     （不涉及 BPF Arena），随后再规划 BPF Arena 回合以支撑 scx_cake /
+     scx_lavd。
+
+  4. scx 上游 kernel.config（scx/kernel.config）列出的所有 y 项目
+     可作为下游 config 的补齐参考，尤其 CONFIG_FUNCTION_TRACER（lavd
+     追踪 futex）、CONFIG_PREEMPT、CONFIG_KALLSYMS_ALL。
+
+  5. lavd 的 Cargo.toml 声明 CI 将 stable/6_12 列入 blocklist
+     （github.com/sched-ext/scx/issues/3046），建议在 tkernel5 上跑
+     lavd 时优先复核该 issue 提到的稳定性回归是否已随 set3 的
+     v6.13-6.16 sched_ext 补丁被修掉。
+
+================================================================================
+（报告完）
+
+
+
+
+全部核实完毕。给你干净的方案。
+
+## 结论先行
+
+要让 set3 支持跑 `scx_cake` / `scx_lavd`(arena)+ 全部三个(may_goto),从 `upstream` 需要且仅需要 **16 个内核提交**。已逐个验证:**都在 `upstream/master` 上、set3 都还没有**。
+
+关键澄清两点:
+- **用户态 libbpf/bpftool 不用动内核树**。scx 用自己 vendored 的 `local_crates/libbpf-sys`(2026 年的版本,早就懂 arena),内核树里的 `tools/lib/bpf`、`bpftool` 只服务于内核自带 selftests/samples,和你构建 scx 无关。所以之前清单里的 Group C(5 个 libbpf/bpftool 提交)**整组砍掉**。
+- 之前担心的 **exceptions/bpf_throw 系列,确认不 pick**。arena 语义上不用它,它当年只是文本消冲突层。代价见下面"冲突面预警"。
+
+---
+
+## 精确 pick 清单(upstream 哈希,严格按此顺序)
+
+顺序 = 上游 author-date 顺序,天然满足系列内部依赖。
+
+```
+# ── 组1:BTF kfunc 集合宏(arena.c 用 BTF_KFUNCS_START 注册 kfunc,set3 只有旧的 BTF_SET8_START)
+#         各只改 include/linux/btf_ids.h ~10 行,纯新增宏,零涟漪
+79b47344bbc5   bpf: btf: Support flags for BTF_SET8 sets
+a05e90427ef6   bpf: btf: Add BTF_KFUNCS_START/END macro pair
+
+# ── 组2:may_goto(三个调度器间接依赖;第一个是 may_goto 有界循环校验的 verifier 前置)
+4f81c16f50ba   bpf: Recognize that two registers are safe when their ranges match
+011832b97b31   bpf: Introduce may_goto instruction
+
+# ── 组3:arena 的 mm 前置
+e6f798225a31   mm: Introduce VM_SPARSE kind and vm_area_[un]map_pages().
+
+# ── 组4:arena 的 kfunc/mmap 管道前置
+fe5064158c56   bpf: Tell bpf programs kernel's PAGE_SIZE
+88d1d4a7eebe   bpf: Allow kfuncs return 'void *'
+8d94f1357c00   bpf: Recognize '__map' suffix in kfunc arguments
+cf2c2e4a3d91   bpf: Plumb get_unmapped_area() callback into bpf_map_ops
+
+# ── 组5:addr_space_cast + arena 核心(disasm→verifier→JIT→arena→收尾)
+667a86ad9b71   bpf: Disasm support for addr_space_cast instruction.
+6082b6c328b5   bpf: Recognize addr_space_cast instruction in the verifier.
+142fd4d2dcf5   bpf: Add x86-64 JIT support for bpf_addr_space_cast instruction.
+2fe99eb0ccf2   bpf: Add x86-64 JIT support for PROBE_MEM32 pseudo instructions.
+317460317a02   bpf: Introduce bpf_arena.
+2edc3de6fb65   bpf: Recognize btf_decl_tag("arg: Arena") as PTR_TO_ARENA.
+204c628730c6   bpf: Add helper macro bpf_addr_space_cast()
+```
+
+只跑 may_goto、不要 arena 的话,只 pick 组2(2 个)即可。
+
+---
+
+## 干净做下来的标准流程
+
+**1. 开临时 worktree,绝不在 set3 主检出上试**
+```bash
+cd /data/home/paulning/tk5/tkernel5
+git fetch upstream
+git worktree add ../tk5-bp paul/scx-scheduler-set3
+cd ../tk5-bp
+git switch -c paul/scx-bpf-arena-maygoto
+```
+
+**2. 按上面顺序逐个 cherry-pick(用 -x 记录来源,便于追溯)**
+```bash
+git cherry-pick -x 79b47344bbc5 a05e90427ef6 \
+  4f81c16f50ba 011832b97b31 \
+  e6f798225a31 \
+  fe5064158c56 88d1d4a7eebe 8d94f1357c00 cf2c2e4a3d91 \
+  667a86ad9b71 6082b6c328b5 142fd4d2dcf5 2fe99eb0ccf2 \
+  317460317a02 2edc3de6fb65 204c628730c6
+```
+
+**3. 遇到冲突时,先分类再动手(这是"干净"的核心纪律)**
+- 冲突在 `arena.c`(新文件)→ 不可能冲突,忽略。
+- 冲突在 `verifier.c` / `bpf_jit_comp.c` / `filter.h` / `core.c` → 几乎都是**上下文错位**(因为我们故意跳过了 6.7–6.8 的中间态改动),不是功能缺失。手动把新增 hunk 放到正确位置即可,**不要**因此去 pick 别的提交。
+- 真判不准是不是缺前置:`git log upstream/master -- <冲突文件>` 看该文件在这两个补丁之间还有没有别的改动被你跳过;若那改动与 arena/may_goto 无关(比如 exceptions),就手工消冲突,不 pick。
+
+**4. 每 pick 完一组就编译一次,尽早暴露问题**
+```bash
+make olddefconfig && make -j"$(nproc)" kernel/bpf/ arch/x86/net/
+```
+（组1、2 后编 `kernel/bpf/`;组5 后编 `arch/x86/net/`。分段编比全量快,也能把错误定位到刚 pick 的那组。）
+
+**5. 功能验证(最终判据不是"编过",是"能 load")**
+- 确认 uapi:`grep BPF_MAP_TYPE_ARENA include/uapi/linux/bpf.h`
+- 起内核,`cargo build --release -p scx_cake` 后 `sudo ./target/release/scx_cake`,看 struct_ops 能否 attach、arena map 能否创建。
+- 跑 `scx_layered` 验证 may_goto 路径。
+
+---
+
+## 冲突面预警(你选了最精简路线,要有心理预期)
+
+因为**故意不带** 6.7–6.8 的 exceptions 及其它 BPF 中间提交,以下两个文件最可能报文本冲突,需要手工消:
+- `kernel/bpf/verifier.c` —— may_goto(`011832b97b31`)和 arena verifier(`6082b6c328b5`)的 hunk 上下文假设了 6.9 期的 verifier,set3 是 6.6 期。
+- `arch/x86/net/bpf_jit_comp.c` —— 两个 arena JIT 提交(`142fd4d2dcf5`、`2fe99eb0ccf2`)的上下文假设 exceptions 已改过 prologue/epilogue。
+
+这些都是**可手工解决的错位**,不代表要再 pick 东西。真正判断标准永远是:缺的是**符号/功能**(→补前置)还是**上下文**(→手工挪)。
+
+---
+
+要不要我**现在就在临时 worktree 跑一遍这 16 个 dry-run cherry-pick**,把真实的冲突文件和具体 hunk 逐个列给你?这样你能拿到确切的人工成本清单,而 set3 主分支完全不受影响。
