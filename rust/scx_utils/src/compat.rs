@@ -21,6 +21,7 @@ const PROCFS_MOUNTS: &str = "/proc/mounts";
 const TRACEFS: &str = "tracefs";
 const DEBUGFS: &str = "debugfs";
 
+/* 封装的scx ops flags */
 lazy_static::lazy_static! {
     pub static ref SCX_OPS_KEEP_BUILTIN_IDLE: u64 =
         read_enum("scx_ops_flags", "SCX_OPS_KEEP_BUILTIN_IDLE").unwrap_or(0);

@@ -26,6 +26,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use tracing::debug;
 
+/* 描述系统的一个cpu? */
 #[derive(Debug, Clone)]
 pub struct CpuId {
     // - *_adx: an absolute index within a system scope

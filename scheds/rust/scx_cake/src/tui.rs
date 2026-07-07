@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 // TUI module - ratatui-based terminal UI for real-time scheduler statistics
+// TUI 模块 —— 基于 ratatui 的终端界面，用于实时展示调度器统计数据。讲解：本文件实现整个终端可视化界面。
 
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,6 +32,7 @@ use crate::bpf_skel::BpfSkel;
 use crate::topology::TopologyInfo;
 
 /// System hardware and kernel information, collected once at startup.
+/// 系统硬件与内核信息，在启动时采集一次。讲解：缓存 CPU、内存、内核等静态信息避免重复读取。
 #[derive(Clone, Debug)]
 pub struct SystemInfo {
     pub cpu_model: String,
@@ -48,6 +50,7 @@ pub struct SystemInfo {
 impl SystemInfo {
     pub fn detect(topo: &TopologyInfo) -> Self {
         // CPU model from /proc/cpuinfo
+        // 从 /proc/cpuinfo 获取 CPU 型号。讲解：解析 model name 行得到处理器名称。
         let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
             .ok()
             .and_then(|s| {
@@ -59,10 +62,12 @@ impl SystemInfo {
             .unwrap_or_else(|| "Unknown".to_string());
 
         // Architecture from uname
+        // 从 uname 获取 CPU 架构。讲解：优先读内核 arch 文件，失败则回退到 uname -m。
         let cpu_arch = std::fs::read_to_string("/proc/sys/kernel/arch")
             .map(|s| s.trim().to_string())
             .or_else(|_| {
                 // Fallback: parse from uname -m via /proc
+                // 回退方案：通过 uname -m 解析架构。讲解：当读取 /proc 失败时的备用手段。
                 std::process::Command::new("uname")
                     .arg("-m")
                     .output()
@@ -71,6 +76,7 @@ impl SystemInfo {
             .unwrap_or_else(|_| "unknown".to_string());
 
         // Total RAM from /proc/meminfo
+        // 从 /proc/meminfo 获取总内存。讲解：解析 MemTotal 行并转换为 MB。
         let total_ram_mb = std::fs::read_to_string("/proc/meminfo")
             .ok()
             .and_then(|s| {
@@ -86,6 +92,7 @@ impl SystemInfo {
             .unwrap_or(0);
 
         // Kernel version from /proc/version
+        // 从 /proc/version 获取内核版本。讲解：取第三个字段作为内核版本号。
         let kernel_version = std::fs::read_to_string("/proc/version")
             .ok()
             .and_then(|s| s.split_whitespace().nth(2).map(|v| v.to_string()))
@@ -106,6 +113,7 @@ impl SystemInfo {
     }
 
     /// Format as compact one-line header for dump files (AI-optimized, all data)
+    /// 格式化为转储文件用的紧凑单行头部（面向 AI 优化，包含全部数据）。讲解：将系统信息压缩成一行文本便于日志记录。
     pub fn format_header(&self) -> String {
         let ram_display = if self.total_ram_mb >= 1024 {
             format!("{:.1}GB", self.total_ram_mb as f64 / 1024.0)
@@ -171,8 +179,11 @@ impl TuiTab {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskStatus {
     Alive, // In sysinfo + has BPF telemetry (total_runs > 0)
+    // 存活：既在 sysinfo 中又有 BPF 遥测数据（total_runs > 0）。讲解：代表当前活跃且被调度器跟踪的任务。
     Idle,  // In sysinfo but no BPF telemetry (sleeping/background)
+    // 空闲：在 sysinfo 中但没有 BPF 遥测数据（休眠/后台）。讲解：进程存在但近期未被调度。
     Dead,  // Not in sysinfo, stale arena entry
+    // 死亡：不在 sysinfo 中，是过期的 arena 条目。讲解：进程已退出但 arena 中残留旧数据。
 }
 
 impl TaskStatus {
@@ -211,6 +222,7 @@ pub enum SortColumn {
 }
 
 /// TUI Application state
+/// TUI 应用状态。讲解：保存整个终端界面运行时的全部状态数据。
 pub struct TuiApp {
     start_time: Instant,
     status_message: Option<(String, Instant)>,
@@ -227,40 +239,70 @@ pub struct TuiApp {
     pub sys: System,
     pub components: Components,
     pub cpu_stats: Vec<(f32, f32)>,            // (Load %, Temp C)
+    // （负载百分比，温度摄氏度）。讲解：每个 CPU 的实时负载与温度。
     pub show_all_tasks: bool,                  // false = BPF-tracked only, true = all
+    // false = 仅显示 BPF 跟踪的任务，true = 显示全部。讲解：控制任务列表过滤开关。
     pub arena_active: usize,                   // Arena slots with tid != 0
+    // tid 不为 0 的 arena 槽位数。讲解：统计当前占用的 arena 条目数量。
     pub arena_max: usize,                      // Arena pool max_elems
+    // arena 池的最大元素数。讲解：arena 容量上限。
     pub bpf_task_count: usize,                 // Tasks with total_runs > 0
+    // total_runs 大于 0 的任务数。讲解：真正被调度过的任务数量。
     pub prev_deltas: HashMap<u32, (u32, u16)>, // (total_runs, migration_count) — lightweight delta snapshot
+    // （总运行次数，迁移次数）——轻量级增量快照。讲解：用于计算每秒速率的上一次采样值。
     pub active_pids_buf: std::collections::HashSet<u32>, // Reused per-tick to avoid alloc
+    // 每个 tick 复用以避免分配。讲解：缓存活跃 PID 集合，减少内存分配开销。
     pub collapsed_tgids: std::collections::HashSet<u32>, // Collapsed process groups
+    // 已折叠的进程组。讲解：记录被用户折叠隐藏的 TGID。
     pub collapsed_ppids: std::collections::HashSet<u32>, // Collapsed PPID groups
+    // 已折叠的 PPID 组。讲解：记录被折叠的父进程分组。
     pub bench_latency_handle: Option<thread::JoinHandle<Vec<Vec<f64>>>>, // Background c2c bench
+    // 后台 c2c 基准测试。讲解：核心间延迟测试的后台线程句柄。
     pub _prev_stats: Option<cake_stats>,       // Previous global stats for rate calc
+    // 上一次全局统计，用于速率计算。讲解：保存前一次全局数据以求差值。
     // BenchLab cached results
+    // BenchLab 缓存结果。讲解：以下字段缓存基准测试实验室的数据。
     pub bench_entries: [(u64, u64, u64, u64); 67], // (min_ns, max_ns, total_ns, last_value)
+    // （最小纳秒，最大纳秒，累计纳秒，最近值）。讲解：67 个基准项的统计聚合。
     pub bench_samples: Vec<Vec<u64>>, // Per-entry accumulated raw samples for percentiles
+    // 每个基准项累积的原始样本，用于计算百分位。讲解：保留原始样本以算 P50/P99 等分位数。
     pub bench_cpu: u32,
     pub bench_iterations: u32,
     pub bench_timestamp: u64,
     pub bench_run_count: u32,
     pub last_bench_timestamp: u64, // to detect new results
+    // 用于检测新结果。讲解：比较时间戳判断是否有新的基准数据。
     pub system_info: SystemInfo,
     // Game TGID detection: process-level yielder promotion
+    // 游戏 TGID 检测：进程级别的让步者提权。讲解：识别游戏进程并整体提升其调度优先级。
     pub tracked_game_tgid: u32, // currently detected game tgid (0 = none)
+    // 当前检测到的游戏 tgid（0 = 无）。讲解：锁定的游戏主进程组 ID。
     pub tracked_game_ppid: u32, // PPID of the locked game family (for hysteresis comparison)
+    // 锁定游戏家族的 PPID（用于滞回比较）。讲解：以父进程 ID 标识整个游戏进程家族。
     pub game_thread_count: usize, // thread count for detected game
+    // 检测到的游戏线程数。讲解：显示游戏进程包含多少线程。
     pub game_name: String,      // process name from /proc/{tgid}/comm
+    // 来自 /proc/{tgid}/comm 的进程名。讲解：读取游戏进程名称用于展示。
     // Hysteresis: challenger must beat current game for 15s to take over
+    // 滞回机制：挑战者需连续压制当前游戏 15 秒才能接管。讲解：避免游戏识别频繁抖动切换。
     pub game_challenger_ppid: u32, // PPID contesting game slot (0 = none)
+    // 争夺游戏槽位的 PPID（0 = 无）。讲解：正在挑战当前游戏地位的候选者。
     pub game_challenger_since: Option<Instant>, // When challenger first appeared
+    // 挑战者首次出现的时间。讲解：用于计算挑战持续时长。
     // Confidence-based polling throttle (Rule 40)
+    // 基于置信度的轮询节流（规则 40）。讲解：识别越稳定则轮询频率越低以省开销。
     pub game_stable_polls: u32, // consecutive polls with same PPID winner
+    // 连续多少次轮询得到同一 PPID 赢家。讲解：衡量游戏识别的稳定程度。
     pub game_skip_counter: u32, // how many polls we've skipped this interval
+    // 本区间内已跳过的轮询次数。讲解：节流计数器。
     // Scheduler state machine (IDLE=0, COMPILATION=1, GAMING=2)
+    // 调度器状态机（空闲=0，编译=1，游戏=2）。讲解：根据当前场景切换调度策略。
     pub sched_state: u8,           // current operating state written to BPF BSS
+    // 写入 BPF BSS 的当前运行状态。讲解：把状态同步给内核端 BPF 程序。
     pub compile_task_count: usize, // active compiler task count for display
+    // 用于展示的活跃编译任务数。讲解：统计正在编译的任务数量。
     // Game detection confidence tier (100=Steam, 90=Wine .exe, 0=none)
+    // 游戏检测置信度等级（100=Steam，90=Wine .exe，0=无）。讲解：不同来源对应不同的识别可信度。
     pub game_confidence: u8,
 }
 
@@ -273,6 +315,7 @@ pub struct TaskTelemetryRow {
     pub deficit_us: u32,
     pub wait_duration_ns: u64,
     pub gate_hit_pcts: [f64; 10], // G1, G2, G1W, G3, G1P, G1C, G1CP, G1D, G1WC, GTUN
+    // G1、G2、G1W、G3、G1P、G1C、G1CP、G1D、G1WC、GTUN 各门命中百分比。讲解：记录任务命中各个调度门的比例。
     pub select_cpu_ns: u32,
     pub enqueue_ns: u32,
     pub core_placement: u16,
@@ -289,49 +332,78 @@ pub struct TaskTelemetryRow {
     pub running_duration_ns: u32,
     pub max_runtime_us: u32,
     // Scheduling period (dispatch gap)
+    // 调度周期（派发间隔）。讲解：任务两次被派发之间的时间间隔。
     pub dispatch_gap_us: u64,
     pub max_dispatch_gap_us: u64,
     // Wait latency histogram
+    // 等待延迟直方图。讲解：按区间统计任务排队等待时长分布。
     pub wait_hist: [u32; 4], // <10µs, <100µs, <1ms, >=1ms
+    // <10µs、<100µs、<1ms、>=1ms 四个区间。讲解：等待延迟的四档分桶计数。
     // Delta mode: per-interval rates
+    // 增量模式：按区间计算的速率。讲解：以每秒频率呈现变化量。
     pub runs_per_sec: f64,
     pub migrations_per_sec: f64,
     pub status: TaskStatus,
     pub is_bpf_tracked: bool,
     pub tgid: u32,
     // Phase B: blind spot metrics
+    // 阶段 B：盲区指标。讲解：补充此前难以观测的调度细节。
     pub slice_util_pct: u16,
     pub llc_id: u16,
     pub same_cpu_streak: u16,
     pub wakeup_source_pid: u32,
     // Voluntary/involuntary context switch tracking (GPU detection)
+    // 主动/被动上下文切换跟踪（GPU 检测）。讲解：用切换类型辅助识别 GPU 相关任务。
     pub nvcsw_delta: u32,
     pub nivcsw_delta: u32,
     pub _pad_recomp: u16,
     pub is_hog: bool,         // Hog squeeze: BULK + non-yielder + deprioritized
+    // 占用型挤压：批量 + 不让步 + 已降优先级。讲解：标记贪占 CPU 的任务以便压制。
     pub is_bg: bool,          // Background noise squeeze: non-game, non-wb, non-kernel
+    // 后台噪声挤压：非游戏、非回写、非内核。讲解：标记可被压制的后台杂项任务。
     pub is_game_member: bool, // Task is in the game PPID family (tgid==game_tgid or ppid==game_ppid)
+    // 任务属于游戏 PPID 家族（tgid==game_tgid 或 ppid==game_ppid）。讲解：判断任务是否属于游戏进程组。
     pub ppid: u32,            // Parent PID for game family detection
+    // 用于游戏家族检测的父 PID。讲解：以父进程归属判断游戏成员。
     // Phase 8: Per-callback sub-function stopwatch (ns)
+    // 阶段 8：各回调内子函数计时（纳秒）。讲解：细粒度测量每个调度回调内部耗时。
     pub gate_cascade_ns: u32,  // select_cpu: full gate cascade duration
+    // select_cpu：完整门级联耗时。讲解：选核阶段整个门判定的耗时。
     pub idle_probe_ns: u32,    // select_cpu: winning gate idle probe cost
+    // select_cpu：命中门的空闲探测开销。讲解：探测空闲 CPU 所花时间。
     pub vtime_compute_ns: u32, // enqueue: vtime calculation + tier weighting
+    // enqueue：vtime 计算 + 层级加权。讲解：入队时虚拟时间与优先级权重计算耗时。
     pub mbox_staging_ns: u32,  // running: mailbox CL0 write burst
+    // running：邮箱 CL0 写入突发。讲解：运行阶段向邮箱缓存行写入的耗时。
     pub _pad_ewma: u32,
     pub classify_ns: u32,      // stopping: tier classify + squeeze fusion
+    // stopping：层级分类 + 挤压融合。讲解：停止阶段对任务分层与挤压判定的耗时。
     pub vtime_staging_ns: u32, // stopping: dsq_vtime bit packing + writes
+    // stopping：dsq_vtime 位打包与写入。讲解：停止阶段虚拟时间打包写回耗时。
     pub warm_history_ns: u32,  // stopping: warm CPU ring shift
+    // stopping：热点 CPU 环移位。讲解：更新任务近期运行过的 CPU 历史。
     // Phase 8: Quantum completion tracking
+    // 阶段 8：时间片完成情况跟踪。讲解：统计任务如何结束其时间片。
     pub quantum_full_count: u16,    // Task consumed entire slice
+    // 任务用完了整个时间片。讲解：跑满时间片的次数。
     pub quantum_yield_count: u16,   // Task yielded before slice exhaustion
+    // 任务在时间片用尽前主动让出。讲解：主动让步的次数。
     pub quantum_preempt_count: u16, // Task was kicked/preempted mid-slice
+    // 任务在时间片中途被踢出/抢占。讲解：被抢占的次数。
     // Phase 8: Wake chain enhancement
+    // 阶段 8：唤醒链增强。讲解：记录唤醒者信息以分析唤醒关系。
     pub waker_cpu: u16,  // CPU the waker was running on
+    // 唤醒者所在的 CPU。讲解：谁在哪个核上唤醒了本任务。
     pub waker_tgid: u32, // TGID of the waker (process group)
+    // 唤醒者的 TGID（进程组）。讲解：唤醒来源所属进程组。
     // Phase 8: CPU core distribution histogram
+    // 阶段 8：CPU 核分布直方图。讲解：统计任务在各核上的运行分布。
     pub cpu_run_count: [u16; 64], // Per-CPU run count (TUI normalizes to %)
+    // 每个 CPU 的运行次数（TUI 归一化为百分比）。讲解：反映任务的 CPU 亲和分布。
     // EEVDF telemetry
+    // EEVDF 遥测。讲解：EEVDF 调度相关的观测数据。
     pub vtime_mult: u16, // EEVDF vtime reciprocal (1024=nice0, <1024 high-pri, >1024 low-pri)
+    // EEVDF vtime 倒数（1024=nice0，<1024 高优先级，>1024 低优先级）。讲解：控制虚拟时间推进速度以实现优先级。
 }
 
 impl Default for TaskTelemetryRow {
@@ -379,6 +451,7 @@ impl Default for TaskTelemetryRow {
             is_game_member: false,
             ppid: 0,
             // Phase 8
+            // 阶段 8。讲解：以下为阶段 8 新增字段的默认值。
             gate_cascade_ns: 0,
             idle_probe_ns: 0,
             vtime_compute_ns: 0,
@@ -404,6 +477,7 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
     if let Some(bss) = &skel.maps.bss_data {
         for s in &bss.global_stats {
             // Sum all fields
+            // 累加所有字段。讲解：把每 CPU 的统计求和得到全局统计。
             total.nr_new_flow_dispatches += s.nr_new_flow_dispatches;
             total.nr_old_flow_dispatches += s.nr_old_flow_dispatches;
             total.nr_dropped_allocations += s.nr_dropped_allocations;
@@ -413,6 +487,7 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
             total.total_enqueue_latency_ns += s.total_enqueue_latency_ns;
 
             // Callback profiling aggregation
+            // 回调性能剖析聚合。讲解：汇总各调度回调的耗时统计。
             total.total_select_cpu_ns += s.total_select_cpu_ns;
             total.total_stopping_ns += s.total_stopping_ns;
             total.total_running_ns += s.total_running_ns;
@@ -425,6 +500,7 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
             total.nr_stop_miss += s.nr_stop_miss;
 
             // Dispatch locality (cake_dispatch stats)
+            // 派发局部性（cake_dispatch 统计）。讲解：统计本地/窃取等派发行为衡量缓存亲和。
             total.nr_local_dispatches += s.nr_local_dispatches;
             total.nr_stolen_dispatches += s.nr_stolen_dispatches;
             total.nr_dispatch_misses += s.nr_dispatch_misses;
@@ -433,10 +509,12 @@ fn aggregate_stats(skel: &BpfSkel) -> cake_stats {
             total.nr_dsq_consumed += s.nr_dsq_consumed;
 
             // Phase 8: dispatch callback timing
+            // 阶段 8：dispatch 回调计时。讲解：汇总派发回调的耗时。
             total.total_dispatch_ns += s.total_dispatch_ns;
             total.max_dispatch_ns = total.max_dispatch_ns.max(s.max_dispatch_ns);
 
             // EEVDF topology telemetry
+            // EEVDF 拓扑遥测。讲解：汇总 EEVDF 在不同拓扑下的调整计数。
             total.nr_vprot_suppressed += s.nr_vprot_suppressed;
             total.nr_lag_applied += s.nr_lag_applied;
             total.nr_capacity_scaled += s.nr_capacity_scaled;
@@ -452,11 +530,13 @@ impl TuiApp {
 
         let mut sys = System::new();
         // Only load CPU specific metrics to reduce background overhead
+        // 仅加载 CPU 相关指标以降低后台开销。讲解：避免刷新无关信息节省资源。
         sys.refresh_cpu_usage();
 
         let components = Components::new_with_refreshed_list();
 
         // Collect system info once at startup (cold path only)
+        // 启动时采集一次系统信息（仅冷路径）。讲解：静态信息只需采集一次。
         let system_info = SystemInfo::detect(&topology);
 
         Self {
@@ -508,6 +588,7 @@ impl TuiApp {
     }
 
     /// Format uptime as "Xm Ys" or "Xh Ym"
+    /// 将运行时长格式化为 "X分 Y秒" 或 "X时 Y分"。讲解：根据时长选择合适的显示单位。
     fn format_uptime(&self) -> String {
         let elapsed = self.start_time.elapsed();
         let secs = elapsed.as_secs();
@@ -519,11 +600,13 @@ impl TuiApp {
     }
 
     /// Set a temporary status message that disappears after 2 seconds
+    /// 设置一条 2 秒后自动消失的临时状态消息。讲解：用于短暂提示用户操作结果。
     fn set_status(&mut self, msg: &str) {
         self.status_message = Some((msg.to_string(), Instant::now()));
     }
 
     /// Get current status message if not expired
+    /// 获取当前尚未过期的状态消息。讲解：超过 2 秒则返回空。
     fn get_status(&self) -> Option<&str> {
         match &self.status_message {
             Some((msg, timestamp)) if timestamp.elapsed() < Duration::from_secs(2) => Some(msg),
@@ -587,6 +670,7 @@ impl TuiApp {
 
     pub fn scroll_bench_down(&mut self) {
         let max = 32; // bench rows + category headers
+        // 基准行数 + 分类表头。讲解：基准表可滚动的最大索引。
         let i = match self.bench_table_state.selected() {
             Some(i) => {
                 if i >= max {
@@ -621,6 +705,7 @@ impl TuiApp {
 }
 
 /// Initialize the terminal for TUI mode
+/// 为 TUI 模式初始化终端。讲解：开启原始模式并切换到备用屏幕缓冲。
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("Failed to enable raw mode")?;
     io::stdout()
@@ -631,6 +716,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 }
 
 /// Restore terminal to normal mode
+/// 将终端恢复到正常模式。讲解：退出时关闭原始模式并还原主屏幕。
 fn restore_terminal() -> Result<()> {
     disable_raw_mode().context("Failed to disable raw mode")?;
     io::stdout()
@@ -640,7 +726,9 @@ fn restore_terminal() -> Result<()> {
 }
 
 /// A very compact topology display: shows LLC clusters cleanly formatted.
+/// 极紧凑的拓扑显示：以清晰格式展示 LLC 集群。讲解：绘制按末级缓存分组的 CPU 布局。
 // Includes active Sysinfo hardware polling (load & temperature).
+// 包含实时的 Sysinfo 硬件轮询（负载与温度）。讲解：在拓扑图上叠加每核负载和温度。
 fn build_cpu_topology_grid_compact<'a>(
     topo: &'a TopologyInfo,
     cpu_stats: &'a [(f32, f32)],
@@ -653,6 +741,7 @@ fn build_cpu_topology_grid_compact<'a>(
     ]));
 
     // Group CPUs by LLC
+    // 按 LLC 对 CPU 分组。讲解：把共享同一末级缓存的核归为一组。
     let mut llc_groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for (cpu_id, &llc_id) in topo.cpu_llc_id.iter().enumerate() {
         llc_groups.entry(llc_id as u32).or_default().push(cpu_id);
@@ -660,6 +749,7 @@ fn build_cpu_topology_grid_compact<'a>(
 
     let mut sorted_llcs: Vec<_> = llc_groups.into_iter().collect();
     sorted_llcs.sort_by_key(|k| k.0); // Sort by LLC ID
+    // 按 LLC ID 排序。讲解：保证缓存分组按序稳定显示。
 
     for (llc_idx, (llc_id, cpus)) in sorted_llcs.iter().enumerate() {
         let l3_color = match llc_idx % 4 {
@@ -670,6 +760,7 @@ fn build_cpu_topology_grid_compact<'a>(
         };
 
         // Determine if this LLC has 3D V-Cache
+        // 判断该 LLC 是否带 3D V-Cache。讲解：AMD X3D 缓存核会有额外堆叠缓存。
         let has_vcache = (topo.vcache_llc_mask & (1 << *llc_id)) != 0;
         let vcache_label = if has_vcache { " [3D V-Cache]" } else { "" };
 
@@ -680,11 +771,14 @@ fn build_cpu_topology_grid_compact<'a>(
 
         let mut sorted_cpus = cpus.clone();
         sorted_cpus.sort(); // Sort CPUs within LLC
+        // 对 LLC 内的 CPU 排序。讲解：让同一缓存组内的核按编号有序排列。
 
         // Arrange CPUs in a compact grid
+        // 将 CPU 排成紧凑网格。讲解：每行固定数量地布局核心。
         let cpus_per_row = 4;
         for chunk in sorted_cpus.chunks(cpus_per_row) {
             let mut line_spans = vec![Span::raw("  ")]; // Indent
+            // 缩进。讲解：行首留白使网格更易读。
             for &cpu in chunk {
                 let is_e_core = (topo.little_core_mask & (1 << cpu)) != 0;
                 let core_color = if is_e_core {
@@ -696,6 +790,7 @@ fn build_cpu_topology_grid_compact<'a>(
                 let (load, temp) = cpu_stats.get(cpu).copied().unwrap_or((0.0, 0.0));
 
                 // Color scaling based on load and temp
+                // 根据负载和温度做颜色分级。讲解：负载越高颜色越偏红以突出热点。
                 let load_color = if load > 90.0 {
                     Color::Red
                 } else if load > 50.0 {
@@ -742,6 +837,7 @@ fn build_cpu_topology_grid_compact<'a>(
 }
 
 /// Custom Widget for high-density Latency Heatmap
+/// 用于高密度延迟热力图的自定义控件。讲解：以颜色块可视化核间通信延迟矩阵。
 struct LatencyHeatmap<'a> {
     matrix: &'a [Vec<f64>],
     topology: &'a TopologyInfo,
@@ -776,6 +872,7 @@ impl<'a> Widget for LatencyHeatmap<'a> {
         }
 
         // Header for Target CPUs (X-axis)
+        // 目标 CPU 表头（X 轴）。讲解：绘制横向坐标轴上的目标核编号。
         for j in 0..nr_cpus {
             let x = inner_area.x + 6 + (j as u16 * 2);
             if x < inner_area.right() {
@@ -795,6 +892,7 @@ impl<'a> Widget for LatencyHeatmap<'a> {
             }
 
             // Row Label (Source CPU)
+            // 行标签（源 CPU）。讲解：绘制纵向每行代表的源核编号。
             buf.set_string(
                 inner_area.x + 1,
                 y,
@@ -816,10 +914,13 @@ impl<'a> Widget for LatencyHeatmap<'a> {
                     Style::default().fg(Color::Rgb(40, 40, 40))
                 } else if is_smt {
                     Style::default().fg(Color::Rgb(0, 255, 150)) // Turquoise
+                    // 青绿色。讲解：标记 SMT 兄弟核之间的关系。
                 } else if same_ccd {
                     Style::default().fg(Color::Rgb(0, 200, 255)) // Cyan
+                    // 青色。讲解：标记同一 CCD/LLC 内的核。
                 } else {
                     Style::default().fg(Color::Rgb(255, 180, 0)) // Amber
+                    // 琥珀色。讲解：标记跨 CCD 的核，延迟更高。
                 };
 
                 buf.set_string(x, y, "█", style);
@@ -828,6 +929,7 @@ impl<'a> Widget for LatencyHeatmap<'a> {
         }
 
         // Legend at bottom
+        // 底部图例。讲解：在底部说明各颜色所代表的核间关系。
         let legend_y = inner_area.bottom().saturating_sub(1);
         let legend_x = inner_area.x + 1;
         if legend_y > inner_area.y + nr_cpus as u16 {
@@ -854,6 +956,7 @@ impl<'a> Widget for LatencyHeatmap<'a> {
 }
 
 /// Custom Widget for numerical latency table
+/// 用于数值化延迟表的自定义控件。讲解：以数字表格精确展示核间延迟。
 struct LatencyTable<'a> {
     matrix: &'a [Vec<f64>],
     topology: &'a TopologyInfo,
@@ -883,6 +986,7 @@ impl<'a> Widget for LatencyTable<'a> {
         }
 
         // Header for Target CPUs
+        // 目标 CPU 表头。讲解：绘制数值表横向的目标核编号。
         for j in 0..nr_cpus {
             let x = inner_area.x + 5 + (j as u16 * 3);
             if x < inner_area.right() {
@@ -936,22 +1040,28 @@ impl<'a> Widget for LatencyTable<'a> {
 }
 
 /// Format BenchLab results as a copyable text string (tab-specific copy)
+/// 将 BenchLab 结果格式化为可复制文本（标签页专用复制）。讲解：把基准测试数据导出成表格文本。
 fn format_bench_for_clipboard(app: &TuiApp) -> String {
     // (index, name, category, source: K=kernel kfunc, C=cake custom code)
+    // （索引，名称，分类，来源：K=内核 kfunc，C=cake 自定义代码）。讲解：定义每个基准项的元信息。
     // Groups: kfunc baseline first, then cake replacements. SPEED is per-group.
+    // 分组：先列内核 kfunc 基线，再列 cake 替代实现；SPEED 按组内计算。讲解：便于对比 cake 相对内核的加速比。
     let bench_items: &[(usize, &str, &str, &str)] = &[
         // Timing: all available clock sources
+        // 计时：所有可用的时钟源。讲解：对比各种获取时间的开销。
         (0, "bpf_ktime_get_ns()", "Timing", "K"),
         (1, "scx_bpf_now()", "Timing", "K"),
         (24, "bpf_ktime_get_boot_ns()", "Timing", "K"),
         (10, "Timing harness (cal)", "Timing", "C"),
         // Task Lookup: kfunc vs arena direct access
+        // 任务查找：kfunc 对比 arena 直接访问。讲解：比较不同方式获取任务上下文的成本。
         (3, "bpf_task_from_pid()", "Task Lookup", "K"),
         (29, "bpf_get_current_task_btf()", "Task Lookup", "K"),
         (36, "bpf_task_storage_get()", "Task Lookup", "K"),
         (6, "get_task_ctx() [arena]", "Task Lookup", "C"),
         (22, "get_task_ctx+arena CL0", "Task Lookup", "C"),
         // Process Info: kfunc alternatives
+        // 进程信息：kfunc 替代方案。讲解：比较获取进程标识信息的不同途径。
         (28, "bpf_get_current_pid_tgid()", "Process Info", "K"),
         (30, "bpf_get_current_comm()", "Process Info", "K"),
         (14, "task_struct p->scx+nvcsw", "Process Info", "K"),
@@ -960,53 +1070,65 @@ fn format_bench_for_clipboard(app: &TuiApp) -> String {
         (46, "Arena tctx.pid+tgid", "Process Info", "C"),
         (47, "Mbox CL0 cached_cpu", "Process Info", "C"),
         // CPU Identification: kfunc vs mailbox cached
+        // CPU 识别：kfunc 对比邮箱缓存。讲解：比较获取当前 CPU 编号的成本。
         (2, "bpf_get_smp_proc_id()", "CPU ID", "K"),
         (31, "bpf_get_numa_node_id()", "CPU ID", "K"),
         (11, "Mbox CL0 cached CPU", "CPU ID", "C"),
         // Idle Probing: kfunc vs cake probes
+        // 空闲探测：kfunc 对比 cake 探测。讲解：比较查找空闲 CPU 的开销。
         (4, "test_and_clear_idle()", "Idle Probing", "K"),
         (37, "scx_bpf_pick_idle_cpu()", "Idle Probing", "K"),
         (38, "idle_cpumask get+put", "Idle Probing", "K"),
         (19, "idle_probe(remote) MESI", "Idle Probing", "C"),
         (20, "smtmask read-only check", "Idle Probing", "C"),
         // Data Read: kernel struct vs cake data paths
+        // 数据读取：内核结构体对比 cake 数据路径。讲解：比较不同数据源的读取成本。
         (8, "BSS global_stats[cpu]", "Data Read", "C"),
         (9, "Arena per_cpu.mbox", "Data Read", "C"),
         (15, "RODATA llc+quantum_ns", "Data Read", "C"),
         // Mailbox CL0: cake's Disruptor handoff variants
+        // 邮箱 CL0：cake 的 Disruptor 交接变体。讲解：比较缓存行邮箱交接的不同实现。
         (12, "Mbox CL0 tctx+deref", "Mailbox CL0", "C"),
         (18, "CL0 ptr+fused+packed", "Mailbox CL0", "C"),
         (21, "Disruptor CL0 full read", "Mailbox CL0", "C"),
         // Composite: cake-only multi-step operations
+        // 复合操作：仅 cake 的多步操作。讲解：测量多步组合操作的整体开销。
         (16, "Bitflag shift+mask+brless", "Composite Ops", "C"),
         (17, "(reserved, was compute_ewma)", "Composite Ops", "C"),
         // DVFS / Performance: CPU frequency queries
+        // DVFS / 性能：CPU 频率查询。讲解：比较查询 CPU 频率/性能的成本。
         (35, "scx_bpf_cpuperf_cur(cpu)", "DVFS / Perf", "K"),
         (42, "scx_bpf_cpuperf_cap(cpu)", "DVFS / Perf", "K"),
         (45, "RODATA cpuperf_cap[cpu]", "DVFS / Perf", "C"),
         // Topology Constants: kfunc vs RODATA
+        // 拓扑常量：kfunc 对比 RODATA。讲解：比较获取拓扑常量的两种方式成本。
         (5, "scx_bpf_nr_cpu_ids()", "Topology", "K"),
         (34, "scx_bpf_nr_node_ids()", "Topology", "K"),
         (43, "RODATA nr_cpus const", "Topology", "C"),
         (44, "RODATA nr_nodes const", "Topology", "C"),
         // Standalone Kfuncs: reference costs
+        // 独立 kfunc：参考成本。讲解：测量若干独立 kfunc 的基准开销。
         (7, "scx_bpf_dsq_nr_queued()", "Standalone Kfuncs", "K"),
         (13, "ringbuf reserve+discard", "Standalone Kfuncs", "K"),
         (39, "scx_bpf_kick_cpu(self)", "Standalone Kfuncs", "K"),
         // Synchronization: lock/RNG costs
+        // 同步：锁/随机数成本。讲解：测量自旋锁与随机数生成的开销。
         (41, "bpf_spin_lock+unlock", "Synchronization", "K"),
         (40, "bpf_get_prandom_u32()", "Synchronization", "K"),
         (48, "CL0 lock-free 3-field", "Synchronization", "C"),
         (49, "BSS xorshift32 PRNG", "Synchronization", "C"),
         // TLB/Memory: arena access pattern cost
+        // TLB/内存：arena 访问模式成本。讲解：测量跨步访问 arena 引起的 TLB/内存开销。
         (23, "Arena stride (TLB/hugepage)", "TLB/Memory", "C"),
         // Kernel Free Data: zero-cost task_struct field reads
+        // 内核免费数据：零成本读取 task_struct 字段。讲解：这些字段已在内存中读取几乎不额外耗时。
         (50, "PELT util+runnable_avg", "Kernel Free Data", "K"),
         (51, "PELT runnable_avg only", "Kernel Free Data", "K"),
         (52, "schedstats nr_wakeups", "Kernel Free Data", "K"),
         (53, "p->policy+prio+flags", "Kernel Free Data", "K"),
         (54, "PELT read+tier classify", "Kernel Free Data", "K"),
         // End-to-End Workflow Comparisons
+        // 端到端工作流对比。讲解：比较完整读写/选核等工作流的整体成本。
         (55, "task_storage write+read", "Storage Roundtrip", "C"),
         (56, "Arena write+read", "Storage Roundtrip", "C"),
         (57, "3-probe cascade (cake)", "Idle Selection", "C"),
@@ -1016,9 +1138,12 @@ fn format_bench_for_clipboard(app: &TuiApp) -> String {
         (61, "SMT: cake sib probe", "SMT Probing", "C"),
         (62, "SMT: cpumask probe", "SMT Probing", "K"),
         // ═══ Fairness Fixes (cold-cache + remote) ═══
+        // ═══ 公平性修复（冷缓存 + 远程）═══。讲解：单列冷缓存/跨核场景以修正测量偏差。
         // Note: cold probes use arena-stride L1 pollution. storage_get cold
         // can't evict task_struct — add ~10ns (L3 hit) conservatively.
         // kick_cpu remote measures bit-set only — add ~100ns for IPI delivery.
+        // 注意：冷探测用 arena 跨步污染 L1；storage_get 冷路径无法驱逐 task_struct，保守加约 10ns（L3 命中）；
+        // kick_cpu 远程仅测量位设置，需为 IPI 投递额外加约 100ns。讲解：对冷缓存与远程唤醒的估算做人工补偿。
         (63, "storage_get COLD ~est", "Cold Cache", "K"),
         (64, "PELT classify COLD", "Cold Cache", "K"),
         (65, "legacy EWMA COLD", "Cold Cache", "C"),
@@ -1037,6 +1162,7 @@ fn format_bench_for_clipboard(app: &TuiApp) -> String {
 
     let mut output = String::new();
     // System hardware context header
+    // 系统硬件上下文头部。讲解：在导出文本顶部附上硬件信息作为背景。
     output.push_str(&app.system_info.format_header());
     output.push('\n');
     output.push_str(&format!(
@@ -1051,10 +1177,12 @@ fn format_bench_for_clipboard(app: &TuiApp) -> String {
 
     let mut last_cat = "";
     let mut cat_baseline: u64 = 1; // per-category baseline AVG
+    // 每个分类的基线平均值。讲解：以组内第一项为基准计算加速比。
     for &(idx, name, cat, src) in bench_items {
         if cat != last_cat {
             last_cat = cat;
             // Reset baseline for new category — first entry with data becomes base
+            // 遇到新分类时重置基线——首个有数据的项成为基准。讲解：每组独立计算相对加速。
             cat_baseline = 0;
             output.push_str(&format!("\n▸ {}\n", cat));
         }
@@ -1085,6 +1213,7 @@ fn format_bench_for_clipboard(app: &TuiApp) -> String {
 }
 
 /// Format stats as a copyable text string
+/// 将统计数据格式化为可复制文本。讲解：把全局与任务级统计导出为纯文本便于粘贴分析。
 fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
     let total_dispatches = stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches;
     let new_pct = if total_dispatches > 0 {
@@ -1097,6 +1226,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
     output.push_str(&app.system_info.format_header());
 
     // Compact state/game/uptime line
+    // 紧凑的状态/游戏/运行时长行。讲解：一行汇总当前调度状态与识别到的游戏信息。
     let state_str = match app.sched_state {
         2 => {
             let conf_label = match app.game_confidence {
@@ -1128,6 +1258,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
     ));
 
     // Compact dispatch stats
+    // 紧凑的派发统计。讲解：汇总本地/窃取/未命中等派发指标。
     let dsq_depth = stats.nr_dsq_queued.saturating_sub(stats.nr_dsq_consumed);
     let total_dispatch_calls = stats.nr_dispatch_hint_skip
         + stats.nr_dispatch_misses
@@ -1151,6 +1282,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
     ));
 
     // Compact callback profile (all on 2 lines)
+    // 紧凑的回调剖析（全部压缩在 2 行内）。讲解：汇总各调度回调的耗时与调用统计。
     let stop_total = stats.nr_stop_confidence_skip
         + stats.nr_stop_classify
         + stats.nr_stop_ramp
@@ -1179,11 +1311,13 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
     }
 
     // Task matrix header — compact column key
+    // 任务矩阵表头——紧凑列名说明。讲解：给出各列缩写的含义索引。
     output.push_str("\ntasks: [PPID PID ST COMM CLS PELT AVG MAX GAP JIT WAIT R/s CPU SEL ENQ STOP RUN G1 G3 DSQ MIG/s WHIST]\n");
     output.push_str("       [detail-A: gates% + DIRECT DEFI YIELD PRMPT ENQ MASK MAX_GAP DSQ_INS RUNS SUTIL LLC STREAK WAKER VCSW ICSW CONF TGID]\n");
     output.push_str("       [detail-B: sw=cascade/probe/vtime/mbox/pelt/classify/vstg/warm(ns) qc=F%/Y%/P% wk=pid/tgid@cpu dist=C:pct,...]\n");
 
     // Dump always captures ALL BPF-tracked tasks (not filtered by TUI view)
+    // 转储始终采集所有被 BPF 跟踪的任务（不受 TUI 视图过滤影响）。讲解：导出完整数据便于离线分析。
     let mut dump_pids: Vec<u32> = app
         .task_rows
         .iter()
@@ -1196,6 +1330,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
         r_b.pelt_util.cmp(&r_a.pelt_util)
     });
     // TGID grouping (same logic as TUI)
+    // 按 TGID 分组（与 TUI 相同逻辑）。讲解：将同一进程的线程归组显示。
     let mut tgid_rank: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for (i, pid) in dump_pids.iter().enumerate() {
         if let Some(row) = app.task_rows.get(pid) {
@@ -1216,6 +1351,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
     });
 
     // Pre-compute thread counts per tgid
+    // 预先计算每个 tgid 的线程数。讲解：便于在进程组表头显示线程数量。
     let mut tgid_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     for &pid in &dump_pids {
         if let Some(row) = app.task_rows.get(&pid) {
@@ -1230,6 +1366,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
             let tgid = if row.tgid > 0 { row.tgid } else { pid };
 
             // Process group header
+            // 进程组表头。讲解：每遇到新进程组时输出一行组标题。
             if tgid != last_tgid {
                 let count = tgid_counts.get(&tgid).copied().unwrap_or(1);
                 let proc_name = if let Some(tgid_row) = app.task_rows.get(&tgid) {
@@ -1255,6 +1392,8 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
                 // Game family member: show ●GAME badge to signal boost status.
                 // This takes priority over HOG/BG which are cosmetic PELT labels.
                 // Note: BPF's can_squeeze = !is_game so game tasks are NEVER squeezed.
+                // 游戏家族成员：显示 ●GAME 徽章表示已提权。优先于 HOG/BG 这类仅装饰用的 PELT 标签。
+                // 注意：BPF 中 can_squeeze = !is_game，因此游戏任务永远不会被挤压。讲解：确保游戏任务始终受保护。
                 TaskStatus::Alive if row.is_game_member => "●GAME",
                 TaskStatus::Alive if row.is_hog => "●HOG",
                 TaskStatus::Alive if row.is_bg => "●BG",
@@ -1288,6 +1427,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
                 row.comm,
                 cls_str,
                 row.pelt_util,  // PELT utilization (0-1024)
+                // PELT 利用率（0-1024）。讲解：内核 PELT 负载值，1024 表示满载。
                 row.max_runtime_us,
                 row.dispatch_gap_us,
                 j_us,
@@ -1299,12 +1439,16 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
                 row.stopping_duration_ns,
                 row.running_duration_ns,
                 row.gate_hit_pcts[0],  // G1
+                // 门 G1 命中率。讲解：任务命中第一个调度门的比例。
                 row.gate_hit_pcts[3],  // G3
+                // 门 G3 命中率。讲解：任务命中第三个调度门的比例。
                 row.gate_hit_pcts[9],  // DSQ
+                // DSQ 门命中率。讲解：任务经由 DSQ 派发的比例。
                 row.migrations_per_sec,
                 row.wait_hist[0], row.wait_hist[1], row.wait_hist[2], row.wait_hist[3],
             ));
             // detail-A: gate % (G1/G3/DSQ) + all extended fields, compact labels
+            // 明细 A：门命中率（G1/G3/DSQ）+ 全部扩展字段，采用紧凑标签。讲解：任务第二行的详细遥测。
             output.push_str(&format!(
                 "{}  g={:.0}/{:.0}/{:.0} dir={} defi={}µs yld={} prmpt={} enq={} mask={} maxgap={}µs dsqins={}ns runs={} sutil={}% llc=L{:02} streak={} waker={} vcsw={} icsw={} conf={}/{} tgid={}\n",
                 indent,
@@ -1317,6 +1461,7 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
                 row._pad_recomp, row.total_runs, row.tgid,
             ));
             // detail-B: stopwatch(ns) + quantum completion % + waker + cpu dist — all one line
+            // 明细 B：秒表(ns) + 时间片完成率 + 唤醒者 + CPU 分布，全部压缩为一行。讲解：任务第三行的深度剖析数据。
             let q_total = row.quantum_full_count as u32
                 + row.quantum_yield_count as u32
                 + row.quantum_preempt_count as u32;
@@ -1365,10 +1510,12 @@ fn format_stats_for_clipboard(stats: &cake_stats, app: &TuiApp) -> String {
 }
 
 /// Draw the UI
+/// 绘制整个界面。讲解：顶层渲染函数，负责标签栏、内容区与页脚。
 fn draw_ui(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats) {
     let area = frame.area();
 
     // --- Tab Bar ---
+    // --- 标签栏 ---。讲解：顶部的多标签页切换条。
     let tab_titles = vec![" Dashboard ", " Topology ", " BenchLab ", " Reference "];
     let tabs = Tabs::new(tab_titles)
         .select(match app.active_tab {
@@ -1398,18 +1545,23 @@ fn draw_ui(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats) {
         );
 
     // Create main outer layout
+    // 创建主外层布局。讲解：把界面纵向分为标签栏、内容区和页脚三块。
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Tab bar (bordered)
+            // 标签栏（带边框）。讲解：固定高度 3 行。
             Constraint::Min(0),    // Active View
+            // 当前视图。讲解：占据剩余空间显示激活的标签页。
             Constraint::Length(3), // Footer
+            // 页脚。讲解：固定高度 3 行显示按键提示。
         ])
         .split(area);
 
     frame.render_widget(tabs, main_layout[0]);
 
     // Render active view
+    // 渲染当前视图。讲解：按激活标签分派到对应的绘制函数。
     match app.active_tab {
         TuiTab::Dashboard => draw_dashboard_tab(frame, app, stats, main_layout[1]),
         TuiTab::Topology => draw_topology_tab(frame, app, main_layout[1]),
@@ -1418,6 +1570,7 @@ fn draw_ui(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats) {
     }
 
     // --- Footer (key bindings + status) ---
+    // --- 页脚（按键绑定 + 状态）---。讲解：底部展示快捷键说明与临时状态消息。
     let arrow = if app.sort_descending { "▼" } else { "▲" };
     let sort_label = match app.sort_column {
         SortColumn::RunDuration => format!("[RunTM]{}", arrow),
@@ -1462,16 +1615,21 @@ fn draw_ui(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats) {
 
 fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, area: Rect) {
     // Full-width stacked layout: compact header → tier performance → task matrix
+    // 全宽纵向堆叠布局：紧凑头部 → 层级性能 → 任务矩阵。讲解：仪表盘从上到下分三段展示。
     let outer_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // Header: 3 content lines (stats + sched + state/game) + 2 borders
+            // 头部：3 行内容（统计+调度+状态/游戏）+ 2 行边框。讲解：固定高度 5 行。
             Constraint::Length(8), // Tier performance panel (4 rows + header + borders)
+            // 层级性能面板（4 行 + 表头 + 边框）。讲解：固定高度 8 行。
             Constraint::Min(10),   // Full-width Task Matrix
+            // 全宽任务矩阵。讲解：占用剩余空间显示任务列表。
         ])
         .split(area);
 
     // --- Compact Header: system info + tier counts on one line ---
+    // --- 紧凑头部：系统信息 + 层级计数于一行 ---。讲解：在一行内浓缩关键状态。
     let total_dispatches = stats.nr_new_flow_dispatches + stats.nr_old_flow_dispatches;
     let new_pct = if total_dispatches > 0 {
         (stats.nr_new_flow_dispatches as f64 / total_dispatches as f64) * 100.0
@@ -1480,6 +1638,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     };
 
     // PELT tier summary: count tasks by utilization bands
+    // PELT 层级汇总：按利用率区间统计任务数。讲解：将任务按负载高低分档计数。
     let (mut wc0, mut wc1, mut wc2, mut wc3) = (0u32, 0u32, 0u32, 0u32);
     for row in app.task_rows.values() {
         if !row.is_bpf_tracked || row.total_runs == 0 {
@@ -1516,6 +1675,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     };
 
     // CPU frequency from sysfs (best-effort, CPU 0 as representative)
+    // 从 sysfs 读取 CPU 频率（尽力而为，以 CPU 0 为代表）。讲解：读取 cpu0 当前频率作展示。
     let cpu_freq_str =
         std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
             .ok()
@@ -1524,6 +1684,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
             .unwrap_or_default();
 
     // Hog count for header visibility
+    // 头部显示用的占用型任务计数。讲解：统计被标记为 HOG 的任务数。
     let hog_count = app.task_rows.values().filter(|r| r.is_hog).count();
     let bg_count = app.task_rows.values().filter(|r| r.is_bg).count();
     let squeeze_str = match (hog_count > 0, bg_count > 0) {
@@ -1534,6 +1695,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     };
 
     // Line 1: CPU | Dispatches | Tier Distribution
+    // 第 1 行：CPU | 派发 | 层级分布。讲解：头部第一行汇总硬件与派发概况。
     let line1 =
         format!(
         " CPU: {}{}  │  Dispatches: {} ({:.0}% new)  │  Tiers: T0:{} T1:{} T2:{} T3:{}  │  {}{}{}",
@@ -1548,6 +1710,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     );
 
     // Line 2: Dispatch locality | Queue depth | Tasks | Filter
+    // 第 2 行：派发局部性 | 队列深度 | 任务 | 过滤。讲解：头部第二行展示派发质量与队列状态。
     let dsq_depth = stats.nr_dsq_queued.saturating_sub(stats.nr_dsq_consumed);
     let _filter_label = if app.show_all_tasks {
         "ALL tasks"
@@ -1556,6 +1719,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     };
 
     // Hint effectiveness: what % of dispatch calls skipped the kfunc
+    // 提示有效性：多少比例的派发调用跳过了 kfunc。讲解：衡量派发提示命中带来的开销节省。
     let total_dispatch_calls = stats.nr_dispatch_hint_skip
         + stats.nr_dispatch_misses
         + stats.nr_local_dispatches
@@ -1567,6 +1731,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     };
 
     // Queue depth warning: if tasks are piling up, the hint may be causing stalls
+    // 队列深度告警：若任务堆积，说明提示可能造成停顿。讲解：队列过深时给出警示图标。
     let queue_str = if dsq_depth > 10 {
         format!("⚠ Queue:{}", dsq_depth)
     } else {
@@ -1587,8 +1752,10 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     );
 
     // State label — shown in header for all three operating states
+    // 状态标签——三种运行状态都会在头部显示。讲解：根据调度状态生成对应文字。
     let state_line = match app.sched_state {
         2 => String::new(), // GAMING: state shown inline in game_line below
+        // 游戏中：状态在下面的 game_line 里内联显示。讲解：游戏态另行拼接故此处留空。
         1 => format!(
             " State: COMPILATION | {} compiler task{} active",
             app.compile_task_count,
@@ -1599,6 +1766,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
 
     let header_text = if app.tracked_game_tgid > 0 {
         // Confidence tag: shows detection tier + poll stability
+        // 置信度标记：显示检测等级 + 轮询稳定度。讲解：告诉用户游戏识别的可信程度。
         let conf_label = match app.game_confidence {
             100 => "Steam",
             90 => "Wine/.exe",
@@ -1623,6 +1791,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
             stability,
         );
         // Show challenger holdoff status if active
+        // 若有挑战者则显示其等待接管状态。讲解：展示挑战者已坚持的时长/阈值。
         if app.game_challenger_ppid > 0 {
             if let Some(since) = app.game_challenger_since {
                 let elapsed = since.elapsed().as_secs();
@@ -1656,7 +1825,9 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     frame.render_widget(header, outer_layout[0]);
 
     // --- PELT Utilization Tier Panel ---
+    // --- PELT 利用率层级面板 ---。讲解：按负载分档展示各层任务的性能汇总。
     // Aggregate by PELT bands: P0 <5%, P1 5-25%, P2 25-78%, P3 ≥HOG
+    // 按 PELT 区间聚合：P0 <5%，P1 5-25%，P2 25-78%，P3 ≥HOG。讲解：定义四个负载分档边界。
     let mut tier_pids = [0u32; 4];
     let mut tier_avg_rt_sum = [0u64; 4];
     let mut tier_jitter_sum = [0u64; 4];
@@ -1665,7 +1836,9 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     let mut tier_active = [0u32; 4];
 
     // --- CLASS Distribution Panel ---
+    // --- 调度类别分布面板 ---。讲解：按调度类别（GAME/NORM/HOG/BG）汇总统计。
     // Aggregate by scheduling class: GAME=1, NORM=0, HOG=2, BG=3
+    // 按调度类别聚合：GAME=1，NORM=0，HOG=2，BG=3。讲解：定义类别与索引的映射。
     let mut cls_pids = [0u32; 4];
     let mut cls_pelt_sum = [0u64; 4];
     let mut cls_wait_sum = [0u64; 4];
@@ -1677,6 +1850,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
             continue;
         }
         // PELT tier aggregation
+        // PELT 层级聚合。讲解：把当前任务归入对应的负载档并累加统计。
         let t = match row.pelt_util {
             0..=49 => 0,
             50..=255 => 1,
@@ -1692,12 +1866,18 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
         tier_wait_sum[t] += row.wait_duration_ns / row.total_runs as u64 / 1000;
 
         // CLASS aggregation (tier field: 0=NORM, 1=GAME, 2=HOG, 3=BG)
+        // 类别聚合（tier 字段：0=NORM，1=GAME，2=HOG，3=BG）。讲解：把 tier 值重排为面板行索引。
         let c = match row.tier {
             1 => 0, // GAME
+            // GAME 游戏类。讲解：游戏任务归第 0 行。
             0 => 1, // NORM
+            // NORM 普通类。讲解：普通任务归第 1 行。
             2 => 2, // HOG
+            // HOG 占用类。讲解：贪占任务归第 2 行。
             3 => 3, // BG
+            // BG 后台类。讲解：后台任务归第 3 行。
             _ => 1, // default NORM
+            // 默认归 NORM。讲解：未知 tier 视为普通任务。
         };
         cls_pids[c] += 1;
         cls_pelt_sum[c] += row.pelt_util as u64;
@@ -1709,10 +1889,12 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     let total_runs_sec: f64 = tier_runs_per_sec.iter().sum();
 
     // Split tier row into two side-by-side panels
+    // 将该行拆分为左右并排的两个面板。讲解：左侧放 PELT 层级，右侧放类别分布。
     let tier_cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(outer_layout[1]);
 
     // ── Left: PELT Utilization Tiers ──
+    // ── 左侧：PELT 利用率层级 ──。讲解：绘制左半部分的负载分档表。
     let tier_names = ["P0 <5%", "P1 5-25%", "P2 25-78%", "P3 ≥HOG"];
     let tier_colors = [Color::LightCyan, Color::Green, Color::Yellow, Color::Red];
 
@@ -1787,12 +1969,19 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
         tier_rows,
         [
             Constraint::Length(15), // TIER
+            // 层级列。讲解：负载档名称列宽 15。
             Constraint::Length(6),  // PIDs
+            // PID 数列。讲解：该档任务数量列宽 6。
             Constraint::Length(10), // AVG RT
+            // 平均运行时列。讲解：平均运行时长列宽 10。
             Constraint::Length(10), // AVG JIT
+            // 平均抖动列。讲解：平均抖动列宽 10。
             Constraint::Length(9),  // WAIT µs
+            // 等待微秒列。讲解：平均等待时长列宽 9。
             Constraint::Length(9),  // RUNS/s
+            // 每秒运行次数列。讲解：运行速率列宽 9。
             Constraint::Length(7),  // WORK%
+            // 工作占比列。讲解：该档工作量占比列宽 7。
         ],
     )
     .header(tier_header)
@@ -1811,6 +2000,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     frame.render_widget(tier_table, tier_cols[0]);
 
     // ── Right: CLASS Distribution ──
+    // ── 右侧：类别分布 ──。讲解：绘制右半部分的调度类别汇总表。
     let cls_names = ["GAME", "NORM", "HOG", "BG"];
     let cls_colors = [Color::Green, Color::Blue, Color::Yellow, Color::Red];
 
@@ -1878,11 +2068,17 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
         cls_rows,
         [
             Constraint::Length(7), // CLASS
+            // 类别列。讲解：调度类别名称列宽 7。
             Constraint::Length(6), // PIDs
+            // PID 数列。讲解：该类任务数量列宽 6。
             Constraint::Length(6), // PELT
+            // PELT 列。讲解：平均 PELT 利用率列宽 6。
             Constraint::Length(9), // WAIT µs
+            // 等待微秒列。讲解：平均等待时长列宽 9。
             Constraint::Length(9), // RUNS/s
+            // 每秒运行次数列。讲解：运行速率列宽 9。
             Constraint::Length(7), // WORK%
+            // 工作占比列。讲解：该类工作量占比列宽 7。
         ],
     )
     .header(cls_header)
@@ -1924,12 +2120,14 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Classification (LightMagenta) ──
+        // ── 分类（亮品红）──。讲解：分类相关列使用亮品红配色。
         Cell::from("CLS").style(
             Style::default()
                 .fg(Color::LightMagenta)
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Timing (Cyan) ──
+        // ── 计时（青色）──。讲解：计时相关列使用青色配色。
         Cell::from("VCSW").style(
             Style::default()
                 .fg(Color::Cyan)
@@ -1966,12 +2164,14 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Placement (Magenta) ──
+        // ── 放置（品红）──。讲解：核放置相关列使用品红配色。
         Cell::from("CPU").style(
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Callback Overhead (LightCyan) ──
+        // ── 回调开销（亮青）──。讲解：各回调耗时列使用亮青配色。
         Cell::from("SEL").style(
             Style::default()
                 .fg(Color::LightCyan)
@@ -1993,6 +2193,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Gate Distribution (Green) ──
+        // ── 门分布（绿色）──。讲解：调度门命中率列使用绿色配色。
         Cell::from("G1").style(
             Style::default()
                 .fg(Color::Green)
@@ -2009,18 +2210,21 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Placement (Magenta) ──
+        // ── 放置（品红）──。讲解：迁移速率列使用品红配色。
         Cell::from("MIGR/s").style(
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Identity (DarkGray) ──
+        // ── 身份（深灰）──。讲解：标识类列（如 TGID）使用深灰配色。
         Cell::from("TGID").style(
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Quantum Completion (LightYellow) ──
+        // ── 时间片完成（亮黄）──。讲解：时间片完成率列使用亮黄配色。
         Cell::from("Q%F").style(
             Style::default()
                 .fg(Color::LightYellow)
@@ -2037,12 +2241,14 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
                 .add_modifier(Modifier::BOLD),
         ),
         // ── EEVDF (LightGreen) ──
+        // ── EEVDF（亮绿）──。讲解：EEVDF 相关列（如唤醒者）使用亮绿配色。
         Cell::from("WAKER").style(
             Style::default()
                 .fg(Color::LightGreen)
                 .add_modifier(Modifier::BOLD),
         ),
         // ── Classification (LightMagenta) ──
+        // ── 分类（亮品红）──。讲解：NICE 优先级列使用亮品红配色。
         Cell::from("NICE").style(
             Style::default()
                 .fg(Color::LightMagenta)
@@ -2055,6 +2261,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
     let mut last_tgid: u32 = 0;
 
     // Pre-compute thread counts per tgid for the header
+    // 为表头预先计算每个 tgid 的线程数。讲解：便于在进程组标题显示线程数量。
     let mut tgid_thread_counts: std::collections::HashMap<u32, u32> =
         std::collections::HashMap::new();
     for pid in &app.sorted_pids {
@@ -2072,6 +2279,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
         let tgid = if row.tgid > 0 { row.tgid } else { *pid };
 
         // Insert process group header when tgid changes
+        // 当 tgid 变化时插入进程组表头。讲解：为每个新进程组输出可折叠标题行。
         if tgid != last_tgid {
             let thread_count = tgid_thread_counts.get(&tgid).copied().unwrap_or(1);
             let proc_name = if let Some(tgid_row) = app.task_rows.get(&tgid) {
@@ -2097,16 +2305,19 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut TuiApp, stats: &cake_stats, a
         }
 
         // Skip entire PPID group if collapsed
+        // 若整个 PPID 组已折叠则跳过。讲解：折叠时不渲染该父进程下的任务。
         if app.collapsed_ppids.contains(&row.ppid) && row.ppid > 0 {
             continue;
         }
 
         // Skip child threads if their TGID is collapsed
+        // 若子线程所属 TGID 已折叠则跳过。讲解：折叠进程时隐藏其子线程行。
         if tgid != *pid && app.collapsed_tgids.contains(&tgid) {
             continue;
         }
 
         // Voluntary context switch color: higher = more GPU/IO activity
+        // 主动上下文切换颜色：数值越高表示 GPU/IO 活动越多。讲解：用颜色分级直观反映 VCSW 强度。
         let vcsw_style = match row.nvcsw_delta {
             0..=10 => Style::default().fg(Color::DarkGray),
             11..=64 => Style::default().fg(Color::Green),
@@ -2536,20 +2747,25 @@ fn draw_reference_tab(frame: &mut Frame, area: Rect) {
 
 fn draw_bench_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     // (index, name, category, source: K=kernel kfunc, C=cake custom code)
+    // （索引，名称，分类，来源：K=内核 kfunc，C=cake 自定义代码）。讲解：定义每个基准项的元信息。
     // Groups: kfunc baseline first, then cake replacements. SPEED is per-group.
+    // 分组：先列内核 kfunc 基线，再列 cake 替代实现；SPEED 按组内计算。讲解：便于对比 cake 相对内核的加速比。
     let bench_items: &[(usize, &str, &str, &str)] = &[
         // Timing: all available clock sources
+        // 计时：所有可用的时钟源。讲解：对比各种获取时间的开销。
         (0, "bpf_ktime_get_ns()", "Timing", "K"),
         (1, "scx_bpf_now()", "Timing", "K"),
         (24, "bpf_ktime_get_boot_ns()", "Timing", "K"),
         (10, "Timing harness (cal)", "Timing", "C"),
         // Task Lookup: kfunc vs arena direct access
+        // 任务查找：kfunc 对比 arena 直接访问。讲解：比较不同方式获取任务上下文的成本。
         (3, "bpf_task_from_pid()", "Task Lookup", "K"),
         (29, "bpf_get_current_task_btf()", "Task Lookup", "K"),
         (36, "bpf_task_storage_get()", "Task Lookup", "K"),
         (6, "get_task_ctx() [arena]", "Task Lookup", "C"),
         (22, "get_task_ctx+arena CL0", "Task Lookup", "C"),
         // Process Info: kfunc alternatives
+        // 进程信息：kfunc 替代方案。讲解：比较获取进程标识信息的不同途径。
         (28, "bpf_get_current_pid_tgid()", "Process Info", "K"),
         (30, "bpf_get_current_comm()", "Process Info", "K"),
         (14, "task_struct p->scx+nvcsw", "Process Info", "K"),
@@ -2558,53 +2774,65 @@ fn draw_bench_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         (46, "Arena tctx.pid+tgid", "Process Info", "C"),
         (47, "Mbox CL0 cached_cpu", "Process Info", "C"),
         // CPU Identification: kfunc vs mailbox cached
+        // CPU 识别：kfunc 对比邮箱缓存。讲解：比较获取当前 CPU 编号的成本。
         (2, "bpf_get_smp_proc_id()", "CPU ID", "K"),
         (31, "bpf_get_numa_node_id()", "CPU ID", "K"),
         (11, "Mbox CL0 cached CPU", "CPU ID", "C"),
         // Idle Probing: kfunc vs cake probes
+        // 空闲探测：kfunc 对比 cake 探测。讲解：比较查找空闲 CPU 的开销。
         (4, "test_and_clear_idle()", "Idle Probing", "K"),
         (37, "scx_bpf_pick_idle_cpu()", "Idle Probing", "K"),
         (38, "idle_cpumask get+put", "Idle Probing", "K"),
         (19, "idle_probe(remote) MESI", "Idle Probing", "C"),
         (20, "smtmask read-only check", "Idle Probing", "C"),
         // Data Read: kernel struct vs cake data paths
+        // 数据读取：内核结构体对比 cake 数据路径。讲解：比较不同数据源的读取成本。
         (8, "BSS global_stats[cpu]", "Data Read", "C"),
         (9, "Arena per_cpu.mbox", "Data Read", "C"),
         (15, "RODATA llc+quantum_ns", "Data Read", "C"),
         // Mailbox CL0: cake's Disruptor handoff variants
+        // 邮箱 CL0：cake 的 Disruptor 交接变体。讲解：比较缓存行邮箱交接的不同实现。
         (12, "Mbox CL0 tctx+deref", "Mailbox CL0", "C"),
         (18, "CL0 ptr+fused+packed", "Mailbox CL0", "C"),
         (21, "Disruptor CL0 full read", "Mailbox CL0", "C"),
         // Composite: cake-only multi-step operations
+        // 复合操作：仅 cake 的多步操作。讲解：测量多步组合操作的整体开销。
         (16, "Bitflag shift+mask+brless", "Composite Ops", "C"),
         (17, "(reserved, was compute_ewma)", "Composite Ops", "C"),
         // DVFS / Performance: CPU frequency queries
+        // DVFS / 性能：CPU 频率查询。讲解：比较查询 CPU 频率/性能的成本。
         (35, "scx_bpf_cpuperf_cur(cpu)", "DVFS / Perf", "K"),
         (42, "scx_bpf_cpuperf_cap(cpu)", "DVFS / Perf", "K"),
         (45, "RODATA cpuperf_cap[cpu]", "DVFS / Perf", "C"),
         // Topology Constants: kfunc vs RODATA
+        // 拓扑常量：kfunc 对比 RODATA。讲解：比较获取拓扑常量的两种方式成本。
         (5, "scx_bpf_nr_cpu_ids()", "Topology", "K"),
         (34, "scx_bpf_nr_node_ids()", "Topology", "K"),
         (43, "RODATA nr_cpus const", "Topology", "C"),
         (44, "RODATA nr_nodes const", "Topology", "C"),
         // Standalone Kfuncs: reference costs
+        // 独立 kfunc：参考成本。讲解：测量若干独立 kfunc 的基准开销。
         (7, "scx_bpf_dsq_nr_queued()", "Standalone Kfuncs", "K"),
         (13, "ringbuf reserve+discard", "Standalone Kfuncs", "K"),
         (39, "scx_bpf_kick_cpu(self)", "Standalone Kfuncs", "K"),
         // Synchronization: lock/RNG costs
+        // 同步：锁/随机数成本。讲解：测量自旋锁与随机数生成的开销。
         (41, "bpf_spin_lock+unlock", "Synchronization", "K"),
         (40, "bpf_get_prandom_u32()", "Synchronization", "K"),
         (48, "CL0 lock-free 3-field", "Synchronization", "C"),
         (49, "BSS xorshift32 PRNG", "Synchronization", "C"),
         // TLB/Memory: arena access pattern cost
+        // TLB/内存：arena 访问模式成本。讲解：测量跨步访问 arena 引起的 TLB/内存开销。
         (23, "Arena stride (TLB/hugepage)", "TLB/Memory", "C"),
         // Kernel Free Data: zero-cost task_struct field reads
+        // 内核免费数据：零成本读取 task_struct 字段。讲解：这些字段已在内存中读取几乎不额外耗时。
         (50, "PELT util+runnable_avg", "Kernel Free Data", "K"),
         (51, "PELT runnable_avg only", "Kernel Free Data", "K"),
         (52, "schedstats nr_wakeups", "Kernel Free Data", "K"),
         (53, "p->policy+prio+flags", "Kernel Free Data", "K"),
         (54, "PELT read+tier classify", "Kernel Free Data", "K"),
         // End-to-End Workflow Comparisons
+        // 端到端工作流对比。讲解：比较完整读写/选核等工作流的整体成本。
         (55, "task_storage write+read", "Storage Roundtrip", "C"),
         (56, "Arena write+read", "Storage Roundtrip", "C"),
         (57, "3-probe cascade (cake)", "Idle Selection", "C"),
@@ -2614,6 +2842,7 @@ fn draw_bench_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         (61, "SMT: cake sib probe", "SMT Probing", "C"),
         (62, "SMT: cpumask probe", "SMT Probing", "K"),
         // ═══ Fairness Fixes (cold-cache + remote) ═══
+        // ═══ 公平性修复（冷缓存 + 远程）═══。讲解：单列冷缓存/跨核场景以修正测量偏差。
         (63, "storage_get COLD ~est", "Cold Cache", "K"),
         (64, "PELT classify COLD", "Cold Cache", "K"),
         (65, "legacy EWMA COLD", "Cold Cache", "C"),

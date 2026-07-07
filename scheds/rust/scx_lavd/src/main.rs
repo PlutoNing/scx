@@ -467,10 +467,12 @@ impl<'a> Scheduler<'a> {
             0
         };
         let mut skel_builder = BpfSkelBuilder::default();
+        /* 设置debug模式 */
         skel_builder.obj_builder.debug(debug_level > 1);
         init_libbpf_logging(Some(PrintLevel::Debug));
 
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
+        /* 打开bpf */
         let mut skel = scx_ops_open!(skel_builder, open_object, lavd_ops, open_opts)?;
 
         // Enable futex tracing using ftrace if available. If the ftrace is not
@@ -486,11 +488,15 @@ impl<'a> Scheduler<'a> {
 
         // Initialize CPU topology with CLI arguments
         let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em).unwrap();
+        /* 初始化系统的各个cpu建模 */
         Self::init_cpus(&mut skel, &order);
+        /* 系统llc,cpu的拓扑等 */
         Self::init_cpdoms(&mut skel, &order);
 
         // When there are multiple domains, hook the execve() syscall family
         // to enable aggressive cross-domain migration when execve() is called.
+        /* 附加一个tracepoint
+        如果有进程执行exec, 看情况进行kick */
         if order.cpdom_map.len() > 1 {
             Self::attach_execve_tracepoints(&mut skel)?;
         }
@@ -574,6 +580,8 @@ impl<'a> Scheduler<'a> {
         compat::cond_tracepoints_enable(tracepoints)
     }
 
+    /* attach系统的exec调用? 
+    调用指定的prog程序*/
     fn attach_execve_tracepoints(skel: &mut OpenBpfSkel) -> Result<bool> {
         let tracepoints = vec![
             (
@@ -589,6 +597,7 @@ impl<'a> Scheduler<'a> {
         compat::cond_tracepoints_enable(tracepoints)
     }
 
+    /* 初始化系统的cpu建模 */
     fn init_cpus(skel: &mut OpenBpfSkel, order: &CpuOrder) {
         debug!("{:#?}", order);
 
@@ -637,6 +646,7 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /* 初始化系统的拓扑建模 */
     fn init_cpdoms(skel: &mut OpenBpfSkel, order: &CpuOrder) {
         // Initialize compute domain contexts
         for (k, v) in order.cpdom_map.iter() {
@@ -674,6 +684,7 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /* 初始化lavd使用的全局变量 */
     fn init_globals(skel: &mut OpenBpfSkel, opts: &Opts, order: &CpuOrder, debug_level: u8) {
         let bss_data = skel.maps.bss_data.as_mut().unwrap();
         bss_data.no_preemption = opts.no_preemption;

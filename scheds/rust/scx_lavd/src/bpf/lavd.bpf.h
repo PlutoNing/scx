@@ -245,6 +245,7 @@ struct task_ctx {
 /*
  * Compute domain context
  * - system > numa node > llc domain > compute domain per core type (P or E)
+ 建模系统的拓扑
  */
 struct cpdom_ctx {
 	/* --- cacheline 0 boundary (0 bytes): read-only --- */

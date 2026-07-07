@@ -2678,6 +2678,8 @@ void BPF_STRUCT_OPS(lavd_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
+/* lavd注册的, 系统调用exec时调用这个函数
+可能会触发kick */
 static
 int set_aggressive_migration(void)
 {
@@ -2692,10 +2694,13 @@ int set_aggressive_migration(void)
 	 * overloaded (is_stealee), set the LAVD_FLAG_MIGRATION_AGGRESSIVE
 	 * flag and preempt itself to trigger aggressive migration right
 	 * now.
+	 如果一个满载的cpu上的进程又调用新进程
+	 设置LAVD_FLAG_MIGRATION_AGGRESSIVE标志, 立即触发 aggressive migration
 	 *
 	 * Self-preemption is not cheap because it issues a self-IPI.
 	 * We assume calling execve() is rare and we send an IPI only when
 	 * the domain is overloaded, so it should be okay.
+	 self preemption 比较昂贵, 只有当domain满载时才发送IPI, 而且这种情况比较少
 	 */
 	if (nr_cpdoms == 1)
 		return 0;
@@ -2713,6 +2718,7 @@ int set_aggressive_migration(void)
 	return 0;
 }
 
+/* lavd注册的, 系统调用exec时自动记录信息 */
 SEC("?tracepoint/syscalls/sys_enter_execve")
 int BPF_PROG(cond_hook_sys_enter_execve)
 {
