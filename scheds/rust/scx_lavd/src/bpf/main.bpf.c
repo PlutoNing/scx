@@ -2566,17 +2566,16 @@ void BPF_STRUCT_OPS(lavd_cgroup_move, struct task_struct *p,
 	}
 }
 
-void BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
-		    u64 period_us, u64 quota_us, u64 burst_us)
+s32 BPF_STRUCT_OPS(lavd_cgroup_set_bandwidth, struct cgroup *cgrp,
+                   u64 period_us, u64 quota_us, u64 burst_us)
 {
-	int ret;
-
-	if (!enable_cpu_bw)
-		return;
-
-	ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
-	if (ret)
-	       scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
+    int ret;
+    if (!enable_cpu_bw)
+        return 0;
+    ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
+    if (ret)
+        scx_bpf_error("Failed to set bandwidth of a cgroup: %d", ret);
+    return 0;
 }
 
 int lavd_enqueue_cb(struct task_struct *p __arg_trusted, u64 ctx)

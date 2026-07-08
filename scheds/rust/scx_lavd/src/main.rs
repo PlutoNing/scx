@@ -495,11 +495,11 @@ impl<'a> Scheduler<'a> {
 
         // When there are multiple domains, hook the execve() syscall family
         // to enable aggressive cross-domain migration when execve() is called.
-        /* 附加一个tracepoint
-        如果有进程执行exec, 看情况进行kick */
-        if order.cpdom_map.len() > 1 {
-            Self::attach_execve_tracepoints(&mut skel)?;
-        }
+        // TODO: disabled temporarily; kernel needs BPF_PROG_TYPE_TRACEPOINT
+        // registered for scx_kfunc_set_any before this can be re-enabled.
+        // if order.cpdom_map.len() > 1 {
+        //     Self::attach_execve_tracepoints(&mut skel)?;
+        // }
 
         // Initialize skel according to @opts.
         Self::init_globals(&mut skel, &opts, &order, debug_level);
