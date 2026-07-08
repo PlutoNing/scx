@@ -3672,6 +3672,10 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
  * 可睡眠：bpf_arena_alloc_pages 只能在可睡眠上下文调用，
  * 故所有 arena 分配都必须放在这里，不能放热路径。
  * 在该任务的任何调度回调触发之前调用。讲解：任务创建时一次性分配并初始化上下文。 */
+
+ /* 每任务的arena存储作用是:
+ 
+  */
 s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 			     struct scx_init_task_args *args)
 {

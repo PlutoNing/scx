@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* scx_cake BPF/userspace interface - shared data structures and constants */
 /* scx_cake 的 BPF 与用户态接口——共享的数据结构与常量定义。 */
-/* 讲解：这个头文件同时被 BPF 内核侧和 Rust 用户态侧包含，保证两边的内存布局完全一致。 */
+/* 这个头文件同时被 BPF 内核侧和 Rust 用户态侧包含，保证两边的内存布局完全一致。 */
 
 #ifndef __CAKE_INTF_H
 #define __CAKE_INTF_H
@@ -10,7 +10,7 @@
 
 /* Type defs for BPF/userspace compat - defined when vmlinux.h is not included */
 /* 为 BPF/用户态兼容定义的类型别名——仅在未包含 vmlinux.h 时生效。 */
-/* 讲解：BPF 侧包含 vmlinux.h 时已有这些类型，用户态编译时则需要在此手动定义。 */
+/* BPF 侧包含 vmlinux.h 时已有这些类型，用户态编译时则需要在此手动定义。 */
 #ifndef __VMLINUX_H__
 typedef unsigned char  u8;
 typedef unsigned short u16;
@@ -32,7 +32,7 @@ typedef signed long    s64;
  *
  * 分层把调度需求相近的任务归为一组。分类依据内核 PELT util_avg（0-1024）；
  * 层内公平（让出 vs 抢占）则由 DRR++ 的赤字机制处理。 */
-/* 讲解：借鉴网络 CAKE 的思路，把任务按延迟敏感度分成 4 层，越靠前的层调度优先级越高。 */
+/* 借鉴网络 CAKE 的思路，把任务按延迟敏感度分成 4 层，越靠前的层调度优先级越高。 */
 enum cake_tier {
 	CAKE_TIER_CRITICAL = 0, /* <100µs:  IRQ, input, audio, network */
 				/* 关键层：<100µs，如中断、输入、音频、网络。讲解：延迟最敏感，必须最快响应。 */
@@ -43,7 +43,7 @@ enum cake_tier {
 	CAKE_TIER_BULK	   = 3, /* ≥8ms:    compilation, background */
 				/* 批处理层：≥8ms，如编译、后台任务。讲解：吞吐型任务，优先级最低。 */
 	CAKE_TIER_MAX	   = 4,
-				/* 层数上限（哨兵值）。讲解：用于数组维度和边界判断。 */
+				/* 层数上限（哨兵值）。用于数组维度和边界判断。 */
 };
 
 /* ═══ TASK CLASS — Pre-stamped by userspace classifier (Phase 2) ═══
@@ -54,18 +54,18 @@ enum cake_tier {
  * 取代了原先在 BPF stopping 中每次都要计算的 is_game/is_hog/bg_noise。
  * 由 Rust 分类器以 60Hz 写入，由 BPF 的 stopping+enqueue 读取。
  * 从而在热路径上省去对 BSS game_tgid/game_ppid 的 MESI-S 读取（约 5ns）。 */
-/* 讲解：把耗时的分类计算挪到用户态低频完成，BPF 侧只读结果，大幅降低热路径开销。 */
+/* 把耗时的分类计算挪到用户态低频完成，BPF 侧只读结果，大幅降低热路径开销。 */
 enum cake_class {
 	CAKE_CLASS_NORMAL  = 0, /* Default: no squeeze, no boost */
-				/* 普通类：默认，既不压制也不加速。讲解：桌面交互任务的基线类别。 */
+				/* 普通类：默认，既不压制也不加速。桌面交互任务的基线类别。 */
 	CAKE_CLASS_GAME    = 1, /* Game family: tgid/ppid match + kthread(gaming) */
-				/* 游戏家族类：tgid/ppid 匹配 + 游戏相关内核线程。讲解：享受最高调度优先级。 */
+				/* 游戏家族类：tgid/ppid 匹配 + 游戏相关内核线程。享受最高调度优先级。 */
 	CAKE_CLASS_HOG     = 2, /* BULK + squeeze: 4× vtime penalty */
-				/* 资源大户类：批处理 + 压制，vtime 惩罚 4 倍。讲解：CPU 吞噬者，延后调度。 */
+				/* 资源大户类：批处理 + 压制，vtime 惩罚 4 倍。CPU 消耗比较多的，延后调度。 */
 	CAKE_CLASS_BG      = 3, /* Background noise: 2× vtime penalty */
-				/* 后台噪声类：vtime 惩罚 2 倍。讲解：低利用率后台任务，游戏时被降权。 */
+				/* 后台噪声类：vtime 惩罚 2 倍。低利用率后台任务，游戏时被降权。 */
 	CAKE_CLASS_MAX     = 4,
-				/* 类别数上限（哨兵值）。讲解：用于数组维度和范围校验。 */
+				/* 类别数上限（哨兵值）。用于数组维度和范围校验。 */
 };
 
 /* ═══ TASK HOT FIELDS — bpf_task_storage (Phase 6) ═══
@@ -77,48 +77,47 @@ enum cake_class {
  * Allocated in: cake_init_task (BPF_NOEXIST → creates on first alloc). */
 /* ═══ 任务热字段——bpf_task_storage（阶段 6） ═══
  * 与 Arena 的 CL0 内容对应，但存放在内核 task_storage 中（查找约 10ns，
- * 而 arena 需 29ns 的 TLB 遍历）。发布模式下所有热字段都放在这里。
- * Arena 的 CL0 仅用于遥测（受 stats_on 门控，发布版中被裁掉）。
+ * 而 arena 需 29ns 的 TLB 遍历）。release模式下所有热字段都放在这里。
+ * Arena 的 CL0 仅用于遥测（受 stats_on 控制，release版中被裁掉）。
  *
  * 访问者：cake_running、cake_stopping、cake_select_cpu、cake_enqueue。
  * 分配处：cake_init_task（BPF_NOEXIST → 首次分配时创建）。 */
-/* 讲解：把最常访问的调度字段放进查找更快的 task_storage，避免每次都走慢速 arena。 */
+/* 把最常访问的调度字段放进查找更快的 task_storage，避免每次都走慢速 arena。 */
 struct cake_task_hot {
 	u64 staged_vtime_bits; /* 8B: VALID|HOME|WB|WB_DUP|NF|weight */
-			       /* 8字节：暂存的 vtime 位域（有效位|归属CPU|唤醒提升|重复提升|新流|权重）。讲解：由 stopping 预打包，enqueue 直接取用。 */
+			       /* 8字节：暂存的 vtime 位域（有效位|归属CPU|唤醒提升|重复提升|新流|权重）。由 stopping 预打包，enqueue 直接取用。 */
 	u16 deficit_u16;       /* 2B: DRR deficit (drain from slice delta) */
-			       /* 2字节：DRR 赤字（按时间片增量消耗）。讲解：DRR++ 公平算法的核心配额。 */
+			       /* 2字节：DRR 赤字（按时间片增量消耗）。DRR++ 公平算法的核心配额。 */
 	u16 wake_counter;      /* 2B: EWMA wakeup frequency (0–1023), higher=more critical */
-			       /* 2字节：唤醒频率的 EWMA（0–1023），越高越关键。讲解：频繁唤醒常意味着延迟敏感。 */
+			       /* 2字节：唤醒频率的 EWMA（0–1023），越高越关键。频繁唤醒常意味着延迟敏感。会考虑进程被唤醒的次数 */
 	u32 packed_info;       /* 4B: flags + tier + flow_id */
-			       /* 4字节：标志位 + 层级 + 流ID 的打包字段。讲解：多字段压进一个 u32，减少内存访问。 */
+			       /* 4字节：标志位 + 层级 + 流ID 的打包字段。把多字段编码进一个 u32，减少内存访问。 */
 	u32 ppid;              /* 4B: Parent PID (game family detection) */
-			       /* 4字节：父进程 PID（用于游戏家族识别）。讲解：靠父进程匹配把整族进程归为 GAME。 */
+			       /* 4字节：父进程 PID（用于游戏家族识别）。靠父进程匹配把整族进程归为 GAME。 */
 	u32 last_run_at;       /* 4B: (u32)scx_bpf_now() from stopping */
-			       /* 4字节：stopping 时记录的 (u32)scx_bpf_now()。讲解：用于计算运行间隔与防饿死。 */
+			       /* 4字节：stopping 时记录的 (u32)scx_bpf_now()。用于计算运行间隔与防饿死。 */
 	u32 reclass_counter;   /* 4B: Per-task stop counter */
-			       /* 4字节：每任务的 stop 计数器。讲解：用于置信度门控，每 64 次才重新分类。 */
+			       /* 4字节：每任务的 stop 计数器。每 64 次才重新分类。stop counter是什么? */
 	u16 warm_cpus[3];      /* 6B: [0]=current, [1]=home, [2]=oldest */
-			       /* 6字节：热点CPU历史 [0]=当前 [1]=归属 [2]=最旧。讲解：用于缓存亲和的 CPU 选择。 */
+			       /* 6字节：热点CPU历史 [0]=当前 [1]=归属 [2]=最旧。用于缓存亲和的 CPU 选择。 */
 	u16 waker_cpu;         /* 2B: CPU where waker last ran */
-			       /* 2字节：唤醒者上次运行的 CPU。讲解：把被唤醒任务放到唤醒者附近以获得缓存局部性。 */
+			       /* 2字节：唤醒者上次运行的 CPU。把被唤醒任务放到唤醒者附近以获得缓存局部性。 */
 	u64 nvcsw_snapshot;    /* 8B: Last nvcsw for yield detection */
-			       /* 8字节：上次的自愿上下文切换计数快照。讲解：与当前值比较即可判断任务是否让出。 */
+			       /* 8字节：上次的自愿上下文切换计数快照。与当前值比较即可判断任务是否让出。 */
 	u8  task_class;        /* 1B: CAKE_CLASS_* enum */
-			       /* 1字节：CAKE_CLASS_* 类别枚举。讲解：由用户态分类器写入的最终类别。 */
+			       /* 1字节：CAKE_CLASS_* 类别枚举。由用户态分类器写入的最终类别。 */
 	u8  _pad_hot;          /* 1B: alignment */
-			       /* 1字节：对齐填充。讲解：保证后续字段按对齐边界排列。 */
+			       /* 1字节：对齐填充。保证后续字段按对齐边界排列。 */
 	u16 vtime_mult;        /* 2B: EEVDF vtime reciprocal (102400/weight, 1024=nice0) */
-			       /* 2字节：EEVDF vtime 倒数系数（102400/weight，1024=nice0）。讲解：把 nice 权重换算成 vtime 缩放因子。 */
+			       /* 2字节：EEVDF vtime 倒数系数（102400/weight，1024=nice0）。把 nice 权重换算成 vtime 缩放因子。 */
 	/* cached_cpumask REMOVED: after scx_bpf_select_cpu_and refactor,
 	 * kernel handles affinity via p->cpus_ptr natively. 0 read sites. */
 	/* cached_cpumask 已移除：在改用 scx_bpf_select_cpu_and 后，
 	 * 亲和性由内核经 p->cpus_ptr 原生处理，已无任何读取点。 */
-	/* 讲解：重构后不再需要自缓存 CPU 掩码，减小了结构体并省去维护成本。 */
+	/* 重构后不再需要自缓存 CPU 掩码，减小了结构体并省去维护成本。 */
 	u64 dsq_vtime;         /* 8B: G1+G4: EEVDF intra-tier vruntime (arena, no kernel overwrite) */
-			       /* 8字节：EEVDF 层内虚拟运行时（自管理，内核不覆盖）。讲解：决定同层任务的先后顺序。 */
+			       /* 8字节：EEVDF 层内虚拟运行时（自管理，内核不覆盖）。决定同层任务的先后顺序。 */
 }; /* Total: 64B (1 cache line) */
-   /* 合计：64 字节（恰好一条缓存行）。讲解：整块热字段一次缓存加载即可读到，性能最优。 */
 
 
 /* ═══ PER-CPU BSS — Arena-free running (Phase 5) ═══
@@ -133,6 +132,7 @@ struct cake_task_hot {
  *   - MESI-S for remote reads: same cost as current arena mbox reads.
  *   - stopping bridges BSS→arena mbox for consumers that still read mbox. */
 /* ═══ 每CPU BSS——不依赖 arena 的运行态存储（阶段 5） ═══
+热点数据不放arena里面, 避免性能开销?
  * 由 cake_running 写入（仅本地 CPU），读取方：
  *   - cake_stopping（同一 CPU，命中 L1）
  *   - Gate 1P/1C-P（远端 CPU，MESI-S → 命中 L3）
@@ -143,16 +143,16 @@ struct cake_task_hot {
  *   - 无需原子操作：单写者（本地 running）、多读者。
  *   - 远端读走 MESI-S：与现有 arena 邮箱读取代价相同。
  *   - stopping 会把 BSS 桥接到 arena 邮箱，兼容仍读邮箱的消费者。 */
-/* 讲解：把每 CPU 的热状态放进独占缓存行的 BSS，单写多读且无锁，避免跨核缓存抖动。 */
+/* 把每 CPU 的热状态放进独占缓存行的 BSS，单写多读且无锁，避免跨核缓存抖动。 */
 struct cake_cpu_bss {
 	u32 run_start;          /* 4B  off  0: (u32)scx_bpf_now() when task started */
-				/* 4字节 偏移0：任务开始运行时的 (u32)scx_bpf_now()。讲解：用于计算已运行时长。 */
+				/* 4字节 偏移0：任务开始运行时的 (u32)scx_bpf_now()。用于计算已运行时长。 */
 	u8  is_yielder;         /* 1B  off  4: task_class-derived yielder + waker_boost */
-				/* 1字节 偏移4：由类别推导的让出者标志 + 唤醒提升。讲解：让出者可享更宽松的时间片。 */
+				/* 1字节 偏移4：由类别推导的让出者标志 + 唤醒提升。让出者可享更宽松的时间片。 */
 	u8  idle_hint;          /* 1B  off  5: 0=busy, 1=idle */
-				/* 1字节 偏移5：空闲提示，0=忙 1=空闲。讲解：供选核时快速判断该 CPU 是否空闲。 */
+				/* 1字节 偏移5：空闲提示，0=忙 1=空闲。供选核时快速判断该 CPU 是否空闲。 */
 	u8  tick_count;         /* 1B  off  6: cake_tick throttle counter */
-				/* 1字节 偏移6：cake_tick 的节流计数器。讲解：限制 tick 相关逻辑的执行频率。 */
+				/* 1字节 偏移6：cake_tick 的节流计数器。限制 tick 相关逻辑的执行频率。 */
 	u8  llc_id;             /* 1B  off  7: per-CPU LLC ID cache (Rule 41).
 				 *     Populated once at init from cpu_llc_id RODATA.
 				 *     Eliminates indexed RODATA load for local-CPU
@@ -160,31 +160,30 @@ struct cake_cpu_bss {
 				/* 1字节 偏移7：每CPU 的 LLC ID 缓存（规则41）。
 				 *     初始化时从 cpu_llc_id RODATA 填入一次。
 				 *     省去 dispatch/tick/telemetry 中对本地 CPU LLC 的带下标 RODATA 加载。
-				 *     讲解：把常用的本地 LLC 归属缓存下来，减少间接寻址。 */
+				 *     把常用的本地 LLC 归属缓存下来，减少间接寻址。 */
 	u64 tick_slice;         /* 8B  off  8: p->scx.slice ?: quantum_ns */
-				/* 8字节 偏移8：p->scx.slice，若为0则取 quantum_ns。讲解：当前任务的时间片长度。 */
+				/* 8字节 偏移8：p->scx.slice，若为0则取 quantum_ns。当前任务的时间片长度。 */
 	u64 vtime_local;        /* 8B  off 16: per-CPU vtime_now — eliminates
 				 *     cross-core cache line bouncing. Each CPU
 				 *     advances its own monotonic max (Rule 8). */
 				/* 8字节 偏移16：每CPU 的 vtime_now——消除跨核缓存行抖动。
 				 *     每个 CPU 各自推进自己的单调递增最大值（规则8）。
-				 *     讲解：本地维护虚拟时钟，避免全局 vtime 造成的缓存争用。 */
+				 *     本地维护虚拟时钟，避免全局 vtime 造成的缓存争用。 */
 	u32 last_pid;           /* 4B  off 24: Fast path — skip get_task_hot if same pid */
-				/* 4字节 偏移24：快速路径——若 pid 相同则跳过 get_task_hot。讲解：连续运行同一任务时省一次查找。 */
+				/* 4字节 偏移24：快速路径——若 pid 相同则跳过 get_task_hot。连续运行同一任务时省一次查找。 */
 	u8  sched_state_local;  /* 1B  off 28: per-CPU sched_state snapshot (Rule 78).
 				 *     Updated by Rust TUI on state transitions.
 				 *     Eliminates remote global BSS cache line
 				 *     fetch at 5 hot-path sites. */
 				/* 1字节 偏移28：每CPU 的 sched_state 快照（规则78）。
-				 *     由 Rust TUI 在状态切换时更新。
-				 *     省去 5 处热路径对全局 BSS 缓存行的远端读取。
-				 *     讲解：把全局调度状态复制到本地行，读它时不再触发跨核同步。 */
+				 *     由 Rust TUI 在状态切换时更新, 省去 5 处热路径对全局 BSS 缓存行的远端读取。
+				 *     把全局调度状态复制到本地行，读它时不再触发跨核同步。 */
 	u8  _reserved[3];       /* 3B  off 29: available for future use */
-				/* 3字节 偏移29：预留待用。讲解：为将来新增字段留出对齐空间。 */
+				/* 3字节 偏移29：预留待用。*/
 	u64 cached_now;         /* 8B  off 32: scx_bpf_now() from select_cpu tunnel */
-				/* 8字节 偏移32：select_cpu“隧道”缓存的 scx_bpf_now()。讲解：enqueue 复用该值，省一次 kfunc 调用。 */
+				/* 8字节 偏移32：select_cpu“隧道”缓存的 scx_bpf_now()。enqueue 复用该值可以省一次 kfunc 调用。 */
 	u8  _pad[88];           /* 88B off 40: pad to 128B (V-Cache sector) */
-				/* 88字节 偏移40：填充至 128B（V-Cache 扇区大小）。讲解：见下方 128B 对齐说明。 */
+				/* 88字节 偏移40：填充至 128B（V-Cache 扇区大小）。为啥对齐大128B? */
 } __attribute__((aligned(128)));
 /* 128B alignment (Rule 15): 9800X3D V-Cache uses 128B sectors.
  * At 64B, adjacent CPUs shared one sector — writes to CPU N's vtime_local
@@ -192,7 +191,8 @@ struct cake_cpu_bss {
 /* 128B 对齐（规则15）：9800X3D 的 V-Cache 使用 128B 扇区。
  * 若只对齐 64B，相邻 CPU 会共享同一扇区——CPU N 写 vtime_local 会使
  * CPU N+1 在 L3 中的 idle_hint 失效。现在每个 CPU 独占一个扇区。 */
-/* 讲解：按硬件扇区粒度对齐，彻底杜绝跨 CPU 的伪共享导致的缓存失效。 */
+/* 按硬件扇区粒度对齐，彻底杜绝跨 CPU 的伪共享导致的缓存失效。
+那其他型号cpu呢? */
 
 /* Global bitmask: bit N set = CPU N is running a GAME task.
  * Written atomically in cake_running, read in cake_enqueue.
@@ -202,18 +202,18 @@ struct cake_cpu_bss {
  * 在 cake_running 中原子写入，在 cake_enqueue 中读取。
  * 寻找抢占目标 = __builtin_ctzll(~game_cpu_mask & online_mask)
  * = 在 Zen 4 上一条 tzcnt 指令（1 个周期延迟）。 */
-/* 讲解：用位掩码 + 取反后数末尾零，O(1) 找到一个正跑非游戏任务的 CPU 作为抢占目标。 */
+/* 用位掩码 + 取反后数末尾零，O(1) 找到一个正跑非游戏任务的 CPU 作为抢占目标。 */
 
 #define CAKE_MAX_CPUS 256
-			/* 支持的最大 CPU 数。讲解：决定各类每CPU数组的静态维度。 */
+			/* 支持的最大 CPU 数。决定各类每CPU数组的静态维度。 */
 #define CAKE_TELEM_MAX_CPUS 64  /* Telemetry-only: cpu_run_count histogram dimension */
-				/* 仅用于遥测：cpu_run_count 直方图的维度。讲解：限制每任务 CPU 分布统计的规模。 */
+				/* 仅用于遥测：cpu_run_count 直方图的维度。限制每任务 CPU 分布统计的规模。 */
 #define CAKE_MAX_LLCS 8
-			/* 支持的最大 LLC（末级缓存/CCD）数量。讲解：决定每 LLC DSQ 及掩码数组的规模。 */
+			/* 支持的最大 LLC（末级缓存/CCD）数量。决定每 LLC DSQ 及掩码数组的规模。 */
 #define CAKE_MAX_AUDIO_TGIDS 8       /* Max tracked audio daemon TGIDs (RODATA) */
-				     /* 最多跟踪的音频守护进程 TGID 数（RODATA）。讲解：游戏时把音频进程提升到 GAME 优先级。 */
+				     /* 最多跟踪的音频守护进程 TGID 数（RODATA）。游戏时把音频进程提升到 GAME 优先级。 */
 #define CAKE_MAX_COMPOSITOR_TGIDS 4  /* Max tracked compositor TGIDs (RODATA) */
-				     /* 最多跟踪的合成器 TGID 数（RODATA）。讲解：游戏时保证合成器与游戏线程延迟对等。 */
+				     /* 最多跟踪的合成器 TGID 数（RODATA）。游戏时保证合成器与游戏线程延迟对等。 */
 
 /* Per-LLC DSQ base — DSQ IDs are LLC_DSQ_BASE + llc_index (0..nr_llcs-1).
  * V3: Single vtime-ordered DSQ per LLC. Priority encoded in vtime:
@@ -223,9 +223,9 @@ struct cake_cpu_bss {
  * V3：每个 LLC 只用一个按 vtime 排序的 DSQ。优先级编码进 vtime：
  * (vtime_tier << 56) | 时间戳。T0 层永远 vtime 最小 → 最先派发。
  * 相比旧的 4 层拆分，省去了 3 次空 DSQ 探测。 */
-/* 讲解：把“层级优先级”编码进 vtime 高位，用单队列排序即可实现严格分层，简化派发逻辑。 */
+/* 把“层级优先级”编码进 vtime 高位，用单队列排序即可实现严格分层，简化派发逻辑。 */
 #define LLC_DSQ_BASE 200
-		     /* DSQ ID 的起始基址。讲解：低号段留给内核内置 DSQ，200 起分配自定义队列避免冲突。 */
+		     /* DSQ ID 的起始基址。低号段留给内核内置 DSQ，200 起分配自定义队列避免冲突。 */
 
 /* ── dsq_vtime STAGED BIT LAYOUT (Rule 54: no magic positions) ──
  * Written by cake_stopping, read by cake_running + cake_select_cpu.
@@ -238,7 +238,7 @@ struct cake_cpu_bss {
  *   [49]       = WAKER_BOOST_DUP (Gate 1P — was VCSW yielder)
  *   [48]       = NEW_FLOW (first enqueue after init)
  *   [31:0]     = DSQ_WEIGHT (dsq_weight: tier_base + pelt_scaled, or inverted PELT for GAME during GAMING) */
-/* ── dsq_vtime 暂存位布局（规则54：不使用魔法位置） ──
+/* ── dsq_vtime 暂存位布局, 不使用魔法位置 ──
  * 由 cake_stopping 写入，由 cake_running + cake_select_cpu 读取。
  *   [63]     = VALID（上下文已存在时置位）
  *   [62:55]  = HOME_CPU（warm_cpus[1] & 0xFF，上一个归属 CPU）
@@ -249,23 +249,24 @@ struct cake_cpu_bss {
  *   [49]     = WAKER_BOOST_DUP（Gate 1P——曾是自愿切换的让出者）
  *   [48]     = NEW_FLOW（初始化后首次入队）
  *   [31:0]   = DSQ_WEIGHT（派发权重：层基值 + PELT 缩放；游戏中的 GAME 则用反相 PELT） */
-/* 讲解：把多种调度提示打包进一个 u64，stopping 预算好、enqueue 直接取，避免热路径重复计算。 */
+/* 把多种调度提示打包进一个 u64，stopping 预算好、enqueue 直接取，避免热路径重复计算。
+下面这几个是进程的flag? */
 #define STAGED_BIT_VALID        63
 				/* 有效位。讲解：置位表示该暂存数据已由 stopping 填好、可被使用。 */
 #define STAGED_SHIFT_HOME       55
-				/* 归属 CPU 字段的起始位移。讲解：把上次归属 CPU 存高位，供缓存亲和选核。 */
+				/* 归属 CPU 字段的起始位移。把上次归属 CPU 存高位，供缓存亲和选核。 */
 #define STAGED_BIT_BG_NOISE     53  /* Background noise squeeze */
-				    /* 后台噪声压制位。讲解：标记该任务应被降权处理。 */
+				    /* 后台噪声压制位。标记该任务应被降权处理。 */
 #define STAGED_BIT_WAKER_BOOST  52
-				/* 唤醒提升位。讲解：被游戏线程唤醒的任务临时继承游戏优先级。 */
+				/* 唤醒提升位。被游戏线程唤醒的任务临时继承游戏优先级。 */
 #define STAGED_BIT_GAME_MEMBER  51
-				/* 游戏成员位。讲解：标识属于游戏进程家族，享 VIP 抢占阈值。 */
+				/* 游戏成员位。标识属于游戏进程家族，享 VIP 抢占阈值。 */
 #define STAGED_BIT_HOG          50
-				/* 资源大户位。讲解：批处理层且未被提升的任务，抢占保护最弱。 */
+				/* 资源大户位。批处理层且未被提升的任务，抢占保护最弱。 */
 #define STAGED_BIT_WB_DUP       49  /* Gate 1P: waker_boost duplicate */
-				    /* 唤醒提升副本位（Gate 1P）。讲解：记录曾为自愿让出者，用于抢占决策。 */
+				    /* 唤醒提升副本位（Gate 1P）。记录曾为自愿让出者，用于抢占决策。 */
 #define STAGED_BIT_NEW_FLOW     48
-				/* 新流位。讲解：新唤醒任务享受新流赤字加成，抢先入队一次。 */
+				/* 新流位。新唤醒任务享受新流赤字加成，抢先入队一次。 */
 
 /* ── Kfunc BenchLab: extensible per-kfunc stopwatch ──
  * Each kfunc gets a slot. Run N iterations, capture min/max/avg + return value.
@@ -273,62 +274,65 @@ struct cake_cpu_bss {
 /* ── Kfunc BenchLab：可扩展的逐 kfunc 计时器 ──
  * 每个 kfunc 占一个槽位。运行 N 次迭代，记录最小/最大/平均值 + 返回值。
  * 通过 BSS 变量 bench_request 由 TUI 触发。 */
-/* 讲解：这是一套内核内微基准，用于测量各调度原语（kfunc、内存访问等）的真实纳秒开销。 */
+/* 这是一套内核内微基准，用于测量各调度原语（kfunc、内存访问等）的真实纳秒开销。 */
 #define BENCH_ITERATIONS 8
 			  /* 每项基准的迭代次数。讲解：多次取样以便计算最小/平均/百分位。 */
 
+			  /* 能不能把下面也理解为cake声明了自己使用的kfunc? */
 enum kfunc_bench_id {
 	/* ── Existing entries (0–23) ── */
 	/* ── 已有条目（0–23） ── */
-	/* 讲解：以下每个枚举对应一项被测操作，注释标明其测量目标。 */
+	/* 以下每个枚举对应一项被测操作，注释标明其测量目标。 */
 	BENCH_KTIME_GET_NS       = 0, /* bpf_ktime_get_ns() */
-				      /* 测量 bpf_ktime_get_ns()。讲解：常规单调纳秒时钟的取时开销。 */
+				      /* 测量 bpf_ktime_get_ns()。常规单调纳秒时钟的取时开销。 */
 	BENCH_SCX_BPF_NOW        = 1, /* scx_bpf_now() */
-				      /* 测量 scx_bpf_now()。讲解：sched_ext 优化过的取时 kfunc。 */
+				      /* 测量 scx_bpf_now()。sched_ext 优化过的取时 kfunc。 */
 	BENCH_GET_SMP_PROC_ID    = 2, /* bpf_get_smp_processor_id() */
-				      /* 测量取当前 CPU 号。讲解：热路径常用，需知其成本。 */
+				      /* 测量取当前 CPU 号,热路径常用，需知其成本。 */
 	BENCH_TASK_FROM_PID      = 3, /* bpf_task_from_pid() */
-				      /* 测量由 pid 反查 task。讲解：涉及查表，相对较慢。 */
+				      /* 测量由 pid 反查 task。涉及查表，相对较慢。 */
 	BENCH_TEST_CLEAR_IDLE    = 4, /* scx_bpf_test_and_clear_cpu_idle() */
-				      /* 测量“测试并清除 CPU 空闲位”。讲解：Gate 1 选核的核心原子操作。 */
+				      /* 测量“测试并清除 CPU 空闲位”。Gate 1 选核的核心原子操作。 */
 	BENCH_NR_CPU_IDS         = 5, /* scx_bpf_nr_cpu_ids() */
-				      /* 测量取 CPU 总数。讲解：对比 RODATA 常量方式的开销。 */
+				      /* 测量取 CPU 总数。对比 RODATA 常量方式的开销。 */
 	BENCH_GET_TASK_CTX       = 6, /* get_task_ctx() → arena deref */
-				      /* 测量取任务 ctx（arena 解引用）。讲解：反映 arena 访问的 TLB 成本。 */
+				      /* 测量取任务 ctx（arena 解引用）。反映 arena 访问的 TLB 成本。
+					  任务ctx存放内容? */
 	BENCH_DSQ_NR_QUEUED      = 7, /* scx_bpf_dsq_nr_queued() */
-				      /* 测量查询 DSQ 排队数。讲解：派发决策时会读它。 */
+				      /* 测量查询 DSQ 排队数。派发决策时会读它。 */
 	BENCH_BSS_ARRAY_ACCESS   = 8, /* Raw BSS global_stats[cpu] access */
-				      /* 测量裸 BSS 数组访问。讲解：最快的全局数据读取方式基线。 */
+				      /* 测量裸 BSS 数组访问。最快的全局数据读取方式基线。 */
 	BENCH_ARENA_DEREF        = 9, /* Arena per_cpu[cpu].mbox field read */
-				      /* 测量 arena 每CPU 邮箱字段读取。讲解：与 BSS 访问对比成本。 */
+				      /* 测量 arena 每CPU mailbox 字段读取。与 BSS 访问对比成本。 */
 	BENCH_NOW_PAIR           = 10, /* Back-to-back scx_bpf_now() pair (calibration) */
-				       /* 测量连续两次 scx_bpf_now()。讲解：用于扣除计时自身开销的校准。 */
+				       /* 测量连续两次 scx_bpf_now()。用于扣除计时自身开销的校准。 */
 	BENCH_MBOX_CPU_READ      = 11, /* Read cached CPU from mailbox CL0 (alternative) */
-				       /* 从邮箱 CL0 读缓存 CPU 号（替代方案）。讲解：对比 kfunc 取 CPU 的省时程度。 */
+				       /* 从邮箱 CL0 读缓存 CPU 号（替代方案）。对比 kfunc 取 CPU 的省时程度。 */
 	BENCH_TCTX_FROM_MBOX     = 12, /* Read cached tctx ptr from mailbox CL0 (alternative) */
-				       /* 从邮箱 CL0 读缓存的 tctx 指针。讲解：省去重复的 arena 查找。 */
+				       /* 从邮箱 CL0 读缓存的 tctx 指针。省去重复的 arena 查找。 */
 	BENCH_RINGBUF_CYCLE      = 13, /* bpf_ringbuf_reserve + discard cycle */
-				       /* 测量 ringbuf 预留+丢弃一轮。讲解：评估 ringbuf 通信的固有成本。 */
+				       /* 测量 ringbuf 预留+丢弃一轮。评估 ringbuf 通信的固有成本。 */
 	BENCH_TASK_STRUCT_READ   = 14, /* p->scx.slice + p->nvcsw (task_struct fields) */
-				       /* 读取 task_struct 字段。讲解：热路径直接读内核任务字段的代价。 */
+				       /* 读取 task_struct 字段。热路径直接读内核任务字段的代价。 */
 	BENCH_RODATA_LOOKUP      = 15, /* cpu_llc_id[cpu] + tier_slice_ns[tier] RODATA */
-				       /* 读取 RODATA 表项。讲解：只读常量数组访问，通常极快。 */
+				       /* 读取 RODATA 表项。只读常量数组访问，通常极快。这个也有开销吗? */
 	BENCH_BITFLAG_OPS        = 16, /* Shift+mask+branchless yielder pattern */
-				       /* 测量位移+掩码的无分支让出者判断。讲解：验证无分支写法的高效性。 */
+				       /* 测量位移+掩码的无分支让出者判断。验证无分支写法的高效性。 */
 	BENCH_RESERVED_17        = 17, /* (was compute_ewma — removed in PELT transition) */
-				       /* 预留（原 compute_ewma，转向 PELT 后移除）。讲解：占位以保持枚举编号稳定。 */
+				       /* 预留（原 compute_ewma，转向 PELT 后移除）。占位以保持枚举编号稳定。 */
 	BENCH_PSYCHIC_HIT_SIM    = 18, /* Psychic cache pointer compare + fused read */
-				       /* 模拟“预知缓存”指针比较+融合读。讲解：评估指针命中快速路径。 */
+				       /* 模拟“预知缓存”指针比较+融合读。评估指针命中快速路径。 */
 	BENCH_IDLE_REMOTE        = 19, /* scx_bpf_test_and_clear_cpu_idle(sibling) — cross-CPU */
-				       /* 对兄弟核做测试清空闲——跨 CPU。讲解：跨核原子操作更贵。 */
+				       /* 对兄弟核做测试清空闲——跨 CPU。跨核原子操作更贵。 */
 	BENCH_IDLE_SMTMASK       = 20, /* cpumask_test_cpu on smtmask — read-only, no atomic */
-				       /* 在 SMT 掩码上做只读位测试。讲解：无原子写，比测试清更便宜。 */
+				       /* 在 SMT 掩码上做只读位测试。无原子写，比测试清更便宜。 */
 	BENCH_DISRUPTOR_READ     = 21, /* Full CL0 Disruptor handoff read (cake_stopping sim) */
-				       /* 完整 CL0 交接读取（模拟 cake_stopping）。讲解：评估 stopping 读取负担。 */
+				       /* 完整 CL0 交接读取（模拟 cake_stopping）。评估 stopping 读取负担。
+					   stopping是什么 */
 	BENCH_TCTX_COLD_SIM      = 22, /* get_task_ctx + arena CL0 read (cake_running sim) */
-				       /* 取 ctx + 读 arena CL0（模拟 cake_running）。讲解：评估 running 冷读成本。 */
+				       /* 取 ctx + 读 arena CL0（模拟 cake_running）。评估 running 冷读成本。 */
 	BENCH_ARENA_STRIDE       = 23, /* Stride across arena per_cpu array to test TLB/hugepage */
-				       /* 跨步遍历 arena 每CPU 数组。讲解：测试 TLB/大页命中的影响。 */
+				       /* 跨步遍历 arena 每CPU 数组。测试 TLB/大页命中的影响。 */
 
 	/* ── New entries (24–42): eBPF helpers + SCX kfuncs ── */
 	/* ── 新增条目（24–42）：eBPF 辅助函数 + SCX kfunc ── */

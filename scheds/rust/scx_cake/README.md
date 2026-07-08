@@ -123,7 +123,9 @@ bss.game_confidence  = game_confidence      // 0/90/100
 bss.sched_state      = IDLE | COMPILATION | GAMING
 ```
 
-The BPF classification engine in `cake_init_task` and `cake_stopping` reads `game_ppid` to decide if a task belongs to the game family. All scheduling behavior changes (class assignment, DSQ weights, quantum caps, CPUPERF boost) flow from `sched_state`.
+The BPF classification engine in `cake_init_task` and `cake_stopping` reads `game_ppid` to decide
+ if a task belongs to the game family. All scheduling behavior changes (class assignment, DSQ weights,
+  quantum caps, CPUPERF boost) flow from `sched_state`.
 
 ### DRR++ Deficit Tracking
 
@@ -202,6 +204,7 @@ flowchart TD
 | `cake_runnable`           | Preempt count + wakeup source telemetry (stats-gated)      | **Cold**          |
 | `cake_set_cpumask`        | Event-driven affinity update (replaces polling)            | **Cold**          |
 | `cake_init_task`          | Arena + task_storage allocation, initial classification    | **Cold** (once)   |
+cake init task涉及arena?
 | `cake_exit_task`          | Arena deallocation                                         | **Cold** (once)   |
 | `cake_init` / `cake_exit` | DSQ creation, arena init, UEI                              | **Cold** (once)   |
 
