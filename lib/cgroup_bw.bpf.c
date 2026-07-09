@@ -9,13 +9,41 @@
 #include <lib/topology.h>
 #include <lib/cgroup.h>
 #include <lib/atq.h>
+/* cgroup_bw.bpf.c 是 sched_ext（SCX）调度框架的 CPU 带宽控制（cpu bandwidth）
+库的 BPF 侧实现，由 Meta 开发，作者为 Changwoo Min。
 
+其核心功能是：在 BPF 程序中实现 Linux cgroup v2 的 cpu.max（CPU 配额限流），让基于
+ SCX 的调度器能对每个 cgroup 做 CPU 带宽限制。当一个 cgroup 的 CPU 使用量超过配额时，
+ 该 cgroup 下的任务会被节流（throttled），放入 Backlog Task Queue（BTQ）暂存，
+ 待预算补充后再重新入队执行。 */
 #ifndef U64_MAX
 #define U64_MAX		((u64)~0ULL)
 #endif
 
 extern int scx_cgroup_bw_enqueue_cb(u64 taskc);
-
+/* 常量	含义
+CBW_REPLENISH_PERIOD
+补充周期，100ms，所有 cgroup 使用统一周期
+CBW_ACCOUNTING_PERIOD_MIN/MAX
+记账定时器触发间隔，1ms ~ 20ms
+CBW_ACCOUNTING_PERIOD_DIVISOR
+将预计节流时间除以 4，提前触发记账以捕获速率变化
+CBW_SHIFT / CBW_SCALE
+固定小数点精度，1024 = 100% 一个 CPU 核
+CBW_CONSUMPTION_RATE_DECAY
+EWMA 衰减因子，半衰期约 520ms
+CBW_NR_CGRP_MAX
+最多 2048 个 cgroup
+CBW_NR_CGRP_LLC_MAX
+最多 2048 × 32 个 LLC 上下文
+CBW_CGRP_TREE_HEIGHT_MAX
+cgroup 树最大深度 32
+CBW_RUNTUME_INF
+无限配额（即 cpu.max 中的 "max"）
+CBW_REENQ_MAX_BATCH
+每次 dispatch 最多重入队 2 个任务
+CBW_DEFERRED_BTQ_SIZE
+延迟销毁 BTQ 队列大小 */
 enum scx_cgroup_consts {
 	/* cache line size of an architecture */
 	SCX_CACHELINE_SIZE		= 64,
@@ -61,6 +89,7 @@ enum scx_cgroup_consts {
 };
 
 /*
+root cg 的 id
  * Root cgroup id.  This is the kernel-level cgroup_id of the
  * cgroup-v2 default hierarchy root, which is always 1 on a
  * standard kernel configuration (kernfs allocates the root with
@@ -85,6 +114,10 @@ static u32 cbw_loader_tgid;
  * Per-cgroup data structure containing cpu.max-related information.
  * In the future, it can be extended to support other features of cgroup
  * beyond cpu.max.
+ struct scx_cgroup_ctx（每 cgroup 上下文）
+每个受管 cgroup 都有一个此结构，存放在 BPF arena 中，通过 cbw_cgrp_map 哈希表索引。
+结构体按缓存行分两部分，减少伪共享：
+只读缓存行（初始化后不变）：
  */
 struct scx_cgroup_ctx {
 	/* read-only cache line */
@@ -103,11 +136,13 @@ struct scx_cgroup_ctx {
 		/* parent cgroup id (0 for root); set once at init */
 		u64		parent_id;
 
-		/* cgroup tree depth (root = 0); set once at init */
+		/* cgroup tree depth (root = 0); set once at init
+		在cgroup 树的深度 */
 		u32		level;
 
 		/*
 		 * Given @quota, @period, and @burst in nanoseconds.
+		 来自 cpu.max 的配额/周期/突发量（纳秒）
 		 */
 		u64		quota;
 		u64		period;
@@ -117,12 +152,14 @@ struct scx_cgroup_ctx {
 		 * Normalized quota by period of 100 msec. By using the same
 		 * period, we can use a single BPF timer to handle all the
 		 * cgroups.
+		 将 quota 归一化到 100ms 周期后的值
 		 */
 		u64		nquota;
 	
 		/*
 		 * The upper bound of a cgroup’s quota, which is the minimum
 		 * normalized quota of all its ancestors and itself.
+		 该 cgroup 自身及所有祖先的 nquota 最小值（即有效上限）
 		 */
 		u64		nquota_ub;
 	
@@ -130,11 +167,13 @@ struct scx_cgroup_ctx {
 		 * A boolean flag indicating whether the cgroup has LLC
 		 * contexts. Written only during slow-path init/destroy;
 		 * treated as read-only in the hot path.
+		 是否有 LLC 上下文（叶子 cgroup 或 threaded cgroup 才有）
 		 */
 		bool		has_llcx;
 	} __attribute__((aligned(SCX_CACHELINE_SIZE)));
 
-	/* read-write cache line */
+	/* read-write cache line
+	读写缓存行（热路径更新） */
 	struct {
 		/*
 		 * A boolean flag indicating whether the cgroup is throttled or
@@ -146,6 +185,7 @@ struct scx_cgroup_ctx {
 
 		/*
 		 * How many times this cgroup is throttled so far.
+		 累计被节流的周期次数
 		 */
 		u32		nr_throttled_periods;
 
@@ -153,8 +193,10 @@ struct scx_cgroup_ctx {
 		 * @period_start_clk represents when a new period starts.
 		 * @burst_remaining is the maximum burst that can be accumulated
 		 * until the end of the period from @period_start_clk.
+		 当前 cpu.max 周期的开始时间
 		 */
 		u64		period_start_clk;
+		/* 当前周期内剩余的突发额度 */
 		s64		burst_remaining;
 
 		/*
@@ -165,6 +207,7 @@ struct scx_cgroup_ctx {
 		 * cbw_update_runtime_total_sloppy() as the throttle threshold
 		 * instead of the bare nquota_ub, so that long-run average
 		 * utilization converges to the configured quota.
+		 当前周期有效预算（nquota_ub + 突发信用 - 上周期欠债）
 		 */
 		s64		period_budget;
 
@@ -178,11 +221,13 @@ struct scx_cgroup_ctx {
 		 * for more budget from the parent, so there will be no more
 		 * updates on @runtime_total_sloppy before the next period
 		 * starts.
+		 本周期内所有 LLC 上下文的累计运行时间（近似值，不加锁）
 		 */
 		s64		runtime_total_sloppy;
 
 		/*
 		 * Total runtime at the last replenishment period.
+		 上一次补充时保存的 runtime_total_sloppy 快照
 		 */
 		s64		runtime_total_last;
 
@@ -206,6 +251,7 @@ struct scx_cgroup_ctx {
 		 * cbw_replenish_cgroup() returns early, so avg_consumption_rate
 		 * stays 0. This is correct: a cgroup with no quota limit has no
 		 * meaningful consumption rate to track.
+		 CPU 消耗速率的 EWMA（固定小数点，CBW_SCALE=1024 表示 100% 一核）
 		 */
 		u64		avg_consumption_rate;
 	} __attribute__((aligned(SCX_CACHELINE_SIZE)));
@@ -218,6 +264,8 @@ typedef struct scx_cgroup_ctx __arena scx_cgroup_ctx_t;
  * contexts to reduce cross-LLC cache coherence traffic. Otherwise, the cgroup
  * stats are used only for distributing remaining budgets. In this case, we do
  * not manage per-LLC context since they will be accessed much less frequently.
+ 叶子 cgroup 或 threaded cgroup 对每个 LLC（Last-Level Cache）域各有一个此结构，
+ 用于减少跨 LLC 的缓存一致性流量。通过 cbw_cgrp_llc_map 以 {cgrp_id, llc_id} 为键索引。
  */
 struct scx_cgroup_llc_ctx {
 	/*
@@ -235,6 +283,7 @@ struct scx_cgroup_llc_ctx {
 	/*
 	 * Total amount of time executed once replenished. It should not
 	 * exceed @quota_ub.
+	 本周期内该 LLC 域的累计运行时间（原子更新）
 	 */
 	s64		runtime_total;
 
@@ -250,6 +299,7 @@ struct scx_cgroup_llc_ctx {
  	 * Since DSQ does not support a pop-like operation that dispatches a
 	 * task from the DSQ without moving to another DSQ, we use ATQ as a
 	 * backend of BTQ.
+	 Backlog Task Queue（ATQ 实现），存放被节流的任务
 	 */
 	scx_atq_t	*btq;
 } __attribute__((aligned(SCX_CACHELINE_SIZE)));
@@ -2847,3 +2897,155 @@ release_out:
 	bpf_cgroup_release(start_cgrp);
 	return 0;
 }
+/* union backlog_stat（后台任务状态）
+一个 64 位原子值，同时编码多个状态字段：
+
+字段	作用
+rp_seq
+补充定时器序列号（奇数 = 正在运行，偶数 = 空闲）
+nr_throttled_cgroups
+cbw_throttled_cgroup_ids 中的被节流 cgroup 数量
+has_throttled_tasks
+是否有任务在 BTQ 中等待
+其他辅助结构
+结构	作用
+cbw_cgrp_entry
+cbw_cgrp_map 的值，存放 scx_cgroup_ctx 的 arena 指针
+cbw_llc_entry
+cbw_cgrp_llc_map 的值，存放 scx_cgroup_llc_ctx 的 arena 指针
+cgroup_llc_id
+cbw_cgrp_llc_map 的键，{cgrp_id, llc_id} 对
+tree_levels
+per-CPU 数组，用于 post-order 遍历时按层聚合 runtime_total_sloppy
+replenish_timer / accounting_timer
+BPF 定时器包装结构
+函数说明
+库初始化
+函数	作用
+is_kernel_compatible()
+检查当前内核是否支持 SCX 的 cpu.max 功能
+scx_cgroup_bw_lib_init()
+库初始化入口：验证内核兼容性，保存配置，启动补充定时器和记账定时器
+Cgroup 生命周期
+函数	作用
+scx_cgroup_bw_init()
+cgroup 创建时调用：分配 scx_cgroup_ctx，设置配额参数，初始化各 LLC 上下文；若父 cgroup 从叶变为非叶则释放父的 LLC 上下文
+scx_cgroup_bw_exit()
+cgroup 销毁时调用：先设置为无限配额避免任务卡死，再删除 cgroup 上下文和 LLC 上下文
+scx_cgroup_bw_set()
+cpu.max 写入时调用：更新配额，并对该 cgroup 及全部后代做 pre-order 遍历更新 nquota_ub
+内存管理（Arena 空闲链表）
+函数	作用
+cbw_freelist_pop()
+无锁 Treiber 栈弹出：从空闲链表取一个 arena 对象（CAS 实现）
+cbw_freelist_push()
+无锁 Treiber 栈压入：将 arena 对象归还到空闲链表
+cbw_alloc_cgx() / cbw_free_cgx()
+分配/释放 scx_cgroup_ctx（优先从空闲链表取，没有则 bump 分配）
+cbw_alloc_llcx() / cbw_free_llcx()
+分配/释放 scx_cgroup_llc_ctx（同上）
+cbw_alloc_llc_ctx()
+分配并初始化一个 LLC 上下文：分配 llcx、创建 BTQ、注册到 cbw_cgrp_llc_map
+cbw_init_llc_ctx()
+为一个 cgroup 初始化全部 LLC 的上下文
+cbw_free_llc_ctx()
+释放一个 cgroup 全部 LLC 上下文：先将 BTQ 中被节流的任务迁移到 root cgroup 的 BTQ，再删除 map 条目，延迟销毁 BTQ
+cbw_del_cgroup_ctx()
+从 cbw_cgrp_map 删除条目并释放 scx_cgroup_ctx
+schedule_atq_destroy()
+将 BTQ 的销毁推迟到一个环形延迟槽数组，避免 use-after-free
+带宽参数管理
+函数	作用
+cbw_set_bandwidth()
+将 period_us / quota_us / burst_us 写入 scx_cgroup_ctx，并将 quota 归一化到 100ms 周期（nquota）
+cbw_update_nquota_ub()
+更新 cgroup 的有效配额上限：取自身 nquota 与父 cgroup nquota_ub 的较小值
+节流判断
+函数	作用
+cbw_cgroup_bw_throttled()
+检查给定 cgroup 是否被节流（读 cgx->is_throttled）；缓存 cgx_raw 到任务上下文以避免重复 map 查找
+scx_cgroup_bw_throttled()
+公开 API：额外跳过正在退出（PF_EXITING）的任务，防止其被困在 BTQ 中永远无法被重新入队
+cbw_unthrottle_cgroup_for_exit()
+将 cgroup 的 nquota_ub 和 period_budget 设为无限，并清除 is_throttled，用于 cgroup 退出前解除节流
+运行时记账
+函数	作用
+scx_cgroup_bw_consume()
+任务运行后调用：原子地将 consumed_ns 加到当前 LLC 的 runtime_total；利用任务上下文缓存 cgx_raw 和 llcx_raw 加速查找；无限配额 cgroup 走快速路径直接返回
+cbw_sum_rumtime_total_llcx()
+汇总一个 cgroup 所有 LLC 上下文的 runtime_total
+cbw_update_runtime_total_sloppy()
+对 cgroup 树做 post-order（自底向上）遍历：将各 LLC 的 runtime_total 聚合为每个 cgroup 的 runtime_total_sloppy，并在超过 period_budget 时标记 is_throttled
+cbw_throttle_cgroups()
+对 cgroup 树做 post-order 遍历：将被节流祖先的节流状态向下传播给所有后代；同时计算每个未节流 cgroup 的预计节流时间，返回下次记账定时器的触发间隔
+定时器（Top Half / Bottom Half 设计）
+函数	作用
+replenish_timerfn()
+补充定时器（Top Half），每 100ms 触发一次：① 聚合 runtime_total_sloppy；② 重置各 LLC 的 runtime_total 并快照上周期用量；③ 对所有 cgroup 补充预算（调用 cbw_replenish_cgroup）；④ 收集需要重入队的 cgroup 列表；⑤ 踢一个空闲 CPU 以触发 Bottom Half
+accounting_timerfn()
+记账定时器，自适应间隔（1~20ms）触发：调用 cbw_update_runtime_total_sloppy 和 cbw_throttle_cgroups，在两次补充之间及时节流超额 cgroup；由 cbw_throttle_cgroups 的返回值动态调整下次间隔
+cbw_replenish_cgroup()
+补充单个 cgroup 的预算：计算欠债（上周期超支）和突发信用（上周期少用），更新 period_budget；更新 avg_consumption_rate 的 EWMA；返回该 cgroup 是否还有待重入队的任务
+Backlog 任务管理（BTQ）
+函数	作用
+cbw_put_aside()
+将任务放入当前 LLC 的 BTQ：加锁后检查 BTQ 未被销毁，再调用 scx_atq_insert_vtime_unlocked 插入
+scx_cgroup_bw_put_aside()
+cbw_put_aside() 的公开 API
+cbw_has_backlogged_tasks()
+检查 cgroup 的任意 LLC BTQ 中是否还有任务
+cbw_drain_btq_batch()
+从单个 LLC BTQ 中批量弹出最多 CBW_REENQ_MAX_BATCH 个任务，调用 scx_cgroup_bw_enqueue_cb 回调通知调度器重新入队
+cbw_reenqueue_cgroup()
+对一个 cgroup 的所有 LLC BTQ 做批量排空（随机起始 LLC 以公平性）；若 cgroup 被重新节流则立即停止
+scx_cgroup_bw_reenqueue()
+Bottom Half 入口，由调度器在 ops.dispatch() 中调用：检查是否有节流任务，有则对各被节流 cgroup 调用 cbw_reenqueue_cgroup 重新入队
+Backlog 状态机
+函数	作用
+cbw_top_half_running()
+通过 rp_seq 奇偶性判断补充定时器是否正在运行
+cbw_top_half_begin()
+将 rp_seq 加一（变为奇数），标记 Top Half 开始
+cbw_top_half_end()
+将 rp_seq 加一（变为偶数），同时更新节流 cgroup 数量和 has_throttled_tasks
+cbw_top_half_abort()
+Top Half 因错误中止：再次递增 rp_seq 恢复偶数状态
+cbw_update_backlog_stat_cas()
+用 CAS 原子更新 cbw_backlog_stat
+cbw_has_throttled_tasks()
+双重检查（廉价 volatile 读 + smp_load_acquire）是否有节流任务
+任务管理
+函数	作用
+scx_cgroup_bw_cancel()
+取消一个任务的节流状态（从 ATQ 中移除）；用于任务被 sched_setaffinity 等系统调用强制出队时
+scx_cgroup_bw_move()
+任务在 cgroup 间迁移时：清除任务缓存的 cgx_raw/llcx_raw；若任务在 BTQ 中则先取消，再放入目标 cgroup 的 BTQ
+状态查询与调试
+函数	作用
+scx_cgroup_bw_is_cgroup_throttled()
+查询指定 cgroup 是否被节流
+scx_cgroup_bw_is_task_throttled()
+查询一个任务是否在 BTQ 中（即被节流）
+cbw_get_root_cgrp()
+通过加载器进程（cbw_loader_tgid）解析 root cgroup 指针，规避内核 < v6.18 中 bpf_cgroup_from_id() 受 cgroup namespace 过滤导致返回 NULL 的问题
+cbw_dump_cgroup()
+通过 bpf_printk 打印单个 cgroup 的配额、运行时、节流状态等调试信息
+scx_cgroup_bw_dump()
+打印指定 cgroup（及可选后代）的状态信息
+整体设计思路
+
+ops.enqueue()              ops.stopping()/ops.tick()     ops.dispatch()
+     │                            │                            │
+     ▼                            ▼                            ▼
+scx_cgroup_bw_throttled()  scx_cgroup_bw_consume()   scx_cgroup_bw_reenqueue()
+     │                            │                       (Bottom Half)
+     │ 节流?                       │ 记账到 llcx->runtime_total
+     ▼                            │
+scx_cgroup_bw_put_aside()  ◄──────┘
+  放入 BTQ                  
+                   ↑
+        replenish_timerfn (100ms, Top Half)
+        accounting_timerfn (1~20ms，自适应)
+         - 聚合 runtime_total_sloppy
+         - 补充 period_budget
+         - 设置/清除 is_throttled */

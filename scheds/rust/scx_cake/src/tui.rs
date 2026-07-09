@@ -3503,6 +3503,7 @@ pub fn run_tui(
             // Track currently active PIDs in this sweep to prune dead tasks
             app.active_pids_buf.clear();
 
+            /* 获取task iter prog的link */
             let link_raw = unsafe { TASK_ITER_LINK_RAW };
             if link_raw > 1 {
                 // bpf_iter_create(link_fd: c_int) — get fd from the stored *mut bpf_link
@@ -3511,6 +3512,7 @@ pub fn run_tui(
                         link_raw as *mut libbpf_rs::libbpf_sys::bpf_link,
                     )
                 };
+                /* 获取fd, 从这个fd可以遍历cake 任务 */
                 let iter_fd = unsafe { libbpf_rs::libbpf_sys::bpf_iter_create(link_fd_c) };
                 if iter_fd >= 0 {
                     // Read cake_iter_record structs sequentially from the iter fd

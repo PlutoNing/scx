@@ -15,7 +15,12 @@
  * to avoid sleepable allocations in fast path (enqueue/dequeue). This
  * makes DHQ usable in non-sleepable contexts like BPF enqueue callbacks.
  */
+ /* dhq.bpf.c 实现了 Double Helix Queue（DHQ，双螺旋队列）——灵感来自 DNA 双螺旋结构，
+ 内部维护两条并行的"链（strand）"，底层各用一个 min-heap 实现。支持 FIFO 和 vtime 
+ 两种模式，以及三种出队策略。因使用预分配容量，无需在热路径中睡眠分配，可在 BPF 非睡眠上下文
+ （如 ops.enqueue()）中安全使用。 */
 
+ /* 创建并初始化一个 DHQ 实例，返回其 arena 指针（以 u64 形式）。 */
 __weak
 u64 scx_dhq_create_internal(bool fifo, size_t capacity, u64 mode, u64 max_imbalance)
 {
@@ -48,6 +53,7 @@ u64 scx_dhq_create_internal(bool fifo, size_t capacity, u64 mode, u64 max_imbala
 	return (u64)dhq;
 }
 
+/* 向指定链（A 或 B）插入一个元素。加锁后检查容量和平衡约束，再调用 min-heap 插入。 */
 static inline
 int __scx_dhq_insert_strand(scx_dhq_t *dhq, u64 taskc_ptr, u64 strand, u64 key)
 {
@@ -106,6 +112,7 @@ error:
 	return ret;
 }
 
+/* FIFO 模式的公开入队接口。用链自增的序列号（seq_a/seq_b）作为排序键，保证先进先出。 */
 __hidden
 int scx_dhq_insert(scx_dhq_t *dhq, u64 taskc_ptr, u64 strand)
 {
@@ -133,6 +140,8 @@ int scx_dhq_insert(scx_dhq_t *dhq, u64 taskc_ptr, u64 strand)
 	return __scx_dhq_insert_strand(dhq, taskc_ptr, selected_strand, key);
 }
 
+/*  vtime 模式的公开入队接口。直接用调用者传入的 vtime 作为排序键（最小堆保证最小
+ vtime 优先出队）。 */
 __hidden
 int scx_dhq_insert_vtime(scx_dhq_t *dhq, u64 taskc_ptr, u64 vtime, u64 strand)
 {
@@ -153,6 +162,8 @@ int scx_dhq_insert_vtime(scx_dhq_t *dhq, u64 taskc_ptr, u64 vtime, u64 strand)
 	return __scx_dhq_insert_strand(dhq, taskc_ptr, selected_strand, vtime);
 }
 
+/* 不加锁地从指定链弹出堆顶元素（最小键值任务）。供 scx_dhq_pop_strand 和
+ scx_dhq_pop 内部调用。 */
 static inline
 u64 __scx_dhq_pop_strand_nolock(scx_dhq_t *dhq, u64 strand)
 {

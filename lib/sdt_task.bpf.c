@@ -79,6 +79,7 @@ void __arena *scx_task_data(struct task_struct *p)
 	return (void __arena *)data->payload;
 }
 
+/* scx任务退出时,调用,释放自己的arena内存 */
 __hidden
 void scx_task_free(struct task_struct *p)
 {

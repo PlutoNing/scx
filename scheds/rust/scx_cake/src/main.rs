@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 // SPDX 许可证标识符：GPL-2.0。讲解：声明本文件采用 GPL-2.0 开源许可协议。
 // scx_cake - sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling
-// scx_cake —— 一个把 CAKE 缓冲膨胀（bufferbloat）理念应用于 CPU 调度的 sched_ext 调度器。讲解：说明该程序借鉴网络 CAKE 排队算法来优化 CPU 任务调度。
+// scx_cake —— 一个把 CAKE 缓冲膨胀（bufferbloat）理念应用于 CPU 调度的 sched_ext 调度器。
+// 借鉴网络 CAKE 排队算法来优化 CPU 任务调度。
 
 mod topology;
 mod tui;
@@ -21,14 +22,14 @@ use scx_utils::build_id;
 use scx_utils::UserExitInfo;
 use scx_utils::NR_CPU_IDS;
 // Include the generated interface bindings
-// 引入自动生成的接口绑定。讲解：包含由构建脚本生成的 Rust 与 BPF 之间的接口定义。
+// 引入自动生成的接口绑定。包含由构建脚本生成的 Rust 与 BPF 之间的接口定义。
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod bpf_intf {
     include!(concat!(env!("OUT_DIR"), "/bpf_intf.rs"));
 }
 
 // Include the generated BPF skeleton
-// 引入自动生成的 BPF 骨架。讲解：包含编译后 BPF 程序的骨架代码，用于在用户态加载和操作 BPF。
+// 引入自动生成的 BPF 骨架。包含编译后 BPF 程序的骨架代码，用于在用户态加载和操作 BPF。
 #[allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -38,60 +39,62 @@ use bpf_skel::*;
 const SCHEDULER_NAME: &str = "scx_cake";
 
 /// Scheduler profile presets
-/// 调度器配置文件预设。讲解：定义一组预设的调度参数组合，便于按场景一键切换。
+/// 调度器配置文件预设。定义一组预设的调度参数组合，便于按场景切换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
     /// Ultra-low-latency for competitive esports (1ms quantum)
-    /// 面向竞技电竞的超低延迟（1ms 时间片）。讲解：追求极致响应，时间片极短。
+    /// 面向竞技电竞的超低延迟（1ms 时间片）。追求极致响应，时间片极短。
     Esports,
     /// Optimized for older/lower-power hardware (4ms quantum)
-    /// 针对较老/低功耗硬件优化（4ms 时间片）。讲解：加大时间片以降低旧 CPU 上的调度开销。
+    /// 针对较老/低功耗硬件优化（4ms 时间片）。加大时间片以降低旧 CPU 上的调度开销。
     Legacy,
     /// Low-latency profile optimized for gaming and interactive workloads
-    /// 针对游戏和交互式负载优化的低延迟配置。讲解：默认游戏场景，兼顾低延迟。
+    /// 针对游戏和交互式负载优化的低延迟配置。默认游戏场景，兼顾低延迟。
     Gaming,
     /// Balanced profile for general desktop use (same as gaming for now)
-    /// 面向通用桌面的均衡配置（目前与 gaming 相同）。讲解：日常桌面使用，暂等同于游戏配置。
+    /// 面向通用桌面的均衡配置（目前与 gaming 相同）。日常桌面使用，暂等同于游戏配置。
     Default,
     /// Power-efficient profile for handhelds/laptops on battery (DVFS enabled)
-    /// 面向掌机/笔记本电池供电的节能配置（启用 DVFS）。讲解：优先省电，减少上下文切换。
+    /// 面向掌机/笔记本电池供电的节能配置（启用 DVFS）。优先省电，减少上下文切换。
     Battery,
 }
 
 impl Profile {
     /// Returns (quantum_us, new_flow_bonus_us, starvation_us)
-    /// 返回三元组 (时间片_us, 新流奖励_us, 饥饿阈值_us)。讲解：把每种配置映射到具体的调度参数值。
+    /// 返回三元组 (时间片_us, 新流奖励_us, 饥饿阈值_us)。把每种配置映射到具体的调度参数值。
     fn values(&self) -> (u64, u64, u64) {
         match self {
             // Esports: Ultra-aggressive, 1ms quantum for maximum responsiveness
-            // 电竞：极度激进，1ms 时间片以获得最大响应速度。讲解：牺牲吞吐换取最低延迟。
+            // 电竞：极度激进，1ms 时间片以获得最大响应速度。牺牲吞吐换取最低延迟。
             Profile::Esports => (1000, 4000, 50000),
             // Legacy: High efficiency, 4ms quantum to reduce overhead on older CPUs
-            // 旧硬件：高效率，4ms 时间片以降低旧 CPU 的开销。讲解：加大时间片减少切换成本。
+            // 旧硬件：高效率，4ms 时间片以降低旧 CPU 的开销。加大时间片减少切换成本。
             Profile::Legacy => (4000, 12000, 200000),
             // Gaming: Aggressive latency, 2ms quantum
-            // 游戏：激进的低延迟，2ms 时间片。讲解：在延迟与开销间取得游戏场景平衡。
+            // 游戏：激进的低延迟，2ms 时间片。在延迟与开销间取得游戏场景平衡。
             Profile::Gaming => (2000, 8000, 100000),
             // Default: Same as gaming for now
-            // 默认：目前与游戏配置相同。讲解：占位配置，后续版本可能分化。
+            // 默认：目前与游戏配置相同。占位配置，后续版本可能分化。
             Profile::Default => (2000, 8000, 100000),
             // Battery: 4ms quantum — fewer context switches = less power
-            // 电池：4ms 时间片——更少的上下文切换意味着更省电。讲解：延长时间片以节能。
+            // 电池：4ms 时间片——更少的上下文切换意味着更省电。延长时间片以节能。
             Profile::Battery => (4000, 12000, 200000),
         }
     }
 
     // DVFS — disabled (tick architecture removed, no runtime effect).
-    // DVFS —— 已禁用（tick 架构已移除，运行时无效果）。讲解：动态调频功能不再生效。
+    // DVFS —— 已禁用（tick 架构已移除，运行时无效果）。动态调频功能不再生效。
     // RODATA symbols retained in BPF for loader compat; JIT eliminates.
-    // BPF 中保留 RODATA 符号以兼容加载器；JIT 会将其消除。讲解：保留符号仅为兼容，编译期会优化掉。
+    // BPF 中保留 RODATA 符号以兼容加载器；JIT 会将其消除。
 }
 
-/// 🍰 scx_cake: A sched_ext scheduler applying CAKE bufferbloat concepts
+/// scx_cake: A sched_ext scheduler applying CAKE bufferbloat concepts
 ///
 /// This scheduler adapts CAKE's DRR++ (Deficit Round Robin++) algorithm
 /// for CPU scheduling, providing low-latency scheduling for gaming and
 /// interactive workloads while maintaining fairness.
+/// 本调度器把 CAKE 的 DRR++（赤字轮询++）算法改造用于 CPU 调度，
+/// 在保持公平性的同时，为游戏和交互式负载提供低延迟调度。
 ///
 /// PROFILES set all tuning parameters at once. Individual options override profile defaults.
 ///
@@ -107,10 +110,8 @@ impl Profile {
 ///   scx_cake --quantum 1500           # Gaming profile with custom quantum
 ///   scx_cake -v                       # Run with live TUI stats display
 ///
-/// 🍰 scx_cake：一个把 CAKE 缓冲膨胀理念应用于 CPU 调度的 sched_ext 调度器。
+/// scx_cake：一个把 CAKE 缓冲膨胀理念应用于 CPU 调度的 sched_ext 调度器。
 ///
-/// 本调度器把 CAKE 的 DRR++（赤字轮询++）算法改造用于 CPU 调度，
-/// 在保持公平性的同时，为游戏和交互式负载提供低延迟调度。
 ///
 /// PROFILES（配置文件）会一次性设置所有调优参数。单独的选项会覆盖配置文件的默认值。
 ///
@@ -126,13 +127,12 @@ impl Profile {
 ///   scx_cake --quantum 1500           # 游戏配置并自定义时间片
 ///   scx_cake -v                       # 运行并显示实时 TUI 统计界面
 ///
-/// 讲解：这是命令行程序的顶层帮助文档，说明调度器的原理、任务分类体系与常用命令示例。
 #[derive(Parser, Debug, Clone)]
 #[command(
     author,
     version,
     disable_version_flag = true,
-    about = "🍰 A sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling",
+    about = " A sched_ext scheduler applying CAKE bufferbloat concepts to CPU scheduling",
     verbatim_doc_comment
 )]
 struct Args {
@@ -189,14 +189,11 @@ struct Args {
     /// Recommended range: 1000-8000µs
     ///
     /// 基础调度时间片，单位为微秒 [默认：2000]。
-    ///
     /// 表示一个任务在可能让出 CPU 前运行多久。
-    ///
     /// 时间片越小 = 越灵敏但开销越高。
     /// 电竞：1000µs | 游戏：2000µs | 旧硬件：4000µs
     /// 推荐范围：1000-8000µs
-    ///
-    /// 讲解：--quantum 参数，控制每个任务单次运行的时长。
+    /// --quantum 参数，控制每个任务单次运行的时长。
     #[arg(long, verbatim_doc_comment)]
     quantum: Option<u64>,
 
@@ -215,8 +212,7 @@ struct Args {
     ///
     /// 电竞：4000µs | 游戏：8000µs
     /// 推荐范围：4000-16000µs
-    ///
-    /// 讲解：--new_flow_bonus 参数，给刚被唤醒的任务额外运行配额以改善响应。
+    /// --new_flow_bonus 参数，给刚被唤醒的任务额外运行配额以改善响应。
     #[arg(long, verbatim_doc_comment)]
     new_flow_bonus: Option<u64>,
 
@@ -232,10 +228,8 @@ struct Args {
     ///
     /// 安全上限：运行超过该时长的任务会被强制抢占。
     /// 防止任何单个任务独占 CPU。
-    ///
     /// 电竞：50000µs (50ms) | 游戏：100000µs (100ms) | 旧硬件：200000µs (200ms)
     /// 推荐范围：50000-200000µs
-    ///
     /// 讲解：--starvation 参数，作为防止任务饿死其他任务的抢占安全阀。
     #[arg(long, verbatim_doc_comment)]
     starvation: Option<u64>,
@@ -251,7 +245,6 @@ struct Args {
     /// 显示各层级的派发计数、层级切换、
     /// 等待时间统计以及系统拓扑信息。
     /// 按 'q' 退出 TUI 模式。
-    ///
     /// 讲解：--verbose 参数，开启终端内实时监控面板。
     #[arg(long, short, verbatim_doc_comment)]
     verbose: bool,
@@ -269,7 +262,6 @@ struct Args {
     /// 不加 --verbose 时无效果。
     ///
     /// 默认：1 秒
-    ///
     /// 讲解：--interval 参数，控制监控面板的刷新频率。
     #[arg(long, default_value_t = 1, verbatim_doc_comment)]
     interval: u64,
@@ -283,7 +275,6 @@ struct Args {
     ///
     /// 运行调度器 10 秒，收集 BPF 数据点，
     /// 并向标准输出打印结构化的 JSON。
-    ///
     /// 讲解：--testing 参数，用于跑一段固定时长并输出可解析的性能数据。
     #[arg(long, verbatim_doc_comment)]
     testing: bool,
@@ -296,7 +287,7 @@ struct Args {
 
 impl Args {
     /// Get effective values (profile defaults with CLI overrides applied)
-    /// 获取生效值（在配置文件默认值基础上应用命令行覆盖）。讲解：合并预设与用户传入参数，得到最终使用的参数。
+    /// 获取生效值（在配置文件默认值基础上应用命令行覆盖）。合并预设与用户传入参数，得到最终使用的参数。
     fn effective_values(&self) -> (u64, u64, u64) {
         let (q, nfb, starv) = self.profile.values();
         (
@@ -325,11 +316,11 @@ impl<'a> Scheduler<'a> {
         // ═══ scx_ops_open! equivalent ═══
         // ═══ 等价于 scx_ops_open! ═══。讲解：这一段手工实现宏 scx_ops_open! 的功能。
         // Matches scx_ops_open!(skel_builder, open_object, cake_ops, None)
-        // 对应 scx_ops_open!(skel_builder, open_object, cake_ops, None)。讲解：与该宏调用行为一致。
+        // 对应 scx_ops_open!(skel_builder, open_object, cake_ops, None)。与该宏调用行为一致。
         // Cake can't use the macro directly (custom arena architecture),
-        // Cake 无法直接使用该宏（自定义 arena 架构）。讲解：因架构特殊需要内联展开。
+        // Cake 无法直接使用该宏（自定义 arena 架构）。因架构特殊需要内联展开。
         // so we inline the critical functionality.
-        // 因此我们把关键功能内联实现。讲解：手动完成宏原本负责的初始化步骤。
+        // 关键功能内联实现。手动完成宏原本负责的初始化步骤。
         scx_utils::compat::check_min_requirements()?;
 
         let skel_builder = BpfSkelBuilder::default();
@@ -338,9 +329,9 @@ impl<'a> Scheduler<'a> {
             .context("Failed to open BPF skeleton")?;
 
         // Inject version suffix into ops name: "cake" → "cake_1.1.0_g<hash>_<target>"
-        // 将版本后缀注入 ops 名称："cake" → "cake_1.1.0_g<hash>_<target>"。讲解：给调度器操作名附加版本信息。
+        // 将版本后缀注入 ops 名称："cake" → "cake_1.1.0_g<hash>_<target>"。给调度器操作名附加版本信息。
         // This is what scx_loader reads from /sys/kernel/sched_ext/root/ops
-        // 这正是 scx_loader 从 /sys/kernel/sched_ext/root/ops 读取的内容。讲解：加载器据此识别调度器。
+        // 这正是 scx_loader 从 /sys/kernel/sched_ext/root/ops 读取的内容。加载器据此识别调度器。
         {
             let ops = open_skel.struct_ops.cake_ops_mut();
             let name_field = &mut ops.name;
@@ -370,7 +361,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // Read hotplug sequence number — enables kernel-requested restarts on CPU hotplug
-        // 读取热插拔序列号 —— 允许在 CPU 热插拔时由内核请求重启。讲解：记录热插拔状态以便调度器在拓扑变化时重启。
+        // 读取热插拔序列号 —— 允许在 CPU 热插拔时由内核请求重启。记录热插拔状态以便调度器在拓扑变化时重启。
         {
             let path = std::path::Path::new("/sys/kernel/sched_ext/hotplug_seq");
             let val = std::fs::read_to_string(path)
@@ -382,7 +373,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // Honor SCX_TIMEOUT_MS environment variable (matches scx_ops_open! behavior)
-        // 遵循 SCX_TIMEOUT_MS 环境变量（与 scx_ops_open! 行为一致）。讲解：允许通过环境变量设置调度器超时。
+        // 遵循 SCX_TIMEOUT_MS 环境变量（与 scx_ops_open! 行为一致）。允许通过环境变量设置调度器超时。
         if let Ok(s) = std::env::var("SCX_TIMEOUT_MS") {
             let ms: u32 = s.parse().context("SCX_TIMEOUT_MS has invalid value")?;
             info!("Setting timeout_ms to {} based on environment", ms);
@@ -390,7 +381,8 @@ impl<'a> Scheduler<'a> {
         }
 
         // Populate SCX enum RODATA from kernel BTF (SCX_DSQ_LOCAL_ON, SCX_KICK_PREEMPT, etc.)
-        // 从内核 BTF 填充 SCX 枚举 RODATA（如 SCX_DSQ_LOCAL_ON、SCX_KICK_PREEMPT 等）。讲解：把内核定义的枚举常量导入到 BPF 只读数据中。
+        // 从内核 BTF 填充 SCX 枚举 RODATA（如 SCX_DSQ_LOCAL_ON、SCX_KICK_PREEMPT 等）。
+        // 把内核定义的枚举常量导入到 BPF 只读数据中。
         scx_utils::import_enums!(open_skel);
 
         // Detect system topology (CCDs, P/E cores)
@@ -398,43 +390,44 @@ impl<'a> Scheduler<'a> {
         let topo = topology::detect()?;
 
         // Get effective values (profile + CLI overrides)
-        // 获取生效值（配置文件 + 命令行覆盖）。讲解：得到最终使用的调度参数。
+        // 获取生效值（配置文件 + 命令行覆盖）。得到最终使用的调度参数。
         let (quantum, new_flow_bonus, _starvation) = args.effective_values();
 
         // Latency matrix: zeroed, populated by TUI Topology tab if --verbose
-        // 延迟矩阵：初始化为零，若使用 --verbose 则由 TUI 拓扑页填充。讲解：预留存放核间延迟数据的矩阵。
+        // 延迟矩阵：初始化为零，若使用 --verbose 则由 TUI 拓扑页填充。预留存放核间延迟数据的矩阵。
         let latency_matrix = vec![vec![0.0; topo.nr_cpus]; topo.nr_cpus];
 
         // Configure the scheduler via rodata (read-only data)
-        // 通过 rodata（只读数据）配置调度器。讲解：把用户态参数写入 BPF 只读区，加载后不可改。
+        // 通过 rodata配置调度器。把用户态参数写入 BPF 只读区，加载后不可改。
         if let Some(rodata) = &mut open_skel.maps.rodata_data {
             rodata.quantum_ns = quantum * 1000;
             rodata.new_flow_bonus_ns = new_flow_bonus * 1000;
             // Stats/telemetry: only available in debug builds (CAKE_RELEASE omits the field).
-            // 统计/遥测：仅在 debug 构建中可用（CAKE_RELEASE 会省略该字段）。讲解：发布版剔除统计以避免开销。
+            // 仅在 debug 构建中可用。
             // In release, --verbose is silently ignored — zero overhead for production gaming.
-            // 在 release 版本中，--verbose 会被静默忽略 —— 面向生产游戏零开销。讲解：正式版忽略统计开关。
+            // 在 release 版本中，--verbose 会被静默忽略 —— 面向生产游戏零开销。正式版忽略统计开关。
             #[cfg(debug_assertions)]
             {
                 rodata.enable_stats = args.verbose || args.testing;
             }
 
             // has_hybrid removed: smt_sibling now uses pre-filled cpu_sibling_map only
-            // 已移除 has_hybrid：smt_sibling 现在仅使用预填充的 cpu_sibling_map。讲解：SMT 兄弟核信息改由预置映射提供。
+            // 已移除 has_hybrid：smt_sibling 现在仅使用预填充的 cpu_sibling_map。SMT 兄弟核信息改由预置映射提供。
             // Per-LLC DSQ partitioning: populate CPU→LLC mapping
             // 按 LLC 划分 DSQ：填充 CPU→LLC 的映射。讲解：为每个末级缓存域建立独立派发队列的映射。
+            /* 从感知的拓扑里面计算llc的数量 */
             let llc_count = topo.llc_cpu_mask.iter().filter(|&&m| m != 0).count() as u32;
             rodata.nr_llcs = llc_count.max(1);
             rodata.nr_cpus = topo.nr_cpus.min(256) as u32; // F2: widened from 64→256 for Threadripper
-            // F2：为 Threadripper 从 64 扩展到 256。讲解：支持超多核 CPU。
+            // 为 Threadripper 从 64 扩展到 256。讲解：支持超多核 CPU。
             rodata.nr_phys_cpus = topo.nr_phys_cpus.min(256) as u32; // V3: PHYS_FIRST scan mask
-            // V3：PHYS_FIRST 扫描掩码。讲解：记录物理核数量用于优先扫描物理核。
+            // V3：PHYS_FIRST 扫描掩码。记录物理核数量用于优先扫描物理核。
 
             // Ferry explicit 64-bit topology arrays down into BPF (O(1) execution replacements)
-            // 将显式的 64 位拓扑数组传递到 BPF（用于 O(1) 执行替换）。讲解：预先算好拓扑数组，让 BPF 侧查表即得、避免运行时计算。
+            // 将显式的 64 位拓扑数组传递到 BPF（用于 O(1) 执行替换）。预先算好拓扑数组，让 BPF 侧查表即得、避免运行时计算。
 
             // Heterogeneous Gaming Topology — u64[4] arrays (F2: 256-bit masks)
-            // 异构游戏拓扑 —— u64[4] 数组（F2：256 位掩码）。讲解：用 4 个 u64 表示最多 256 个 CPU 的位掩码。
+            // 异构游戏拓扑 —— u64[4] 数组（F2：256 位掩码）。用 4 个 u64 表示最多 256 个 CPU 的位掩码。
             rodata.big_core_phys_mask[0] = topo.big_core_phys_mask;
             rodata.big_core_smt_mask[0] = topo.big_core_smt_mask;
             rodata.little_core_mask[0] = topo.little_core_mask;
@@ -457,15 +450,16 @@ impl<'a> Scheduler<'a> {
             }
 
             // Performance-ordered CPU arrays: read prefcore ranking from sysfs,
-            // 按性能排序的 CPU 数组：从 sysfs 读取 prefcore 排名，讲解：依据硬件性能提示排列 CPU 顺序。
+            // 按性能排序的 CPU 数组：从 sysfs 读取 prefcore 排名，依据硬件性能提示排列 CPU 顺序。
             // sort by performance, group SMT pairs together.
-            // 按性能排序，并把 SMT 兄弟对分组在一起。讲解：让超线程配对相邻，便于成对分配。
+            // 按性能排序，并把 SMT 兄弟对分组在一起。让超线程配对相邻，便于成对分配。
             // GAME tasks scan fast→slow, non-GAME scans slow→fast.
-            // GAME 任务从快到慢扫描，非 GAME 从慢到快扫描。讲解：游戏任务优先占用最快的核。
+            // GAME 任务从快到慢扫描，非 GAME 从慢到快扫描。游戏任务优先占用最快的核。
             {
                 let nr = topo.nr_cpus.min(256);
                 // Read prefcore ranking per CPU (higher = faster)
                 // 读取每个 CPU 的 prefcore 排名（越高 = 越快）。讲解：从 sysfs 获取各核的性能等级。
+                /* 得到一组<cpu,rank> */
                 let mut rankings: Vec<(usize, u32)> = (0..nr)
                     .map(|cpu| {
                         let path = format!(
@@ -476,19 +470,19 @@ impl<'a> Scheduler<'a> {
                             .ok()
                             .and_then(|s| s.trim().parse::<u32>().ok())
                             .unwrap_or(100); // fallback: equal ranking
-                        // 回退：使用相等排名。讲解：读取失败时默认所有核性能相同。
+                        // 回退：使用相等排名。读取失败时默认所有核性能相同。
                         (cpu, rank)
                     })
                     .collect();
 
                 // Sort by descending rank (fastest first), stable for SMT grouping
-                // 按排名降序排序（最快在前），使用稳定排序以便 SMT 分组。讲解：保持同性能核的相对顺序稳定。
+                // 按排名降序排序（最快在前），使用稳定排序以便 SMT 分组。保持同性能核的相对顺序稳定。
                 rankings.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
                 // Build fast→slow array with SMT pairs grouped together:
-                // 构建从快到慢的数组，并把 SMT 兄弟对分组在一起：讲解：生成有序的 CPU 选择列表。
+                // 构建从快到慢的数组，并把 SMT 兄弟对分组在一起：生成有序的 CPU 选择列表。
                 // [best_phys, best_smt, second_phys, second_smt, ...]
-                // [最快物理核, 其 SMT 兄弟, 次快物理核, 其 SMT 兄弟, ...]。讲解：物理核与其超线程相邻排列。
+                // [最快物理核, 其 SMT 兄弟, 次快物理核, 其 SMT 兄弟, ...]。物理核与其超线程相邻排列。
                 let mut fast_to_slow: Vec<u8> = Vec::with_capacity(nr);
                 let mut used = vec![false; nr];
                 for &(cpu, _) in &rankings {
@@ -498,7 +492,7 @@ impl<'a> Scheduler<'a> {
                     fast_to_slow.push(cpu as u8);
                     used[cpu] = true;
                     // Add SMT sibling immediately after
-                    // 紧接着添加 SMT 兄弟核。讲解：把该核的超线程配对放在其后。
+                    // 紧接着添加 SMT 兄弟核。把该核的超线程配对放在其后。
                     let sib = topo.cpu_sibling_map.get(cpu).copied().unwrap_or(0xFF);
                     if (sib as usize) < nr && !used[sib as usize] {
                         fast_to_slow.push(sib);
@@ -507,16 +501,16 @@ impl<'a> Scheduler<'a> {
                 }
 
                 // Populate RODATA arrays
-                // 填充 RODATA 数组。讲解：把排好序的 CPU 列表写入 BPF 只读数据。
+                // 填充 RODATA 数组, 把排好序的 CPU 列表写入 BPF 只读数据。
                 for i in 0..64usize {
                     if i < fast_to_slow.len() {
                         rodata.cpus_fast_to_slow[i] = fast_to_slow[i];
                         // Reverse for slow→fast
-                        // 反转以得到从慢到快的顺序。讲解：非游戏任务使用该逆序列表。
+                        // 反转以得到从慢到快的顺序。非游戏任务使用该逆序列表。
                         rodata.cpus_slow_to_fast[i] = fast_to_slow[fast_to_slow.len() - 1 - i];
                     } else {
                         rodata.cpus_fast_to_slow[i] = 0xFF; // sentinel
-                        // 哨兵值。讲解：0xFF 表示该槽位无效/结束标记。
+                        // 哨兵值。0xFF 表示该槽位无效/结束标记。
                         rodata.cpus_slow_to_fast[i] = 0xFF;
                     }
                 }
@@ -529,15 +523,19 @@ impl<'a> Scheduler<'a> {
             }
 
             // ═══ Per-CPU capacity table (F1 correctness fix) ═══
-            // ═══ 每 CPU 算力表（F1 正确性修复）═══。讲解：为每个核记录相对算力。
+            // ═══ 每 CPU 算力表（F1 正确性修复）═══。为每个核记录相对算力。
+
             // Read arch_scale_cpu_capacity from sysfs for P/E core vruntime scaling.
-            // 从 sysfs 读取 arch_scale_cpu_capacity，用于性能核/能效核的 vruntime 缩放。讲解：按核算力调整虚拟运行时间。
+            // 从 sysfs 读取 arch_scale_cpu_capacity，用于性能核/能效核的 vruntime 缩放。按核算力调整虚拟运行时间。
+
             // Scale: 0-1024, where 1024 = fastest core. On SMP all = 1024 → JIT folds.
-            // 取值：0-1024，其中 1024 = 最快的核。对称多处理器上全为 1024 → JIT 可折叠优化。讲解：同构系统无需缩放。
+            // 取值：0-1024，其中 1024 = 最快的核。对称多处理器上全为 1024 → JIT 可折叠优化。同构系统无需缩放。
+
             // Intel hybrid: P-cores ~1024, E-cores ~600-700.
-            // Intel 混合架构：性能核约 1024，能效核约 600-700。讲解：异构核算力差异明显。
+            // Intel 混合架构：性能核约 1024，能效核约 600-700。异构核算力差异明显。
+
             // AMD SMP: all 1024 → cap > 0 && cap < 1024 is always false → zero overhead.
-            // AMD 对称多处理器：全为 1024 → 条件 cap > 0 && cap < 1024 恒为假 → 零开销。讲解：同构时缩放逻辑被跳过。
+            // AMD 对称多处理器：全为 1024 → 条件 cap > 0 && cap < 1024 恒为假 → 零开销。同构时缩放逻辑被跳过。
             {
                 let nr = topo.nr_cpus.min(256);
                 let mut all_equal = true;
@@ -569,15 +567,15 @@ impl<'a> Scheduler<'a> {
             }
 
             // Arena library: nr_cpu_ids must be set before load() — arena_init
-            // Arena 库：nr_cpu_ids 必须在 load() 之前设置 —— arena_init 会检查它，讲解：arena 初始化依赖该值。
+            // Arena 库：nr_cpu_ids 必须在 load() 之前设置 —— arena_init 会检查它，arena 初始化依赖该值。
             // checks this and returns -ENODEV (errno 19) if uninitialized.
-            // 若未初始化则返回 -ENODEV（errno 19）。讲解：未设置会导致加载失败。
+            // 若未初始化则返回 -ENODEV（errno 19）。未设置会导致加载失败。
             rodata.nr_cpu_ids = *NR_CPU_IDS as u32;
 
             // ═══ Audio stack detection ═══
-            // ═══ 音频栈检测 ═══。讲解：找出系统中的音频相关进程并特殊对待。
+            // ═══ 音频栈检测 ═══。找出系统中的音频相关进程并特殊对待。
             // Phase 1: Core audio daemons by comm name.
-            // 阶段 1：按进程名（comm）识别核心音频守护进程。讲解：匹配已知音频服务名。
+            // 阶段 1：按进程名（comm）识别核心音频守护进程。匹配已知音频服务名。
             // Phase 2: PipeWire socket clients (mixers like goxlr-daemon).
             // 阶段 2：PipeWire 套接字客户端（如 goxlr-daemon 等混音器）。讲解：通过套接字连接找出音频客户端。
             // Both are session-persistent → bake into RODATA.
@@ -621,13 +619,13 @@ impl<'a> Scheduler<'a> {
                 // Phase 2: PipeWire socket client detection.
                 // 阶段 2：PipeWire 套接字客户端检测。讲解：不依赖进程名，改用套接字连接关系发现音频客户端。
                 // Scan /proc/net/unix for pipewire-0 socket inodes, then find
-                // 扫描 /proc/net/unix 找出 pipewire-0 套接字的 inode，然后查找讲解：先定位套接字 inode。
+                // 扫描 /proc/net/unix 找出 pipewire-0 套接字的 inode，然后查找, 先定位套接字 inode。
                 // processes with fds pointing to those inodes. This catches any
-                // 打开了指向这些 inode 的文件描述符的进程。这样可以捕获任何讲解：通过 fd 反查连接进程。
+                // 打开了指向这些 inode 的文件描述符的进程。这样可以捕获任何, 通过 fd 反查连接进程。
                 // audio mixer daemon (goxlr-daemon, easyeffects, etc.) without
-                // 音频混音守护进程（goxlr-daemon、easyeffects 等），而无需讲解：覆盖各类音频客户端。
+                // 音频混音守护进程（goxlr-daemon、easyeffects 等），而无需
                 // brittle comm lists.
-                // 依赖脆弱的进程名列表。讲解：避免硬编码进程名带来的遗漏。
+                // 依赖脆弱的进程名列表。
                 let core_count = audio_tgids.len();
                 'pw_detect: {
                     let uid = unsafe { libc::getuid() };
@@ -645,7 +643,7 @@ impl<'a> Scheduler<'a> {
                             || line.contains(&format!("{} ", pw_socket_path))
                         {
                             // Format: Num RefCount Protocol Flags Type St Inode Path
-                            // 格式：Num RefCount Protocol Flags Type St Inode Path。讲解：说明该行各字段含义，Inode 在第 7 列。
+                            // 格式：Num RefCount Protocol Flags Type St Inode Path。说明该行各字段含义，Inode 在第 7 列。
                             let fields: Vec<&str> = line.split_whitespace().collect();
                             if fields.len() >= 7 {
                                 if let Ok(inode) = fields[6].parse::<u64>() {
@@ -661,9 +659,9 @@ impl<'a> Scheduler<'a> {
                     }
 
                     // Scan /proc/*/fd for socket links matching PipeWire inodes.
-                    // 扫描 /proc/*/fd 中匹配 PipeWire inode 的套接字链接。讲解：遍历各进程的文件描述符找出连接者。
+                    // 扫描 /proc/*/fd 中匹配 PipeWire inode 的套接字链接。遍历各进程的文件描述符找出连接者。
                     // Only check thread-group leaders (dirs in /proc with numeric names).
-                    // 仅检查线程组组长（/proc 下以数字命名的目录）。讲解：只看主进程，忽略线程目录。
+                    // 仅检查线程组组长（/proc 下以数字命名的目录）。只看主进程，忽略线程目录。
                     if let Ok(proc_entries) = std::fs::read_dir("/proc") {
                         for entry in proc_entries.flatten() {
                             if audio_tgids.len() >= 8 {
@@ -679,7 +677,7 @@ impl<'a> Scheduler<'a> {
                                 Err(_) => continue,
                             };
                             // Skip PIDs already detected as core audio
-                            // 跳过已被识别为核心音频的 PID。讲解：避免重复统计阶段 1 已找到的进程。
+                            // 跳过已被识别为核心音频的 PID。避免重复统计阶段 1 已找到的进程。
                             if audio_tgid_set.contains(&pid) {
                                 continue;
                             }
@@ -692,7 +690,7 @@ impl<'a> Scheduler<'a> {
                                 if let Ok(link) = std::fs::read_link(fd_entry.path()) {
                                     let link_str = link.to_string_lossy();
                                     // Socket links look like "socket:[12345]"
-                                    // 套接字链接形如 "socket:[12345]"。讲解：从符号链接中解析出套接字 inode 号。
+                                    // 套接字链接形如 "socket:[12345]"。从符号链接中解析出套接字 inode 号。
                                     if let Some(inode_str) = link_str
                                         .strip_prefix("socket:[")
                                         .and_then(|s| s.strip_suffix(']'))
@@ -703,7 +701,7 @@ impl<'a> Scheduler<'a> {
                                                     audio_tgids.push(pid);
                                                 }
                                                 break; // Found one match, move to next PID
-                                                // 找到一个匹配，转到下一个 PID。讲解：确认是客户端即可停止扫描该进程的 fd。
+                                                // 找到一个匹配，转到下一个 PID。确认是客户端即可停止扫描该进程的 fd。
                                             }
                                         }
                                     }
@@ -737,11 +735,11 @@ impl<'a> Scheduler<'a> {
             }
 
             // ═══ Compositor detection ═══
-            // ═══ 合成器检测 ═══。讲解：识别桌面合成器进程以便优先调度。
+            // ═══ 合成器检测 ═══。识别桌面合成器进程以便优先调度。
             // Wayland compositors present every frame to the display.
-            // Wayland 合成器负责把每一帧呈现到显示器。讲解：合成器延迟直接影响画面流畅度。
+            // Wayland 合成器负责把每一帧呈现到显示器。合成器延迟直接影响画面流畅度。
             // Session-persistent → bake into RODATA.
-            // 在整个会话期间持续存在 → 固化到 RODATA。讲解：一次检测后写入只读数据。
+            // 在整个会话期间持续存在 → 固化到 RODATA。一次检测后写入只读数据。
             {
                 const COMPOSITOR_COMMS: &[&str] = &[
                     "kwin_wayland",
@@ -796,7 +794,7 @@ impl<'a> Scheduler<'a> {
         // ═══ scx_ops_load! equivalent ═══
         // ═══ 等价于 scx_ops_load! ═══。讲解：这一段手工实现宏 scx_ops_load! 的加载功能。
         // Set UEI dump buffer size before load (matches scx_ops_load! behavior)
-        // 在加载前设置 UEI 转储缓冲区大小（与 scx_ops_load! 行为一致）。讲解：为退出信息预留缓冲区。
+        // 在加载前设置 UEI 转储缓冲区大小（与 scx_ops_load! 行为一致）。为退出信息预留缓冲区。
         scx_utils::uei_set_size!(open_skel, cake_ops, uei);
 
         let mut skel = open_skel.load().context("Failed to load BPF program")?;
@@ -804,18 +802,19 @@ impl<'a> Scheduler<'a> {
         // Initialize the BPF arena library.
         // 初始化 BPF arena 库。讲解：设置 BPF 使用的自定义内存分配区。
         // Must happen after load() (BPF maps are now live) but before attach_struct_ops()
-        // 必须在 load() 之后（此时 BPF map 已就绪）但在 attach_struct_ops() 之前进行，讲解：时序要求严格。
+        // 必须在 load() 之后（此时 BPF map 已就绪）但在 attach_struct_ops() 之前进行
         // (scheduler not yet running, so init_task hasn't fired yet).
-        // （此时调度器尚未运行，因此 init_task 还未触发）。讲解：确保初始化早于任务处理。
+        // （此时调度器尚未运行，因此 init_task 还未触发）。
         // ArenaLib::setup() runs SEC("syscall") probes:
-        // ArenaLib::setup() 会运行 SEC("syscall") 探针：讲解：通过 syscall 类 BPF 程序完成初始化。
+        // ArenaLib::setup() 会运行 SEC("syscall") 探针：syscall 类 BPF 程序完成初始化。
         //   1. arena_init: allocates static pages, inits task stack allocator
-        //   1. arena_init：分配静态页，初始化任务栈分配器。讲解：准备 arena 基础内存。
+        //   1. arena_init：分配静态页，初始化任务栈分配器。准备 arena 基础内存。
         //   2. arena_topology_node_init: registers topology nodes for arena traversal
-        //   2. arena_topology_node_init：为 arena 遍历注册拓扑节点。讲解：登记拓扑信息供后续使用。
+        //   2. arena_topology_node_init：为 arena 遍历注册拓扑节点。登记拓扑信息供后续使用。
         let task_ctx_size = std::mem::size_of::<bpf_intf::cake_task_ctx>();
         let arena = ArenaLib::init(skel.object_mut(), task_ctx_size, topo.nr_cpus)
             .context("Failed to create ArenaLib")?;
+        /* 运行 SEC("syscall") 探针 */
         arena.setup().context("Failed to initialize BPF arena")?;
         info!(
             "BPF arena initialized (task_ctx_size={}B, nr_cpus={})",
@@ -823,7 +822,7 @@ impl<'a> Scheduler<'a> {
         );
 
         // Set initial BSS values before attach (zero-init'd in BPF for BSS placement).
-        // 在 attach 之前设置初始 BSS 值（BPF 中为放入 BSS 段而做零初始化）。讲解：预置可读写全局变量的初值。
+        // 在 attach 之前设置初始 BSS 值
         // quantum_ceiling_ns: default IDLE/GAMING → 2ms. TUI updates at ~2Hz.
         // quantum_ceiling_ns：默认 IDLE/GAMING → 2ms。TUI 以约 2Hz 更新。讲解：设置时间片上限默认值。
         if let Some(bss) = &mut skel.maps.bss_data {
@@ -844,15 +843,15 @@ impl<'a> Scheduler<'a> {
         use libbpf_rs::skel::Skel;
 
         // ═══ scx_ops_attach! equivalent ═══
-        // ═══ 等价于 scx_ops_attach! ═══。讲解：这一段手工实现宏 scx_ops_attach! 的挂载功能。
+        // 这一段手工实现宏 scx_ops_attach! 的挂载功能。
         // Guard: prevent loading if another sched_ext scheduler is already active
-        // 保护性检查：如果已有另一个 sched_ext 调度器在运行，则阻止加载。讲解：避免多个调度器冲突。
+        // 保护性检查：如果已有另一个 sched_ext 调度器在运行，则阻止加载。避免多个调度器冲突。
         if scx_utils::compat::is_sched_ext_enabled().unwrap_or(false) {
             anyhow::bail!("another sched_ext scheduler is already running");
         }
 
         // Attach non-struct_ops BPF programs first, then struct_ops
-        // 先挂载非 struct_ops 的 BPF 程序，再挂载 struct_ops。讲解：按正确顺序挂载，最后启用调度器主体。
+        // 先挂载非 struct_ops 的 BPF 程序，再挂载 struct_ops。按正确顺序挂载，最后启用调度器主体。
         self.skel
             .attach()
             .context("Failed to attach non-struct_ops BPF programs")?;
@@ -865,9 +864,9 @@ impl<'a> Scheduler<'a> {
         );
 
         // Release builds: --verbose and --testing are unavailable (stats compiled out).
-        // Release 构建：--verbose 和 --testing 不可用（统计功能已被编译剔除）。讲解：正式版无遥测。
+        // Release 构建：--verbose 和 --testing 不可用（统计功能已被编译剔除）。
         // Warn early so user knows these flags require a debug build.
-        // 提前告警，让用户知道这些标志需要 debug 构建。讲解：避免用户误以为选项无效。
+        // 提前告警，让用户知道这些标志需要 debug 构建。
         #[cfg(not(debug_assertions))]
         if self.args.verbose || self.args.testing {
             warn!("--verbose and --testing require a debug build (telemetry is compiled out in release).");
@@ -994,7 +993,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Handle --version before anything else (matches cosmos/bpfland)
-    // 在其他一切之前处理 --version（与 cosmos/bpfland 一致）。讲解：请求版本时立即打印并退出。
+    // 在其他一切之前处理 --version（与 cosmos/bpfland 一致）。
     if args.version {
         println!(
             "{} {}",

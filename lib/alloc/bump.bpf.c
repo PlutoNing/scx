@@ -12,7 +12,11 @@
  * memory returned by this code is typeless so it avoids us
  * having to define an allocator for each type.
  */
+/* bump.bpf.c 实现了一个线性分配器（Bump Allocator / Arena Allocator），也叫"指针碰撞分配器"。
 
+它的设计思想极其简单：维护一个内存块和一个偏移量，每次分配只需把偏移往前推进（bump），
+永远不支持单独释放。适用于"只分配、不释放、随程序终止而统一回收"的场景，即 BPF 程序
+初始化阶段的全局静态数据。 */
 #include <alloc/common.h>
 #include <alloc/asan.h>
 #include <alloc/bump.h>
@@ -20,6 +24,9 @@
 /* Maximum memory that can be allocated by the arena. */
 #define ARENA_MAX_MEMORY (1ULL << 20)
 
+/* 作用：把变量放进一个具名 ELF data section。BPF 加载器可以按 section 名称把不同
+变量分组，便于 BTF 类型信息关联和 map pinning。bpf_spin_lock 必须放在 BPF map
+ 的数据段里才能被验证器识别，private() 就是实现这一点的标准手段。 */
 private(STATIC_ALLOC_LOCK) struct bpf_spin_lock static_lock;
 
 private(STATIC_ALLOC) struct bump bump;
@@ -28,6 +35,7 @@ const s8 STATIC_POISON_UNINIT = 0xff;
 
 extern volatile u64 asan_violated;
 
+/* 以及一个内嵌链表节点，用于在扩容时把历史内存块串联起来（销毁时遍历回收）： */
 struct bump_ll;
 struct bump_ll {
 	struct bump_ll __arena *next;
@@ -53,10 +61,12 @@ __weak u64 bump_alloc_internal(size_t bytes, size_t alignment)
 
 	bpf_spin_lock(&static_lock);
 
-	/* Round up the current offset. */
+	/* Round up the current offset.
+	从 addr 开始分配内存 */
 	addr	    = (__u64)bump.memory + bump.off;
 
 	padding	    = round_up(addr, alignment) - addr;
+	/* 要分配的数量 */
 	alloc_bytes = bytes + padding;
 
 	if (alloc_bytes > bump.max_contig_bytes) {
@@ -71,6 +81,7 @@ __weak u64 bump_alloc_internal(size_t bytes, size_t alignment)
 	 * size is significantly larger than the typical allocation
 	 * size, so it does not attempt to alleviate memory
 	 * fragmentation.
+	 超过了 bump 目前大小，需要新申请内存了
 	 */
 	if (bump.off + alloc_bytes > bump.max_contig_bytes) {
 		if (bump.cur_memusage + bump.max_contig_bytes >
@@ -91,6 +102,7 @@ __weak u64 bump_alloc_internal(size_t bytes, size_t alignment)
 
 		alloc_pages = bump.max_contig_bytes / PAGE_SIZE;
 
+		/* 分配内存 */
 		memory	    = bpf_arena_alloc_pages(&arena, NULL, alloc_pages,
 						    NUMA_NO_NODE, 0);
 		if (!memory)
@@ -103,6 +115,7 @@ __weak u64 bump_alloc_internal(size_t bytes, size_t alignment)
 
 		/* Error out if we raced with another allocation. */
 		if (bump.memory != old) {
+			/* 可能别人给 bump 分配内存了 */
 			bpf_spin_unlock(&static_lock);
 			asan_unpoison(memory, bump.max_contig_bytes);
 			bpf_arena_free_pages(&arena, memory, alloc_pages);
@@ -113,14 +126,17 @@ __weak u64 bump_alloc_internal(size_t bytes, size_t alignment)
 		}
 
 		/* Keep a list of allocated blocks to free on allocator destruction. */
+		/* 分配前后的内存地址 前部视为连接件*/
 		oldll = (bump_ll_t *)old;
 		newll = (bump_ll_t *)memory;
 		asan_unpoison(newll, sizeof(*newll));
+		/* 把内存块串起来 */
 		newll->next = oldll;
 
 		/*
 		 * Switch to new memory block, reset offset,
 		 * and recalculate base address.
+		 指向最新的内存块
 		 */
 		bump.memory = memory;
 		bump.off	  = sizeof(*newll);

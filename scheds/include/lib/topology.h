@@ -6,23 +6,34 @@ struct topology;
 typedef struct topology __arena * topo_ptr;
 
 enum topo_level {
+	/* 虚拟根节点，代表整机所有 CPU */
 	TOPO_TOP	= 0,
+	/* NUMA 节点 */
 	TOPO_NODE	= 1,
+	/* LLC 域 */
 	TOPO_LLC	= 2,
+	/* Core */
 	TOPO_CORE	= 3,
+	/* CPU */
 	TOPO_CPU	= 4,
+	/* 最大层级 */
 	TOPO_MAX_LEVEL	= 5,
 };
 
 struct topology {
+	/* 父节点 */
 	topo_ptr parent;
+	/* 子节点数量 */
 	size_t nr_children;
+	/* 该节点覆盖的所有 CPU 的位图（scx_bitmap_t）  */
 	scx_bitmap_t mask;
 	/*
 	 * level and level_ids are hot in the fast path; keep them adjacent
 	 * to ensure they land in the same cache line.
+	 自己所在的层级
 	 */
 	enum topo_level level;
+	/* 从根节点到该节点的路径上，每个层级的索引 */
 	s16 level_ids[TOPO_MAX_LEVEL];
 
 	/* Generic pointer, can be used for anything. */
@@ -32,6 +43,7 @@ struct topology {
 	 * Variable-length children array. Allocated as part of the struct via
 	 * scx_static_alloc(sizeof(struct topology) + max_children * sizeof(topo_ptr)).
 	 * The per-level capacity is stored in topo_max_children[].
+	 子节点数组
 	 */
 	topo_ptr children[];
 };

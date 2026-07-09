@@ -2556,7 +2556,8 @@ static __noinline void enqueue_body(struct task_struct *p, u64 enq_flags)
 /* Enqueue——极薄的 struct_ops 桩函数 → __noinline enqueue_body。
  * 桩函数把 BPF struct_ops 的参数提取与核心逻辑隔离开。
  * enqueue_body 获得独立寄存器帧（规则23：0 次溢出）。 */
-/* 讲解：入口桩只负责取参并转调实际逻辑，保证寄存器分配干净。 */
+/* 讲解：入口桩只负责取参并转调实际逻辑，保证寄存器分配干净。
+20260709184618 */
 void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 {
 #ifndef CAKE_RELEASE
@@ -2569,7 +2570,7 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
  * Direct-dispatched tasks (SCX_DSQ_LOCAL_ON) bypass this callback entirely —
  * kernel handles them natively. Only tasks that went through
  * cake_enqueue → per-LLC DSQ arrive here.
- *
+ * CPU在pick时，缺任务了，让scx的dispatch来选，填充dsq。.
  * FIX: dsq_gen blindfold REMOVED. The generation counter caused CPUs to
  * permanently skip checking the shared DSQ after pulling one task, because
  * all CPUs synced to the same global gen after consuming a single task.
@@ -2585,7 +2586,7 @@ void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
  * 单个任务后都同步到同一个全局代际。
  * 后果：1880 万次 hint_skips，OS 线程（ksoftirqd、rcu）饿死 6.5 秒。
  * 改用 O(1) 的 scx_bpf_dsq_nr_queued()——真实队列深度，无漂移。 */
-/* 讲解：本地 LLC 队列优先消费，空了再跨 LLC 窃取，避免代际计数带来的饥饿。 */
+/* 本地 LLC 队列优先消费，空了再跨 LLC 窃取，避免代际计数带来的饥饿。 */
 void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
 {
 #ifndef CAKE_RELEASE
@@ -2596,11 +2597,11 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
 	u64 dispatch_start = stats_on ? scx_bpf_now() : 0;
 
 	u32 my_llc = cpu_bss[cpu_idx].llc_id;  /* per-CPU cache (Rule 41) */
-					       /* 每 CPU 缓存的 LLC 号（规则41）。讲解：避免再查拓扑表。 */
+					       /* 每 CPU 缓存的 LLC 号（规则41）。*/
 	u64 my_dsq_id = LLC_DSQ_BASE + my_llc;
 
 	/* 1. Fast Path: Check if our local LLC DSQ actually has tasks */
-	/* 1. 快路径：检查本地 LLC 的 DSQ 是否真的有任务。讲解：本地优先，命中率最高。 */
+	/* 1. 快路径：检查本地 LLC 的 DSQ 是否真的有任务。本地优先，命中率最高。 */
 	{
 		s32 depth = scx_bpf_dsq_nr_queued(my_dsq_id);
 		/* P2B: dsq_depth_cached pruned — Rule 5/74.
@@ -2629,7 +2630,7 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
 	}
 
 	/* 2. Steal Path: Look at other LLCs (Active on multi-CCD setups) */
-	/* 2. 窃取路径：查看其他 LLC（多 CCD 配置下生效）。讲解：本地空闲时跨 LLC 借任务。 */
+	/* 2. 窃取路径：查看其他 LLC（多 CCD 配置下生效）。本地空闲时跨 LLC 借任务。 */
 	if (nr_llcs > 1) {
 		for (u32 i = 1; i < CAKE_MAX_LLCS; i++) {
 			if (i >= nr_llcs) break;
@@ -2644,10 +2645,10 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
 			/* EEVDF 拓扑：仅当受害 LLC 有 2 个以上任务时才跨 CCD 窃取。
 			 * 避免把单个任务做缓存冷迁移——它们更适合等待自己 CCD 的核空出来。
 			 * 对应 EEVDF 跨域迁移的 imbalance_pct 阈值。 */
-			/* 讲解：只偷“富队列”，防止把孤立任务搬到冷缓存反而更慢。 */
+			/* 只偷“富队列”，防止把孤立任务搬到冷缓存反而更慢。 */
 			if (scx_bpf_dsq_nr_queued(victim_dsq) > 1 && scx_bpf_dsq_move_to_local(victim_dsq, 0)) {
 				/* MAILBOX CLEAR: stolen DSQ drained. */
-				/* 邮箱清零：被窃取的 DSQ 已抽干。讲解：清除踢核标志避免重复唤醒。 */
+				/* 邮箱清零：被窃取的 DSQ 已抽干。清除踢核标志避免重复唤醒。 */
 				if (dsq_kick_needed[victim]) dsq_kick_needed[victim] = 0;
 				if (stats_on) {
 					struct cake_stats *s = get_local_stats_for(cpu_idx);
@@ -2671,14 +2672,14 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
 	 * 无意义的上下文切换。轻载下每周期省约 2-4µs。
 	 * Cosmos/bpfland 都实现了此机制。对游戏尤其重要，
 	 * 因为“单核单任务”是常见稳态。 */
-	/* 讲解：没别的可跑就让当前任务续跑，避免空切换开销。 */
+	/* 没别的可跑就让当前任务续跑，避免空切换开销。 */
 	if (prev && (prev->scx.flags & SCX_TASK_QUEUED))
 		prev->scx.slice = quantum_ns;
 
 	/* Check-before-write: if CPU is already marked idle from a previous
 	 * dispatch miss, skip the store (Rule 11: MESI optimization). */
 	/* 先读后写：若该 CPU 因上次派发落空已被标记为空闲，则跳过写入
-	 *（规则11：MESI 优化）。讲解：避免重复写触发缓存行失效。 */
+	 *（规则11：MESI 优化）。避免重复写触发缓存行失效。 */
 	if (!cpu_bss[cpu_idx].idle_hint) cpu_bss[cpu_idx].idle_hint = 1;
 }
 
@@ -2686,7 +2687,7 @@ void BPF_STRUCT_OPS(cake_dispatch, s32 raw_cpu, struct task_struct *prev)
  * Kept to prevent loader panic on missing RODATA symbol. JIT dead-code eliminates. */
 /* DVFS RODATA：BPF 未使用（tick 已移除），但 Rust 加载器会写入。
  * 保留它以防加载器因缺少 RODATA 符号而 panic。JIT 会做死代码消除。 */
-/* 讲解：仅为兼容加载器保留的占位常量，实际运行时被优化掉。 */
+/* 仅为兼容加载器保留的占位常量，实际运行时被优化掉。 */
 const u32 tier_perf_target[8] = {
 	1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024,
 };
@@ -2697,7 +2698,7 @@ const u32 tier_perf_target[8] = {
 /* OPT-13：__noinline running_task_change——把任务切换相关的 kfunc
  * 从 cake_running 的寄存器帧中隔离出来。含 get_task_hot、game_cpu_mask
  * 原子操作、scx_bpf_cpuperf_set。4 个参数：p、bss、cpu、slice。 */
-/* 讲解：仅在真正切换任务时才调用，避免污染 cake_running 的热路径寄存器。 */
+/* 仅在真正切换任务时才调用，避免污染 cake_running 的热路径寄存器。 */
 static __noinline void running_task_change(
 	struct task_struct *p,
 	struct cake_cpu_bss *bss,
@@ -2709,7 +2710,7 @@ static __noinline void running_task_change(
 	/* FunSearch：slice 的读取从 cake_running 移到这里。
 	 * 在 75% 的“同任务重跑”情形下，cake_running 完全跳过本函数，
 	 * 从而省掉一次无用的 p->scx.slice 读取。规则5：不做工作 < 做无用工作。 */
-	/* 讲解：只有换任务时才需要 slice，故把读取下沉到此。 */
+	/* 只有换任务时才需要 slice，故把读取下沉到此。 */
 	u64 slice = p->scx.slice;
 	bss->last_pid = p->pid;
 	bss->tick_slice = slice ?: quantum_ns;
@@ -2729,7 +2730,7 @@ static __noinline void running_task_change(
 	 * - game_cpu_mask：下次任务切换会自动纠正
 	 * - game_cpu_mask + cpuperf 消除 → 只剩掩码块
 	 * 权衡：NULL hot（罕见边界）下掩码有 1 周期陈旧。 */
-	/* 讲解：hot 缺失是极罕见边界，直接早退换取更简单的控制流。 */
+	/* hot 缺失是极罕见边界，直接早退换取更简单的控制流。 */
 	if (!hot)
 		return;
 
@@ -2749,18 +2750,18 @@ static __noinline void running_task_change(
 		bss->vtime_local = tv;
 
 	/* Per-CPU sched_state_local: eliminates remote global BSS fetch (Rule 78). */
-	/* 每 CPU 的 sched_state_local：消除对远端全局 BSS 的读取（规则78）。讲解：状态本地化避免跨核读。 */
+	/* 每 CPU 的 sched_state_local：消除对远端全局 BSS 的读取（规则78）。状态本地化避免跨核读。 */
 	if (bss->sched_state_local == CAKE_STATE_GAMING) {
 		/* game_cpu_mask — only needed during GAMING (Gate 2 scan).
 		 * Rule 5: no work < some work. Non-GAMING: skip entirely. */
 		/* game_cpu_mask——仅在 GAMING 期间需要（第2门扫描）。
-		 * 规则5：不做工作 < 做无用工作。非 GAMING：整体跳过。讲解：只有游戏态才维护游戏核掩码。 */
+		 * 规则5：不做工作 < 做无用工作。非 GAMING：整体跳过。只有游戏态才维护游戏核掩码。 */
 		u8 game_flag = (tc == CAKE_CLASS_GAME);
 		u32 word = cpu >> 6;
 		u64 bit = 1ULL << (cpu & 63);
 		u64 cur = READ_ONCE(game_cpu_mask[word]);
 		u64 want = (cur & ~bit) | (bit & -(u64)game_flag);
-		/* 仅当目标值变化时才写回。讲解：先读后写，减少原子写与缓存失效。 */
+		/* 仅当目标值变化时才写回。先读后写，减少原子写与缓存失效。 */
 		if (want != cur)
 			WRITE_ONCE(game_cpu_mask[word], want);
 
@@ -2773,7 +2774,7 @@ static __noinline void running_task_change(
 		 * 把非 GAME 任务限到 75% 频率。这会拖累游戏加载线程（尚未
 		 * 被重分类为 GAME）、音频、合成器与 wineserver。GAMING 期间
 		 * 所有 CPU 都应满速运行。省约 6 条指令。 */
-		/* 讲解：游戏时全核满频，避免误伤尚未识别的关键辅助线程。 */
+		/* 游戏时全核满频，避免误伤尚未识别的关键辅助线程。 */
 	}
 }
 
@@ -2789,7 +2790,7 @@ static __noinline void running_task_change(
  * 4 个参数：p、cpu、now_full、overhead_start（== mbox_start）。
  * 不传入 'hot'——去掉它可为调用方腾出 r6 给 p，
  * 消除最后一次溢出。内部自取（冷路径）。 */
-/* 讲解：把重量级遥测写入从热路径剥离，仅按采样比例执行。 */
+/* 把重量级遥测写入从热路径剥离，仅按采样比例执行。 */
 #ifndef CAKE_RELEASE
 static __noinline void running_telemetry(
 	struct task_struct *p,
@@ -2860,7 +2861,7 @@ static __noinline void running_telemetry(
 	s_run->max_running_ns = s_run->max_running_ns + ((oh_run - s_run->max_running_ns) & -(oh_run > s_run->max_running_ns));
 
 	/* Phase 8: mailbox staging duration (overhead_start == mbox_start) */
-	/* 阶段8：邮箱暂存耗时（overhead_start == mbox_start）。讲解：记录暂存阶段花的时间。 */
+	/* 阶段8：邮箱暂存耗时（overhead_start == mbox_start）。记录暂存阶段花的时间。 */
 	tctx->telemetry.mbox_staging_ns = (u32)(mbox_end - overhead_start);
 }
 #endif
@@ -2871,7 +2872,7 @@ static __noinline void running_telemetry(
 /* cake_running——在每 CPU 邮箱中打上运行起始时间与时间片。
  * cake_stopping 会读取同一条缓存行。每任务遥测通过 arena
  * 跟踪，实现零跨 CPU 缓存失效。 */
-/* 讲解：任务开始运行时的回调，记录起点供 stopping 计算实际运行时长。 */
+/* 任务开始运行时的回调，记录起点供 stopping 计算实际运行时长。 */
 void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 {
 #ifndef CAKE_RELEASE
@@ -2885,9 +2886,6 @@ void BPF_STRUCT_OPS(cake_running, struct task_struct *p)
 	/* Batch kfuncs first: only p=r6 survives both calls (1 callee-save).
 	 * p->scx.slice read DEFERRED until after both kfuncs to avoid
 	 * forcing p through 2 separate spill/reload cycles. */
-	/* 先批量调用 kfunc：仅 p=r6 需跨两次调用存活（1 个被调用者保存寄存器）。
-	 * p->scx.slice 的读取推迟到两次 kfunc 之后，避免逼 p
-	 * 经历两轮独立的溢出/重载。讲解：合并 kfunc 调用以压低寄存器压力。 */
 	u32 cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
 
 	/* CLOCK DOMAIN FIX: tick_last_run_at MUST come from scx_bpf_now(),
@@ -3247,7 +3245,7 @@ static __noinline u32 stopping_drr_ewma(
  * 返回：dsq_weight（u32），供阶段 C 的量子/暂存打包使用。
  * 读取：hot->task_class、nice_shift、wake_counter、dsq_vtime。
  * 写入：hot->dsq_vtime。 */
-/* 讲解：核心是推进任务虚拟时间，vtime 越小越优先被调度。 */
+/* 核心是推进任务虚拟时间，vtime 越小越优先被调度。 */
 static __noinline u32 stopping_eevdf_weight(
 	struct cake_task_hot *hot,
 	u32 rt_raw,
@@ -3381,7 +3379,7 @@ static __noinline void stopping_quantum_pack(
 }
 
 /* cake_stopping — direct arena access + confidence-gated PELT
- *
+任务被dequeue或者put时调用
  * Inputs read directly from task_storage via get_task_hot:
  *   deficit_u16 = DRR deficit (standalone)
  *   packed_info = yield/flow flags
@@ -3681,6 +3679,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 {
 	struct cake_task_ctx __arena *tctx;
 
+	/* 分配arena内存 */
 	tctx = (struct cake_task_ctx __arena *)scx_task_alloc(p);
 	if (!tctx) {
 		if (CAKE_STATS_ACTIVE) {
@@ -3693,7 +3692,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 	/* NOTE: pid_to_tctx registration removed — iter/task program provides
 	 * full task visibility without any map update. Fully lockless. */
 	/* 注意：pid_to_tctx 注册已移除——iter/task 程序无需任何 map 更新
-	 * 即可提供完整的任务可见性。完全无锁。讲解：靠任务迭代器遍历，省去映射维护。 */
+	 * 即可提供完整的任务可见性。完全无锁。靠任务迭代器遍历，省去映射维护。 */
 
 	/* MULTI-SIGNAL INITIAL CLASSIFICATION (moved from alloc_task_ctx_cold)
      *
@@ -3714,9 +3713,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 	 *
 	 * R1 比较求和：无分支的非单调映射。
 	 *（prio >= 120）负 nice 为 0（→ CRITICAL=0），默认为 1（→ INTERACT=1）
-	 *（prio > 130）* 2：正常为 0，高 nice 为 2（1+2 = BULK=3）。讲解：用 nice 给任务一个初始层级。 */
+	 *（prio > 130）* 2：正常为 0，高 nice 为 2（1+2 = BULK=3）。用 nice 给任务一个初始层级。 */
 	/* init_deficit: shared by arena init (stats-gated) and task_hot init. */
-	/* init_deficit：由 arena 初始化（受统计门控）与 task_hot 初始化共用。讲解：初始 DRR 赤字预算。 */
+	/* init_deficit：由 arena 初始化（受统计门控）与 task_hot 初始化共用。初始 DRR 赤字预算。 */
 	u16 init_deficit = (u16)((quantum_ns + new_flow_bonus_ns) >> 10);
 
 	/* SIMPLIFY #1: Arena CL0 fields are only read by cake_task_iter (telemetry).
@@ -3746,7 +3745,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 	/* TUI telemetry: identity fields only needed with --verbose.
 	 * Gated to avoid unnecessary arena writes on task creation. */
 	/* TUI 遥测：身份字段仅在 --verbose 时需要。
-	 * 加门控以避免任务创建时的无谓 arena 写。讲解：pid/tgid/comm 仅供界面展示。 */
+	 * 加门控以避免任务创建时的无谓 arena 写。pid/tgid/comm 仅供界面展示。 */
 #ifndef CAKE_RELEASE
 	if (CAKE_STATS_ACTIVE) {
 		tctx->telemetry.pid = p->pid;
@@ -3771,14 +3770,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 
 	u32 packed		= 0;
 	/* Fused FLAGS: bits [27:24] = [flags:4], FLOW_NEW set on creation */
-	/* 融合 FLAGS：位 [27:24] = [flags:4]，创建时置 FLOW_NEW。讲解：新任务标记为新流以获入队奖励。 */
+	/* 融合 FLAGS：位 [27:24] = [flags:4]，创建时置 FLOW_NEW。新任务标记为新流以获入队奖励。 */
 	packed |= ((u32)CAKE_FLOW_NEW & MASK_FLAGS) << SHIFT_FLAGS;
 	/* Cache PF_KTHREAD branchless (Rule 14+41: relocate cold read to init).
 	 * Kernel threads are immune to bg_noise squeeze.
 	 * Branchless: extract bit 21 (PF_KTHREAD) from p->flags, shift to BIT_KTHREAD. */
 	/* 无分支缓存 PF_KTHREAD（规则14+41：把冷读取移到 init）。
 	 * 内核线程不受 bg_noise 压制影响。
-	 * 无分支：从 p->flags 取第 21 位（PF_KTHREAD），移位到 BIT_KTHREAD。讲解：预先缓存是否内核线程。 */
+	 * 无分支：从 p->flags 取第 21 位（PF_KTHREAD），移位到 BIT_KTHREAD。预先缓存是否内核线程。 */
 	packed |= (((u32)(p->flags >> 21) & 1u) << BIT_KTHREAD);
 	/* Arena copy: only read by iter/task (TUI). Hot-path uses hot->packed_info. */
 	/* arena 副本：仅 iter/task（TUI）读取。热路径用 hot->packed_info。 */
@@ -3790,12 +3789,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 	 * build_cached_cpumask + bpf_rcu_read_lock/unlock eliminated (Rule 64). */
 	/* 缓存亲和性已移除：在改用 scx_bpf_select_cpu_and 后，
 	 * 内核通过 p->cpus_ptr 原生处理亲和性。
-	 * build_cached_cpumask + bpf_rcu_read_lock/unlock 已消除（规则64）。讲解：亲和性交给内核，去掉自维护掩码。 */
+	 * build_cached_cpumask + bpf_rcu_read_lock/unlock 已消除（规则64）。亲和性交给内核，去掉自维护掩码。 */
 
 	/* Phase 6: Allocate task_storage and mirror CL0 hot fields.
 	 * BPF_LOCAL_STORAGE_GET_F_CREATE allocates on first call. */
 	/* 阶段6：分配 task_storage 并镜像 CL0 热字段。
-	 * BPF_LOCAL_STORAGE_GET_F_CREATE 在首次调用时分配。讲解：热字段放 task_storage，访问比 arena 快。 */
+	 * BPF_LOCAL_STORAGE_GET_F_CREATE 在首次调用时分配。热字段放 task_storage，访问比 arena 快。 */
 	struct cake_task_hot *hot = bpf_task_storage_get(
 		&task_hot_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (hot) {
@@ -3829,9 +3828,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init_task, struct task_struct *p,
 /* G1 FIX: .enable callback — initialize task vtime when it becomes schedulable.
  * Like cosmos/bpfland: p->scx.dsq_vtime = vtime_now.
  * For cake, we store in arena (avoids kernel dsq_insert_vtime overwrite). */
-/* G1 修复：.enable 回调——任务变为可调度时初始化其 vtime。
+/* G1 修复：.enable 回调——任务变为可调度时初始化其 vtime。比如刚刚变成scx, 或者刚刚fork出来
  * 类似 cosmos/bpfland：p->scx.dsq_vtime = vtime_now。
- * cake 则存到 arena（避免被内核 dsq_insert_vtime 覆盖）。讲解：以当前本地 vtime 为起点，防止新任务优先级畸高。 */
+ * cake 则存到 arena（避免被内核 dsq_insert_vtime 覆盖）。
+ 以当前本地 vtime 为起点，防止新任务优先级畸高。 */
 void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
 {
 	struct cake_task_hot *hot = get_task_hot(p);
@@ -3846,7 +3846,7 @@ void BPF_STRUCT_OPS(cake_enable, struct task_struct *p)
 /* 事件驱动的亲和性更新——仅遥测计数器。
  * cached_cpumask 字段已移除：scx_bpf_select_cpu_and 经 p->cpus_ptr
  * 原生处理亲和性（规则64：A→D 路径压缩）。
- * 仅保留遥测计数器供 TUI 跟踪 cpumask 变化。讲解：亲和性变更时只记一次数供界面观察。 */
+ * 仅保留遥测计数器供 TUI 跟踪 cpumask 变化。亲和性变更时只记一次数供界面观察。 */
 void BPF_STRUCT_OPS(cake_set_cpumask, struct task_struct *p __arg_trusted,
 		    const struct cpumask *cpumask __arg_trusted)
 {
@@ -3864,9 +3864,10 @@ void BPF_STRUCT_OPS(cake_set_cpumask, struct task_struct *p __arg_trusted,
  * uses PPID matching in cake_stopping, not per-task yield counts.
  * Cost in debug: 1 get_task_ctx (~16ns) per yield. Zero cost in release. */
 /* 处理手动让出（如 sched_yield 系统调用）。
+基本上就是core -> sched class -> scx这里回调 （其实也是直接计数, 没什么可做的）
  * yield_count 仅供 TUI 遥测（受统计门控）。游戏家族检测在 cake_stopping
  * 中用 PPID 匹配，而非每任务的让出计数。
- * debug 代价：每次让出 1 次 get_task_ctx（约 16ns）。release 下零代价。讲解：仅记数，不改变让出行为。 */
+ * debug 代价：每次让出 1 次 get_task_ctx（约 16ns）。release 下零代价。仅记数，不改变让出行为。 */
 bool BPF_STRUCT_OPS(cake_yield, struct task_struct *p)
 {
 #ifndef CAKE_RELEASE
@@ -3883,7 +3884,9 @@ bool BPF_STRUCT_OPS(cake_yield, struct task_struct *p)
 }
 
 /* Handle preemption when a task is pushed off the CPU. */
-/* 任务被推离 CPU（变为可运行）时的处理。讲解：记录抢占次数与唤醒来源用于唤醒链分析。 */
+/* 任务被推离 CPU（变为可运行）时的处理。
+入队时调用
+记录抢占次数与唤醒来源用于唤醒链分析。 */
 void BPF_STRUCT_OPS(cake_runnable, struct task_struct *p, u64 enq_flags)
 {
 #ifndef CAKE_RELEASE
@@ -3893,7 +3896,7 @@ void BPF_STRUCT_OPS(cake_runnable, struct task_struct *p, u64 enq_flags)
 			if (enq_flags & SCX_ENQ_PREEMPT)
 				tctx->telemetry.preempt_count++;
 			/* Wakeup source: the currently running task is the waker */
-			/* 唤醒来源：当前正在运行的任务即唤醒者。讲解：谁唤醒了 p 就记谁。 */
+			/* 唤醒来源：当前正在运行的任务即唤醒者, 谁唤醒了 p 就记谁。 */
 			struct task_struct *waker = bpf_get_current_task_btf();
 			if (waker) {
 				tctx->telemetry.wakeup_source_pid = waker->pid;
@@ -3908,7 +3911,7 @@ void BPF_STRUCT_OPS(cake_runnable, struct task_struct *p, u64 enq_flags)
 }
 
 /* Free per-task arena storage on task exit. */
-/* 任务退出时释放其每任务 arena 存储。讲解：回收资源避免泄漏。 */
+/* 任务退出时释放其每任务 arena 存储。回收资源避免泄漏。 */
 void BPF_STRUCT_OPS(cake_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
@@ -3920,7 +3923,7 @@ void BPF_STRUCT_OPS(cake_exit_task, struct task_struct *p,
 }
 
 /* Initialize the scheduler */
-/* 初始化调度器。讲解：创建各 LLC 的 DSQ 并分配全局 arena 块。 */
+/* 初始化调度器。创建各 LLC 的 DSQ 并分配全局 arena 块。 */
 s32 BPF_STRUCT_OPS_SLEEPABLE(cake_init)
 {
 	/* Per-CPU DSQs eliminated — SCX_DSQ_LOCAL_ON dispatches directly to
@@ -4009,7 +4012,7 @@ void BPF_STRUCT_OPS(cake_exit, struct scx_exit_info *ei)
 
 #ifndef CAKE_RELEASE
 /* Batch 1: timing fields (u64-heavy, 4 u64s + 3 u32s = ~44 bytes) */
-/* 批次1：计时字段（以 u64 为主，4 个 u64 + 3 个 u32 ≈ 44 字节）。讲解：拷贝各阶段耗时。 */
+/* 批次1：计时字段（以 u64 为主，4 个 u64 + 3 个 u32 ≈ 44 字节）。 */
 static __noinline void iter_copy_timing(
 	struct cake_task_ctx __arena *tctx,
 	struct cake_iter_record *rec)
@@ -4084,8 +4087,10 @@ static __noinline void iter_copy_hist(
 	*((__u64 *)&rec->telemetry.comm[8]) = *((__u64 __arena *)&tctx->telemetry.comm[8]);
 }
 
-/* Batch 4: enqueue substage timing + quantum + waker + per-CPU run counts */
-/* 批次4：入队子阶段计时 + 量子 + 唤醒者 + 每 CPU 运行次数。讲解：拷贝细粒度剖析数据。 */
+/* 
+tui遍历cake任务时调用
+Batch 4: enqueue substage timing + quantum + waker + per-CPU run counts */
+/* 批次4：入队子阶段计时 + 量子 + 唤醒者 + 每 CPU 运行次数 */
 static __noinline void iter_copy_substage(
 	struct cake_task_ctx __arena *tctx,
 	struct cake_iter_record *rec)
@@ -4112,6 +4117,10 @@ static __noinline void iter_copy_substage(
 }
 #endif /* !CAKE_RELEASE */
 
+/* 挂载在 iter/task 钩子上。它的作用是让用户态可以通过读取一个 fd
+（类似读文件）来批量遍历所有任务，每个任务调用一次这个函数，把信息序列化输出。
+================
+tui用它获取cake 任务 */
 SEC("iter/task")
 int cake_task_iter(struct bpf_iter__task *ctx)
 {
@@ -4159,6 +4168,7 @@ int cake_task_iter(struct bpf_iter__task *ctx)
 	bpf_seq_write(seq, &rec, sizeof(rec));
 	return 0;
 }
+
 /* F3 FIX: Tick callback for cross-LLC load balance hinting.
  * Runs once per tick (~1ms) per CPU. Throttled to every 8th tick (~8ms)
  * to minimize overhead. On single-CCD (nr_llcs==1), JIT eliminates
@@ -4182,11 +4192,11 @@ int cake_task_iter(struct bpf_iter__task *ctx)
  *
  * 算法：若本 LLC 的 DSQ 排了 2 个以上任务，而另一 LLC 的 DSQ 为空，
  * 就踢那个 LLC 的某个 CPU 以触发跨 LLC 窃取。
- * 这把被动的“空闲时自己找活”变为主动的“通知空闲者”。讲解：多 CCD 下主动均衡，单 CCD 下整段被优化掉。 */
+ * 这把被动的“空闲时自己找活”变为主动的“通知空闲者”。多 CCD 下主动均衡，单 CCD 下整段被优化掉。 */
 void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 {
 	/* Single-LLC: nothing to balance. JIT dead-code eliminates. */
-	/* 单 LLC：无需均衡。JIT 死代码消除。讲解：单簇机器直接返回。 */
+	/* 单 LLC：无需均衡 */
 	if (nr_llcs <= 1)
 		return;
 
@@ -4202,9 +4212,8 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 		return;
 
 	/* Check my LLC's DSQ depth — only rebalance when overloaded */
-	/* 检查本 LLC 的 DSQ 深度——仅在过载时才均衡。讲解：本簇不忙就不折腾。 */
+	/* 检查本 LLC 的 DSQ 深度——仅在过载时才均衡。 */
 	u32 my_llc = cpu_bss[cpu].llc_id;  /* per-CPU cache (Rule 41) */
-					   /* 每 CPU 缓存的 LLC 号（规则41）。 */
 	s32 my_depth = scx_bpf_dsq_nr_queued(LLC_DSQ_BASE + my_llc);
 	if (my_depth < 2)
 		return;
@@ -4212,9 +4221,9 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 	/* Find an empty LLC and kick one of its CPUs to trigger steal.
 	 * Round-robin from my_llc+1 to avoid always kicking the same LLC.
 	 * llc_cpu_mask[] is RODATA — zero cache bounce on read. */
-	/* 找一个空 LLC 并踢它的某个 CPU 以触发窃取。
+	/* 找一个空 LLC 并kick它的某个 CPU 以触发窃取。
 	 * 从 my_llc+1 开始轮转，避免总是踢同一个 LLC。
-	 * llc_cpu_mask[] 是 RODATA——读取零缓存弹跳。讲解：把闲簇唤醒来分担本簇的积压。 */
+	 * llc_cpu_mask[] 是 RODATA——读取零缓存弹跳 */
 	for (u32 i = 1; i < CAKE_MAX_LLCS && i < nr_llcs; i++) {
 		u32 other = (my_llc + i);
 		if (other >= nr_llcs) other -= nr_llcs;
@@ -4222,6 +4231,7 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
 		if (other_depth == 0) {
 			u64 mask = llc_cpu_mask[other];
 			if (mask) {
+				/* 从掩码里面找到第一个空闲 */
 				u32 target = __builtin_ctzll(mask);
 				if (target < nr_cpus)
 					scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
@@ -4240,7 +4250,7 @@ void BPF_STRUCT_OPS(cake_tick, struct task_struct *p)
  * 当 p->scx.weight 因 cgroup 或 nice 变化时内核会调用它。
  * 空操作：实际的权重应用发生在 cake_stopping 中，经 F4 的
  * 乘法缩放（102400 / p->scx.weight）完成。注册此回调是向框架
- * 表明 cake 是“感知权重”的。讲解：仅作声明，实际换算在停止回调里做。 */
+ * 表明 cake 是“感知权重”的。仅作声明，实际换算在停止回调里做。 */
 void BPF_STRUCT_OPS(cake_set_weight, struct task_struct *p, u32 weight)
 {
 	/* Weight already stored in p->scx.weight by kernel.
@@ -4249,8 +4259,7 @@ void BPF_STRUCT_OPS(cake_set_weight, struct task_struct *p, u32 weight)
 	 * F4 在 cake_stopping 中读取它。此处无需任何操作。 */
 }
 
-/* 注册 sched_ext 操作表：把上面各回调绑定到调度框架的对应钩子。
- * 讲解：这是 cake 调度器向内核声明自己实现了哪些调度回调的入口。 */
+/* 注册 sched_ext 操作表：把上面各回调绑定到调度框架的对应钩子。 */
 SCX_OPS_DEFINE(cake_ops, .select_cpu = (void *)cake_select_cpu,
 	       .enqueue	 = (void *)cake_enqueue,
 	       .dispatch = (void *)cake_dispatch,
@@ -4266,5 +4275,5 @@ SCX_OPS_DEFINE(cake_ops, .select_cpu = (void *)cake_select_cpu,
 	       .exit_task = (void *)cake_exit_task, .init = (void *)cake_init,
 	       .exit = (void *)cake_exit, .flags = SCX_OPS_KEEP_BUILTIN_IDLE,
 	       .timeout_ms = 5000, /* G2 FIX: starvation watchdog — matches cosmos/bpfland */
-				   /* G2 修复：饥饿看门狗——与 cosmos/bpfland 一致。讲解：5 秒无进展则内核回退。 */
+				   /* G2 修复：饥饿看门狗——与 cosmos/bpfland 一致。5 秒无进展则内核回退。 */
 	       .name = "cake");

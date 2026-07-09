@@ -18,6 +18,7 @@ fn main() {
     } else {
         base_flags.to_string()
     };
+    /* 如果用到的lib, 都会从项目根lib拷贝一份过来? */
     std::env::set_var("BPF_EXTRA_CFLAGS_PRE_INCL", &cflags);
     scx_cargo::BpfBuilder::new()
         .unwrap()

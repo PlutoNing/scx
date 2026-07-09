@@ -7,13 +7,21 @@
 #include <alloc/common.h>
 #include <alloc/asan.h>
 #include <alloc/buddy.h>
+/* buddy.bpf.c 是一个运行在 BPF Arena 中的伙伴系统
+（Buddy System）内存分配器的完整实现。
 
+伙伴系统是 Linux 内核物理内存管理的核心算法：内存按 2 的幂次方大小划分，
+分配时找最合适的块，释放时将相邻的"伙伴"合并回更大的块，从而减少碎片。
+
+这个文件把该算法移植到了 BPF 程序内部，让 BPF 程序（如调度器 scx_cake）
+可以在自己的 arena 地址空间里动态分配和释放内存。 */
 volatile int zero = 0;
 
 enum {
 	BUDDY_POISONED = (s8)0xef,
 };
 
+/* 对 arena 自旋锁的薄封装。分配器所有修改操作都需要持锁，保证 BPF 并发安全。 */
 static inline int buddy_lock(struct buddy *buddy)
 {
 	return arena_spin_lock(buddy->lock);
@@ -27,6 +35,9 @@ static inline void buddy_unlock(struct buddy *buddy)
 /*
  * Reserve part of the arena address space for the allocator. We use
  * this to get aligned addresses for the chunks.
+ 在初始化时预留地址空间。 伙伴系统要求每个 chunk 必须对齐到 1MiB 边界（这样才能从
+ 地址直接反推 chunk 的起始地址）。这里用 bpf_arena_reserve_pages 预留一段足够大
+ 的虚拟地址区间（最多 1024 个 chunk），但不分配物理内存。
  */
 static int buddy_reserve_arena_vaddr(struct buddy *buddy)
 {
@@ -39,6 +50,8 @@ static int buddy_reserve_arena_vaddr(struct buddy *buddy)
 
 /*
  * Free up any unused address space. Used only during teardown.
+ 销毁时释放未用的地址空间。 buddy->vaddr 记录了已经分配出去的虚拟地址偏移，
+ [vaddr, BUDDY_VADDR_SIZE) 这部分是还没用到的，统一归还。
  */
 static void buddy_unreserve_arena_vaddr(struct buddy *buddy)
 {
@@ -49,7 +62,10 @@ static void buddy_unreserve_arena_vaddr(struct buddy *buddy)
 	buddy->vaddr = 0;
 }
 
-/* Carve out part of the reserved address space and allocate it to the */
+/* Carve out part of the reserved address space and allocate it to the
+以 CAS（Compare-And-Swap）原子操作分配下一个 chunk 的虚拟地址。 用无锁的方式把
+地址游标向前推进一个 chunk 大小，返回对齐好的起始地址。CAS + can_loop 在竞争失败时
+自旋重试。 */
 static int buddy_alloc_arena_vaddr(struct buddy *buddy, u64 *vaddrp)
 {
 	u64 vaddr, old, new;
@@ -86,6 +102,8 @@ static u64 arena_next_pow2(__u64 n)
 	return n;
 }
 
+/* 操作分配位图（bitmap）。 每个 slot 用 1 bit 表示是否已分配，allocated[]
+ 数组以字节为单位打包存储。通过 idx/8 找到字节，1 << (idx%8) 找到位。 */
 __weak
 int idx_set_allocated(buddy_chunk_t __arg_arena *chunk, u64 idx, bool allocated)
 {
@@ -115,6 +133,9 @@ static int idx_is_allocated(buddy_chunk_t *chunk, u64 idx, bool *allocated)
 	return 0;
 }
 
+/* 操作 order 数组（nibble 压缩）。 由于 order 最大为 15（4 bits），每两个 slot
+ 的 order 压缩进一个字节（每个 nibble 存一个）。奇数 idx 用低 4 位，偶数 idx 用高
+  4 位，写入时要保留另半个字节不变。 */
 __weak
 int idx_set_order(buddy_chunk_t __arg_arena *chunk, u64 idx, u8 order)
 {
@@ -166,6 +187,8 @@ static u8 idx_get_order(buddy_chunk_t *chunk, u64 idx)
 	return (idx & 0x1) ? (result & 0xf) : (result >> 4);
 }
 
+/* 把 slot 索引转换为实际内存地址。 chunk 基地址 + idx × 最小分配大小（16字节）。
+由于 chunk 按 1MiB 对齐，反过来也可以从地址推算出 chunk 和 idx。 */
 static void __arena *idx_to_addr(buddy_chunk_t *chunk, size_t idx)
 {
 	u64 address;
@@ -192,6 +215,11 @@ static void __arena *idx_to_addr(buddy_chunk_t *chunk, size_t idx)
 	return (void __arena *)address;
 }
 
+/* 获取空闲块的头部指针（存放 freelist 链接指针）。 头部不放在块的第 0 字节，
+而是偏移 8 字节（BUDDY_HEADER_OFF=8）。原因：如果前一个块写越界（off-by-one），
+会写到第 0~7 字节，而 ASAN 此时对这 8 字节已经解毒，不会报错。把 header 放在偏移
+ 8 处，越界写就能被 ASAN 捕获。
+ */
 static buddy_header_t *idx_to_header(buddy_chunk_t *chunk, size_t idx)
 {
 	bool allocated;
@@ -230,6 +258,9 @@ static buddy_header_t *idx_to_header(buddy_chunk_t *chunk, size_t idx)
 	return (buddy_header_t *)(address + BUDDY_HEADER_OFF);
 }
 
+/* 把一个空闲 slot 插入到对应 order 的 freelist 头部（头插法）。 双向链表操作：
+新节点的 next 指向旧链表头，旧头的 prev 指向新节点，chunk->freelists[order]
+ 更新为新节点。 */
 static void header_add_freelist(buddy_chunk_t  *chunk,
 				buddy_header_t *header, u64 idx, u8 order)
 {
@@ -248,6 +279,8 @@ static void header_add_freelist(buddy_chunk_t  *chunk,
 	chunk->freelists[order] = idx;
 }
 
+/* 把一个 slot 从 freelist 中摘除。 标准双向链表删除：前驱的 next 跳过本节点，
+后继的 prev 跳过本节点，若本节点是链表头则更新 freelists[order]。 */
 static void header_remove_freelist(buddy_chunk_t  *chunk,
 				   buddy_header_t *header, u8 order)
 {
@@ -293,6 +326,9 @@ static u64 size_to_order(size_t size)
 	return order - BUDDY_MIN_ALLOC_SHIFT;
 }
 
+/* 把"零头"区域逐级放入对应 order 的 freelist。 这是 chunk 初始化算法的核心辅助
+函数。从 min_order 到 max_order，依次把 cur_idx + 2^ord 位置的块加入 freelist
+（见下方 buddy_chunk_get 的注释图解）。 */
 __weak
 int add_leftovers_to_freelist(buddy_chunk_t __arg_arena *chunk, u32 cur_idx,
 		u64 min_order, u64 max_order)
@@ -318,6 +354,7 @@ int add_leftovers_to_freelist(buddy_chunk_t __arg_arena *chunk, u32 cur_idx,
 	return 0;
 }
 
+/* 负责从 arena 申请一个新的 1MiB chunk 并完成初始化 */
 static buddy_chunk_t *buddy_chunk_get(struct buddy *buddy)
 {
 	u64 order, ord, min_order, max_order;
@@ -474,6 +511,7 @@ static buddy_chunk_t *buddy_chunk_get(struct buddy *buddy)
 	return chunk;
 }
 
+/* 初始化分配器： 绑定锁、预留虚拟地址空间、分配并初始化第一个 1MiB chunk。 */
 __hidden int buddy_init(struct buddy			 *buddy,
 			    arena_spinlock_t __arg_arena __arena *lock)
 {
@@ -520,6 +558,8 @@ __hidden int buddy_init(struct buddy			 *buddy,
  * currently in use, so any pages being accessed will start taking arena faults.
  * We do not take a lock because we are freeing arena pages, and nobody should
  * be using the allocator at that point in the execution.
+ 销毁分配器： 遍历所有 chunk，毒化后归还给 arena，再释放未用的地址空间。
+ 注意：不加锁（注释说明此时调用者保证没有并发访问）。
  */
 __weak int buddy_destroy(struct buddy *buddy)
 {
@@ -550,6 +590,12 @@ __weak int buddy_destroy(struct buddy *buddy)
 	return 0;
 }
 
+/* 在单个 chunk 内分配内存（伙伴系统核心）：
+
+从请求的 order 开始向上寻找有空闲块的最小 order。
+从 freelist 摘出该块，标记为已分配。
+若找到的块比请求的更大（order 更高），把多余部分递归拆分成更小的伙伴块，依次加入对应
+ freelist（即"伙伴分裂"）。 */
 __weak u64 buddy_chunk_alloc(buddy_chunk_t __arg_arena *chunk,
 				 int				order_req)
 {
@@ -625,6 +671,12 @@ __weak u64 buddy_chunk_alloc(buddy_chunk_t __arg_arena *chunk,
 	return address;
 }
 
+/* 对外暴露的分配入口（通过宏 buddy_alloc 调用）：
+
+把 size 转为 order。
+持锁，遍历 chunk 链表尝试分配。
+若所有 chunk 都满，申请新 chunk 再重试。
+分配成功后，ASAN 精确解毒用户请求的字节数（不多解毒）。 */
 __weak u64 buddy_alloc_internal(struct buddy *buddy, size_t size)
 {
 	buddy_chunk_t *chunk;

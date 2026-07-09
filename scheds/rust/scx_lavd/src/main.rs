@@ -582,6 +582,7 @@ impl<'a> Scheduler<'a> {
 
     /* attach系统的exec调用? 
     调用指定的prog程序*/
+    #[allow(dead_code)]
     fn attach_execve_tracepoints(skel: &mut OpenBpfSkel) -> Result<bool> {
         let tracepoints = vec![
             (

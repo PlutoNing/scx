@@ -12,7 +12,9 @@
 #include <scx/arena_userspace_interrop.bpf.h>
 
 struct scx_alloc_stack __arena *prealloc_stack;
-
+/* sdt_alloc.bpf.c 是 SCX 框架的 BPF 侧内存分配基础设施，在
+ BPF arena 之上实现了四种不同用途的内存分配器，解决 BPF 程序中不能随意
+ 动态分配内存的限制。 */
 /*
  * Necessary for cond_break/can_loop's semantics. According to kernel commit
  * 011832b, the loop counter variable must be seen as imprecise and bounded
@@ -23,7 +25,11 @@ struct scx_alloc_stack __arena *prealloc_stack;
  * that the loop counter's value is imprecise.
  */
 static __u64 zero = 0;
-
+/* 分配器	结构体	特点	用途
+SDT任务分配器 scx_allocator 多层基数树，支持按 idx 随机访问/释放 分配 per-task 数据（有生命周期管理）
+静态分配器 scx_static Bump 指针，只分配不释放 程序初始化时分配长期对象（如锁、队列）
+栈分配器 scx_stk 分段链表栈，固定尺寸对象 为 buddy 分配器提供 chunk 内存
+伙伴分配器 scx_buddy 2^order 伙伴系统 可变尺寸分配，支持合并/分裂 */
 /*
  * XXX Hack to get the verifier to find the arena for sdt_exit_task.
  * As of 6.12-rc5, The verifier associates arenas with programs by
@@ -36,6 +42,8 @@ static __u64 zero = 0;
  */
 static bool scx_arena_verify_once;
 
+/* 解决 BPF 验证器在某些子程序中找不到 arena 的问题：通过打印
+ arena 地址生成一条 LD.IMM 指令，让验证器感知到该 arena，且只执行一次 */
 __hidden void scx_arena_subprog_init(void)
 {
 	if (scx_arena_verify_once)
@@ -71,8 +79,11 @@ u64 scx_next_pow2(__u64 n)
 	return n;
 }
 
-
-/* find the first empty slot */
+/* 用多层 descriptor 树（类似基数树）管理 per-task 的 sdt_data 对象，每个对象通过
+ idx 唯一标识，支持 O(depth) 的分配和释放。 */
+/* find the first empty slot
+在 descriptor 的 bitmap 中找第一个未分配的槽位，返回槽位索引；全满则返回
+ SDT_TASK_ENTS_PER_CHUNK */
 static __u64 chunk_find_empty(sdt_desc_t *desc)
 {
 	__u64 freeslots;
@@ -89,6 +100,7 @@ static __u64 chunk_find_empty(sdt_desc_t *desc)
 	return SDT_TASK_ENTS_PER_CHUNK;
 }
 
+/* 从预分配栈（scx_alloc_stack）中弹出一个 arena 页，无锁，要求调用前已持锁 */
 static
 void __arena *scx_alloc_stack_pop(struct scx_alloc_stack __arena *stack)
 {
@@ -105,6 +117,8 @@ void __arena *scx_alloc_stack_pop(struct scx_alloc_stack __arena *stack)
 	return slab;
 }
 
+/* 向预分配栈中补充一个 arena 页：先检查是否已够用，不够则调用
+ bpf_arena_alloc_pages 分配，再放入栈；若栈已满则释放新页并返回 -EAGAIN */
 static
 int scx_alloc_stack(struct scx_alloc_stack __arena *stack)
 {
@@ -143,6 +157,7 @@ int scx_alloc_stack(struct scx_alloc_stack __arena *stack)
 	return -EAGAIN;
 }
 
+/* 重试最多 SDT_TASK_ALLOC_ATTEMPTS 次调用 scx_alloc_stack，直到成功；成功时持有 alloc_lock 返回 */
 static __noinline
 int scx_alloc_attempt(struct scx_alloc_stack __arena *stack)
 {
@@ -165,6 +180,7 @@ int scx_alloc_attempt(struct scx_alloc_stack __arena *stack)
 }
 
 /* Allocate element from the pool. Must be called with a then pool lock held. */
+/* 从指定 pool（chunk pool 或 desc pool）的当前 slab 中分配一个元素（bump 分配）；slab 用完则从预分配栈取一新页 */
 static
 void __arena *scx_alloc_from_pool(struct sdt_pool *pool,
 	struct scx_alloc_stack __arena *stack)
@@ -194,6 +210,7 @@ void __arena *scx_alloc_from_pool(struct sdt_pool *pool,
 }
 
 /* Allocate element from the pool. Must be called with a then pool lock held. */
+/* 同上，但允许睡眠：slab 用完时直接调用 bpf_arena_alloc_pages（可睡眠路径） */
 static
 void __arena *scx_alloc_from_pool_sleepable(struct sdt_pool *pool)
 {
@@ -218,7 +235,9 @@ void __arena *scx_alloc_from_pool_sleepable(struct sdt_pool *pool)
 	return ptr;
 }
 
-/* Alloc desc and associated chunk. Called with the task spinlock held. */
+/* Alloc desc and associated chunk. Called with the task spinlock held.
+同时从 chunk_pool 和 desc_pool 各分配一个对象，组成一个 (desc, chunk) 对，
+初始化 nr_free = SDT_TASK_ENTS_PER_CHUNK */
 static sdt_desc_t *scx_alloc_chunk(struct scx_alloc_stack __arena *stack)
 {
 	struct sdt_chunk __arena *chunk;
@@ -258,7 +277,9 @@ static int pool_set_size(struct sdt_pool *pool, __u64 data_size, __u64 nr_pages)
 	return 0;
 }
 
-/* initialize the whole thing, maybe misnomer */
+/* initialize the whole thing, maybe misnomer
+整个 SDT 分配器的初始化：配置 chunk/desc pool，为用户数据 pool 设置尺寸，
+分配 prealloc_stack，创建 root descriptor chunk */
 __hidden int
 scx_alloc_init(struct scx_allocator *alloc, __u64 data_size)
 {
@@ -305,6 +326,7 @@ scx_alloc_init(struct scx_allocator *alloc, __u64 data_size)
 	return 0;
 }
 
+/* 在 descriptor 的 bitmap 中设置或清除指定槽位的"已分配"标志 */
 static
 int set_idx_state(sdt_desc_t *desc, __u64 pos, bool state)
 {
@@ -324,6 +346,8 @@ int set_idx_state(sdt_desc_t *desc, __u64 pos, bool state)
 	return 0;
 }
 
+/* 释放时自底向上遍历各层 descriptor，清除 bitmap 位、递增 nr_free；
+若某层 nr_free > 1 则无需继续向上传播（父节点已知有空位） */
 static __noinline
 int mark_nodes_avail(sdt_desc_t *lv_desc[SDT_TASK_LEVELS], __u64 lv_pos[SDT_TASK_LEVELS])
 {
@@ -350,6 +374,9 @@ int mark_nodes_avail(sdt_desc_t *lv_desc[SDT_TASK_LEVELS], __u64 lv_pos[SDT_TASK
 	return 0;
 }
 
+/* 释放一个 idx：从 root 按 idx 的各级地址位逐层向下找到叶 chunk，清零对应的
+ sdt_data（自增 generation 计数，清零 payload），再调用 mark_nodes_avail
+  更新各层 bitmap */
 __weak
 int scx_alloc_free_idx(struct scx_allocator *alloc, __u64 idx)
 {
@@ -439,6 +466,8 @@ int scx_alloc_free_idx(struct scx_allocator *alloc, __u64 idx)
 /*
  * Find and return an available idx on the allocator.
  * Called with the task spinlock held.
+ 分配一个 idx：从 root descriptor 逐层找空槽，若中间层子节点不存在则动态创建，
+ 组装出完整的 idx；随后自底向上标记各层 bitmap 并递减 nr_free
  */
 static sdt_desc_t * desc_find_empty(sdt_desc_t *desc,
 	struct scx_alloc_stack __arena *stack,
@@ -502,6 +531,7 @@ static sdt_desc_t * desc_find_empty(sdt_desc_t *desc,
 	return desc;
 }
 
+/* 分配成功的收尾：更新统计计数，将 idx 写入 data->tid.idx */
 static void scx_alloc_finish(struct sdt_data __arena *data, __u64 idx)
 {
 	bpf_spin_lock(&alloc_lock);
@@ -516,6 +546,9 @@ static void scx_alloc_finish(struct sdt_data __arena *data, __u64 idx)
 	data->tid.idx = idx;
 }
 
+/* 分配主入口：调用 scx_alloc_attempt 预留 arena 页，调用 desc_find_empty
+ 找空 idx，按需从 pool 分配 sdt_data，调用 scx_alloc_finish 完成；失败时回调
+  scx_alloc_free_idx */
 __hidden
 u64 scx_alloc_internal(struct scx_allocator *alloc)
 {
@@ -580,6 +613,9 @@ u64 scx_alloc_internal(struct scx_allocator *alloc)
 
 struct scx_static scx_static;
 
+/* 最简单的 bump allocator，只分配不释放，用于程序生命周期内持续存在的对象
+（初始化时分配，运行期间不释放）。 */
+/* 初始化：调用 bpf_arena_alloc_pages 分配指定页数的 arena 内存，设置 max_alloc_bytes，偏移从 0 开始 */
 __weak
 u64 scx_static_alloc_internal(size_t bytes, size_t alignment)
 {
@@ -681,6 +717,8 @@ int scx_static_init(size_t alloc_pages)
 	return 0;
 }
 
+/* 固定尺寸对象的 arena 分配器，用分段链表（每段 SCX_STK_SEG_MAX 个指针）
+作为空闲元素栈；内存压力下段本身可被复用为数据，数据也可被拆解回段。 */
 __hidden
 int scx_stk_init(struct scx_stk *stack, __u64 data_size, __u64 nr_pages_per_alloc)
 {

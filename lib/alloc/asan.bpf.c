@@ -5,9 +5,15 @@
  */
 #include <alloc/common.h>
 #include <alloc/asan.h>
+/* 这个文件是为 BPF Arena 内存分配器实现的 AddressSanitizer（ASAN）运行时。
 
+ASAN 是一种内存安全检测机制，原本用于用户态/内核态 C 程序。它通过在每次内存读写
+前插入检查代码，发现越界访问、use-after-free 等问题。编译器（Clang）在插桩时会自动调用一批
+以 __asan_ 开头的运行时函数——这个文件就是在 BPF 环境下实现这些函数。 */
 #ifdef BPF_ARENA_ASAN
 
+/* 意思是对该区间内的所有函数关闭 AddressSanitizer (ASAN) 插桩。
+这个文件本身就是 ASAN 的"幕后实现"，如果对它自己也插桩，就会无限递归/循环，所以必须豁免。 */
 #pragma clang attribute push(__attribute__((no_sanitize("address"))), \
 			     apply_to = function)
 
@@ -33,6 +39,8 @@ static bool inited = false;
 
 /*
  * BPF does not currently support the memset/memcpy/memcmp intrinsics.
+ __arena — 修饰指针，表示指向 BPF arena 地址空间的指针（arena 是 BPF 的一种动态内存分配机制，地址空间和普通指针不同）。
+__arg_arena — 用于函数参数，告诉 BPF 验证器该参数是一个 arena 指针，触发不同的验证规则。
  */
 __always_inline int asan_memset(s8a __arg_arena *dst, s8 val, size_t size)
 {
@@ -49,7 +57,13 @@ __always_inline int asan_memset(s8a __arg_arena *dst, s8 val, size_t size)
 	return 0;
 }
 
-/* Validate a 1-byte access, always within a single byte. */
+/* Validate a 1-byte access, always within a single byte.
+检查 1 字节访问是否命中毒化内存。 步骤：
+
+取出该地址对应的 shadow 字节。
+若 shadow 为 0，直接合法（最常见路径，用 likely 优化）。
+若 shadow 非 0，判断该字节在 granule 内的偏移是否超出合法范围
+（ASAN_GRANULE(addr) 是在 8 字节块内的偏移）。 */
 static __always_inline bool memory_is_poisoned_1(s8a *addr)
 {
 	s8 shadow_value = asan_shadow_value(addr);
@@ -67,7 +81,12 @@ static __always_inline bool memory_is_poisoned_1(s8a *addr)
 	return ASAN_GRANULE(addr) >= shadow_value;
 }
 
-/* Validate a 2- 4-, 8-byte access, spans up to 2 bytes. */
+/* Validate a 2- 4-, 8-byte access, spans up to 2 bytes.
+检查 2/4/8 字节访问是否命中毒化内存。 这类访问最多横跨 2 个 shadow 字节（granule）：
+
+如果整个访问区间在同一个 granule 内，只需检查末尾字节。
+如果跨越了 granule 边界，需要同时检查：起始 granule 完全合法
+（shadow == 0）+ 末尾 granule 的末字节合法。 */
 static __always_inline bool memory_is_poisoned_2_4_8(s8a *addr, u64 size)
 {
 	u64 end = (u64)addr + size - 1;
@@ -87,11 +106,15 @@ static __always_inline bool memory_is_poisoned_2_4_8(s8a *addr, u64 size)
 	return asan_shadow_value(addr) || memory_is_poisoned_1((s8a *)end);
 }
 
+/* 检查某地址对应的 shadow 是否被设置 */
 __weak bool asan_shadow_set(void __arena __arg_arena *addr)
 {
 	return memory_is_poisoned_1(addr);
 }
 
+/* 在 shadow map 的一段范围内，找到第一个非零字节的地址。 
+非零字节意味着那里有毒化标记。如果全部为零，返回特殊哨兵值 SHADOW_ALL_ZEROES
+（即 (u64)-1）。这是大块内存检查的"快速扫描"步骤。 */
 static __always_inline u64 first_nonzero_byte(u64 addr, size_t size)
 {
 	while (size && can_loop) {
@@ -104,6 +127,11 @@ static __always_inline u64 first_nonzero_byte(u64 addr, size_t size)
 	return SHADOW_ALL_ZEROES;
 }
 
+/* 检查任意长度 n 字节访问是否命中毒化内存。 思路：
+
+把 [addr, addr+size) 映射到 shadow map 区间 [start, end]。
+用 first_nonzero_byte 快速扫描整段 shadow。
+若找到了非零字节，还要排除一种特殊情况：非零字节正好在末尾 granule，且实际访问没有超过合法的部分毒化边界。 */
 static __always_inline bool memory_is_poisoned_n(s8a *addr, u64 size)
 {
 	u64 ret;
@@ -122,6 +150,8 @@ static __always_inline bool memory_is_poisoned_n(s8a *addr, u64 size)
 						      *(s8a *)end, false);
 }
 
+/* 记录 ASAN 违规事件。 把违规的内存地址写入全局变量 asan_violated
+（它是 volatile u64，用户态可以读取）。 */
 static __always_inline int asan_report(s8a __arg_arena *addr, size_t sz,
 				       bool write)
 {
@@ -177,7 +207,11 @@ confirmed_valid:
  * XXX The "explicit" call to be used from outside without worrying
  * about size. 
  */
+/* 核心调度函数，所有内存访问检查的统一入口。 逻辑：
 
+先做参数预检（size=0 / 溢出）。
+根据 size 分发到对应的专门检查函数（1、2/4/8、n 字节三类）。
+若毒化，调用 asan_report 记录违规。 */
 static __always_inline bool check_region_inline(void *ptr, size_t size,
 						bool write)
 {
@@ -212,8 +246,13 @@ static __always_inline bool check_region_inline(void *ptr, size_t size,
 }
 
 /*
- * __alias is not supported for BPF so define *__noabort() variants as wrappers.
- */
+ * __alias is not supported for BPF so define *__noabort() variants
+  as wrappers.
+ 通过 DEFINE_ASAN_LOAD_STORE(1/2/4/8) 展开，生成 Clang ASAN 插桩需要的运行时
+ 钩子函数。编译器在每个 load/store 指令前会自动插入对 __asan_loadN /
+  __asan_storeN 的调用，这里就是 BPF 环境下的具体实现，内部都调用
+   check_region_inline。_noabort 后缀版本在语义上相同（标准 ASAN 中 noabort
+    版本报告后继续执行，这里两者行为一致）。*/
 #define DEFINE_ASAN_LOAD_STORE(size)                                           \
 	__hidden void __asan_store##size(void *addr)                           \
 	{                                                                      \
@@ -275,6 +314,8 @@ void __asan_unregister_globals(void *globals, size_t n)
 	bpf_printk("Emitted %s", __func__);
 }
 
+/* 内存批量操作的 ASAN 拦截钩子（目前是桩实现）。 Clang 在开启 ASAN 时会把
+ memcpy/memmove/memset 替换成 __asan_memcpy 等，以便同时做内存合法性检查。 */
 // Functions concerning block memory destinations
 void *__asan_memcpy(void *d, const void *s, size_t n)
 {
@@ -298,6 +339,12 @@ void *__asan_memset(void *p, int c, size_t n)
  * Poisoning code, used when we add more freed memory to the allocator by:
  * 	a) pulling memory from the arena segment using bpf_arena_alloc_pages()
  * 	b) freeing memory from application code
+ 将一段内存标记为"毒化"（不可访问）。 使用场景：
+
+从 arena 获取新页面后，立即毒化（全标为不可访问）。
+free 释放内存后，毒化释放区域，捕获 use-after-free。
+要求 addr 和 size 都必须 granule 对齐（8 字节），否则返回 -EINVAL。实现就是在
+ shadow map 对应区域批量写入 val（通常是负数，表示完全毒化）。
  */
 __hidden __noasan int asan_poison(void __arena *addr, s8 val, size_t size)
 {
@@ -356,6 +403,7 @@ __hidden __noasan int asan_poison(void __arena *addr, s8 val, size_t size)
  * invalid. Partial poisoning takes care of that. Freeing and poisoning the
  * memory is still done in granule-aligned sizes and repoisons the already
  * poisoned padding.
+ 将一段内存标记为"合法可访问"（解毒）。 使用场景：分配内存给应用层时调用，把分配区域在 shadow map 中清零（表示可访问）。
  */
 __hidden __noasan int asan_unpoison(void __arena *addr, size_t size)
 {
@@ -398,6 +446,12 @@ __hidden __noasan int asan_unpoison(void __arena *addr, size_t size)
  * Initialize ASAN state when necessary. Triggered from userspace before
  * allocator startup.
  */
+/* 把函数放入 ELF 的 "syscall" 节（section）。BPF 加载器（libbpf）会根据 section
+ 名称决定 BPF 程序类型：
+
+"syscall" — 表示这个 BPF 程序可由用户态通过 bpf(BPF_PROG_RUN, ...) 直接调用，
+相当于一个"用户态可触发的 BPF 函数"。
+其他常见的有 "tp/...", "kprobe/...", "xdp" 等。 */
 SEC("syscall")
 __hidden __noasan int asan_init(struct asan_init_args *args)
 {
