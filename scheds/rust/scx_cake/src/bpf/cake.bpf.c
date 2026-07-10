@@ -520,7 +520,7 @@ struct {
 
 /* BenchLab spin lock: measures bpf_spin_lock + unlock cycle cost. */
 /* BenchLab 自旋锁：测量 bpf_spin_lock + unlock 一轮的成本。 */
-/* 讲解：用于与 cake 的无锁读取方案做性能对比。 */
+/* 用于与 cake 的无锁读取方案做性能对比。 */
 struct bench_lock_data {
 	struct bpf_spin_lock lock;
 	u64 counter;
@@ -536,7 +536,7 @@ struct {
  * Macro to avoid function pointer overhead (BPF doesn't support them). */
 /* 对单次 kfunc 迭代计时：取两次时间，差值即成本。
  * 用宏而非函数指针，因为 BPF 不支持函数指针。 */
-/* 讲解：宏在调用点展开，避免额外调用开销，测得的就是被测操作本身。 */
+/* 宏在调用点展开，避免额外调用开销，测得的就是被测操作本身。 */
 #define BENCH_ONE(entry, call_expr, idx) do {                     \
 	u64 _s = bpf_ktime_get_ns();                                 \
 	u64 _v = (u64)(call_expr);                                    \
@@ -563,14 +563,14 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 {
 	/* Suppress CAKE_STATS_ACTIVE on all cores during benchmark */
 	/* 基准期间在所有核上抑制 CAKE_STATS_ACTIVE。 */
-	/* 讲解：置位 bench_active 让遥测暂停，避免污染测量结果。 */
+	/* 置位 bench_active 让遥测暂停，避免污染测量结果。 */
 	*(volatile u32 *)&bench_active = 1;
 	r->cpu = bpf_get_smp_processor_id();
 	r->iterations = BENCH_ITERATIONS;
 
 	/* Zero all entries */
 	/* 清零所有条目。 */
-	/* 讲解：min 置为最大值以便后续取最小，其余清零。 */
+	/* min 置为最大值以便后续取最小，其余清零。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_MAX_ENTRIES; i++) {
 		r->entries[i].min_ns = ~0ULL;
@@ -580,25 +580,25 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: bpf_ktime_get_ns() — legacy CLOCK_MONOTONIC */
-	/* 基准：bpf_ktime_get_ns()——传统 CLOCK_MONOTONIC 时钟。讲解：常规取时开销。 */
+	/* bpf_ktime_get_ns()——传统 CLOCK_MONOTONIC 时钟。常规取时开销。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_ITERATIONS; i++)
 		BENCH_ONE(&r->entries[BENCH_KTIME_GET_NS], bpf_ktime_get_ns(), i);
 
 	/* Bench: scx_bpf_now() — SCX cached clock */
-	/* 基准：scx_bpf_now()——SCX 缓存时钟。讲解：sched_ext 优化过的取时。 */
+	/* scx_bpf_now()——SCX 缓存时钟。sched_ext 优化过的取时。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_ITERATIONS; i++)
 		BENCH_ONE(&r->entries[BENCH_SCX_BPF_NOW], scx_bpf_now(), i);
 
 	/* Bench: bpf_get_smp_processor_id() — CPU identification */
-	/* 基准：bpf_get_smp_processor_id()——取当前 CPU 号。讲解：热路径常用操作。 */
+	/* bpf_get_smp_processor_id()——取当前 CPU 号。热路径常用操作。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_ITERATIONS; i++)
 		BENCH_ONE(&r->entries[BENCH_GET_SMP_PROC_ID], bpf_get_smp_processor_id(), i);
 
 	/* Bench: bpf_task_from_pid() — PID lookup (kfunc) */
-	/* 基准：bpf_task_from_pid()——由 PID 查任务（kfunc）。讲解：涉及查表，较慢。 */
+	/* bpf_task_from_pid()——由 PID 查任务（kfunc）。涉及查表，较慢。 */
 	{
 		s32 pid = p->pid;
 		#pragma unroll
@@ -618,7 +618,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: scx_bpf_test_and_clear_cpu_idle() — idle probe (gate 1 hot path) */
-	/* 基准：scx_bpf_test_and_clear_cpu_idle()——空闲探测（Gate 1 热路径）。讲解：选核最关键的原子操作。 */
+	/* 基准：scx_bpf_test_and_clear_cpu_idle()——空闲探测（Gate 1 热路径）。选核最关键的原子操作。 */
 	{
 		u32 cpu = bpf_get_smp_processor_id();
 		#pragma unroll
@@ -637,13 +637,13 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: scx_bpf_nr_cpu_ids() — topology constant read */
-	/* 基准：scx_bpf_nr_cpu_ids()——读取拓扑常量。讲解：对比 RODATA 常量的开销。 */
+	/* 基准：scx_bpf_nr_cpu_ids()——读取拓扑常量。对比 RODATA 常量的开销。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_ITERATIONS; i++)
 		BENCH_ONE(&r->entries[BENCH_NR_CPU_IDS], scx_bpf_nr_cpu_ids(), i);
 
 	/* Bench: get_task_ctx() — scx_task_data arena direct pointer deref */
-	/* 基准：get_task_ctx()——arena 直接指针解引用。讲解：反映 arena 访问成本。 */
+	/* 基准：get_task_ctx()——arena 直接指针解引用。反映 arena 访问成本。 */
 	{
 		#pragma unroll
 		for (int i = 0; i < BENCH_ITERATIONS; i++) {
@@ -661,7 +661,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: scx_bpf_dsq_nr_queued() — DSQ depth query (read-only kfunc) */
-	/* 基准：scx_bpf_dsq_nr_queued()——查询 DSQ 深度（只读 kfunc）。讲解：派发决策会读它。 */
+	/* 基准：scx_bpf_dsq_nr_queued()——查询 DSQ 深度（只读 kfunc）。派发决策会读它。 */
 	{
 		u64 dsq_id = LLC_DSQ_BASE + cpu_llc_id[r->cpu & (CAKE_MAX_CPUS - 1)];
 		#pragma unroll
@@ -680,7 +680,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: BSS array access — raw global_stats[cpu] field read */
-	/* 基准：BSS 数组访问——裸读 global_stats[cpu] 字段。讲解：最快的全局数据访问基线。 */
+	/* 基准：BSS 数组访问——裸读 global_stats[cpu] 字段。最快的全局数据访问基线。 */
 	{
 		u32 bcpu = r->cpu & (CAKE_MAX_CPUS - 1);
 		#pragma unroll
@@ -699,7 +699,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: Arena per_cpu deref — read field from per_cpu[cpu].mbox */
-	/* 基准：arena per_cpu 解引用——读取 per_cpu[cpu].mbox 字段。讲解：与 BSS 访问对比成本。 */
+	/* 基准：arena per_cpu 解引用——读取 per_cpu[cpu].mbox 字段。与 BSS 访问对比成本。 */
 #ifndef CAKE_RELEASE
 	{
 		ARENA_ASSOC();
@@ -724,7 +724,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	 * Measures the overhead of the timing harness itself (2× bpf_ktime_get_ns). */
 	/* 基准：连续两次 scx_bpf_now()——校准基线。
 	 * 测量计时框架本身的开销（2 次 bpf_ktime_get_ns）。 */
-	/* 讲解：其它测量结果需减去这个基线，才是被测操作的净耗时。 */
+	/* 其它测量结果需减去这个基线，才是被测操作的净耗时。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_ITERATIONS; i++) {
 		u64 _s = bpf_ktime_get_ns();
@@ -736,7 +736,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 		e->total_ns += _d;
 		e->samples[i] = _d;
 		e->last_value = _d; /* Shows raw overhead of timing harness */
-				    /* 展示计时框架的原始开销。讲解：即基线本身的数值。 */
+				    /* 展示计时框架的原始开销。即基线本身的数值。 */
 	}
 
 	/* Bench: Read cached CPU from mailbox CL0 (Disruptor handoff pattern).
@@ -745,7 +745,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	/* 基准：从邮箱 CL0 读缓存的 CPU 号（Disruptor 交接模式）。
 	 * 模拟 cake_stopping 从邮箱读 CPU，而非调用 bpf_get_smp_processor_id()。
 	 * 因为之前读过 tick_slice，邮箱在 L1 中是热的。 */
-	/* 讲解：验证“从已热的缓存行取值”比调用 kfunc 更省。 */
+	/* 验证“从已热的缓存行取值”比调用 kfunc 更省。 */
 #ifndef CAKE_RELEASE
 	{
 		u32 bcpu = r->cpu & (CAKE_MAX_CPUS - 1);
@@ -773,7 +773,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	/* 基准：从邮箱读缓存的 tctx 指针并解引用字段。
 	 * 模拟先从邮箱 CL0 读预缓存的 arena 指针，再解引用一个字段。
 	 * 与 get_task_ctx() kfunc 做对比。 */
-	/* 讲解：验证缓存指针后再解引用是否比每次调 kfunc 更快。 */
+	/* 验证缓存指针后再解引用是否比每次调 kfunc 更快。 */
 #ifndef CAKE_RELEASE
 	{
 		u32 bcpu = r->cpu & (CAKE_MAX_CPUS - 1);
@@ -782,16 +782,16 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 		 * then read a field from the tctx we already have. */
 		/* 模拟：从邮箱读一个 u64（指针本应缓存在此），
 		 * 再从已持有的 tctx 读一个字段。 */
-		/* 讲解：还原“缓存指针+解引用”的真实访问序列。 */
+		/* 还原“缓存指针+解引用”的真实访问序列。 */
 		struct cake_task_ctx __arena *tctx = get_task_ctx(p);
 		if (tctx) {
 			#pragma unroll
 			for (int i = 0; i < BENCH_ITERATIONS; i++) {
 				u64 _s = bpf_ktime_get_ns();
 				volatile u64 ptr_val = mbox->tick_slice; /* Simulate ptr read from CL0 */
-									 /* 模拟从 CL0 读指针。讲解：代表取缓存指针那一步。 */
+									 /* 模拟从 CL0 读指针。代表取缓存指针那一步。 */
 				volatile u16 field = tctx->deficit_u16; /* Deref cached ptr */
-									/* 解引用缓存指针。讲解：代表读字段那一步。 */
+									/* 解引用缓存指针。代表读字段那一步。 */
 				u64 _e = bpf_ktime_get_ns();
 				u64 _d = _e - _s;
 				struct kfunc_bench_entry *e = &r->entries[BENCH_TCTX_FROM_MBOX];
@@ -811,7 +811,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	/* 基准：bpf_ringbuf_reserve + discard 一轮。
 	 * 测量 BPF ringbuf API 的成本（Disruptor 模式 #3）。
 	 * 用 reserve+discard（而非 submit）以免需要消费者。 */
-	/* 讲解：评估用 ringbuf 做数据交接的固有开销。 */
+	/* 评估用 ringbuf 做数据交接的固有开销。 */
 	{
 		#pragma unroll
 		for (int i = 0; i < BENCH_ITERATIONS; i++) {
@@ -831,7 +831,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: task_struct field reads — p->scx.slice + p->nvcsw */
-	/* 基准：读取 task_struct 字段——p->scx.slice + p->nvcsw。讲解：热路径直接读内核字段的代价。 */
+	/* 基准：读取 task_struct 字段——p->scx.slice + p->nvcsw。热路径直接读内核字段的代价。 */
 	{
 		#pragma unroll
 		for (int i = 0; i < BENCH_ITERATIONS; i++) {
@@ -850,7 +850,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	}
 
 	/* Bench: RODATA array lookup — cpu_llc_id[cpu] + quantum_ns */
-	/* 基准：RODATA 数组查表——cpu_llc_id[cpu] + quantum_ns。讲解：只读常量访问，通常极快。 */
+	/* 基准：RODATA 数组查表——cpu_llc_id[cpu] + quantum_ns。只读常量访问，通常极快。 */
 	{
 		u32 bcpu = r->cpu & (CAKE_MAX_CPUS - 1);
 		#pragma unroll
@@ -858,7 +858,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 			u64 _s = bpf_ktime_get_ns();
 			volatile u32 llc = cpu_llc_id[bcpu];
 			volatile u64 ts = quantum_ns; /* RODATA const read */
-						      /* 读取 RODATA 常量。讲解：JIT 可折叠为立即数。 */
+						      /* 读取 RODATA 常量。JIT 可折叠为立即数。 */
 			u64 _e = bpf_ktime_get_ns();
 			u64 _d = _e - _s;
 			struct kfunc_bench_entry *e = &r->entries[BENCH_RODATA_LOOKUP];
@@ -874,7 +874,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	 * Simulates the full yielder detection + branchless flag set from stopping. */
 	/* 基准：位标志操作——位移+掩码+无分支的让出者判断模式。
 	 * 模拟 stopping 中完整的让出者检测 + 无分支置标志。 */
-	/* 讲解：验证无分支写法能否避免分支预测失败带来的抖动。 */
+	/* 验证无分支写法能否避免分支预测失败带来的抖动。 */
 	{
 		struct cake_task_ctx __arena *tctx = get_task_ctx(p);
 		if (tctx) {
@@ -883,11 +883,11 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 			for (int i = 0; i < BENCH_ITERATIONS; i++) {
 				u64 _s = bpf_ktime_get_ns();
 				/* Extract yielder flag */
-				/* 提取让出者标志。讲解：从 packed 中取出对应位。 */
+				/* 提取让出者标志。从 packed 中取出对应位。 */
 				u32 yl_mask = (u32)CAKE_FLOW_YIELDER << SHIFT_FLAGS;
 				volatile u32 result = (packed & ~yl_mask) | (yl_mask & -(u32)1);
 				/* Extract nf + yl bits */
-				/* 提取新流位 + 让出位。讲解：验证多位提取的组合开销。 */
+				/* 提取新流位 + 让出位。验证多位提取的组合开销。 */
 				volatile u8 nf = (result >> SHIFT_FLAGS) & 1;
 				volatile u8 yl = (result >> SHIFT_FLAGS) & (u32)CAKE_FLOW_YIELDER;
 				u64 _e = bpf_ktime_get_ns();
@@ -906,21 +906,21 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	 * Reads tick_slice from cpu_bss. compute_ewma() removed in PELT transition. */
 	/* 基准：EWMA 计算（遗留项，槽位保留以便对比）。
 	 * 从 cpu_bss 读 tick_slice。转向 PELT 后 compute_ewma() 已移除。 */
-	/* 讲解：保留旧算法测量点，方便与新的 PELT 分类做对比。 */
+	/* 保留旧算法测量点，方便与新的 PELT 分类做对比。 */
 	{
 		s32 ewma_cpu = bpf_get_smp_processor_id();
 		u64 tick_sl_bss = cpu_bss[ewma_cpu & (CAKE_MAX_CPUS - 1)].tick_slice;
 		u32 fused_val = 0x00C80064; /* Simulated: avg=200, deficit=100 */
-					    /* 模拟值：平均=200，赤字=100。讲解：给算法一个固定输入。 */
+					    /* 模拟值：平均=200，赤字=100。给算法一个固定输入。 */
 		#pragma unroll
 		for (int i = 0; i < BENCH_ITERATIONS; i++) {
 			u64 _s = bpf_ktime_get_ns();
 			/* 1.0.4 path: tick_slice from BSS, remaining from p->scx */
-			/* 1.0.4 路径：tick_slice 取自 BSS，剩余片取自 p->scx。讲解：还原真实数据来源。 */
+			/* 1.0.4 路径：tick_slice 取自 BSS，剩余片取自 p->scx。还原真实数据来源。 */
 			u64 tick_sl = tick_sl_bss;   /* cpu_bss — already L1 hot */
-						     /* cpu_bss——已在 L1 中。讲解：模拟热缓存访问。 */
+						     /* cpu_bss——已在 L1 中。模拟热缓存访问。 */
 			u64 rem_sl = p->scx.slice;   /* task_struct — already read */
-						     /* task_struct——已读过。讲解：复用已加载的字段。 */
+						     /* task_struct——已读过。复用已加载的字段。 */
 			u16 old_avg = (u16)(fused_val >> 16);
 			u16 deficit = (u16)(fused_val & 0xFFFF);
 			u64 used = (tick_sl > rem_sl) ? (tick_sl - rem_sl) : 0;
@@ -944,7 +944,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	/* 基准：邮箱 CL0 多字段读取模拟。
 	 * 从 CL0 读取 cached_tctx_ptr + cached_deficit + cached_packed。
 	 * 模拟 cake_stopping 纯邮箱路径（不碰 arena）。 */
-	/* 讲解：验证把所需数据集中在一条缓存行时的并行读取收益。 */
+	/* 验证把所需数据集中在一条缓存行时的并行读取收益。 */
 #ifndef CAKE_RELEASE
 	{
 		ARENA_ASSOC();
@@ -977,11 +977,11 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	 * 模拟探测另一个 CPU 的空闲状态。
 	 * 这揭示 MESI 争用成本：空闲位图缓存行必须从远端 CPU 拥有者处窥探
 	 *（Zen 5 上 30-100ns）。与 BENCH_TEST_CLEAR_IDLE（本地，约 15ns）对比。 */
-	/* 讲解：量化“探测别的核”比“探测自己”贵多少，指导选核策略。 */
+	/* 量化“探测别的核”比“探测自己”贵多少，指导选核策略。 */
 	{
 		u32 local_cpu = bpf_get_smp_processor_id();
 		/* Pick SMT sibling (XOR 1 gives the hyper-thread pair on Zen) */
-		/* 选 SMT 兄弟核（Zen 上异或 1 即得到超线程配对）。讲解：兄弟核最可能共享缓存。 */
+		/* 选 SMT 兄弟核（Zen 上异或 1 即得到超线程配对）。兄弟核最可能共享缓存。 */
 		s32 remote_cpu = (s32)((local_cpu ^ 1) & (CAKE_MAX_CPUS - 1));
 		#pragma unroll
 		for (int i = 0; i < BENCH_ITERATIONS; i++) {
@@ -1009,7 +1009,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	 * cpumask_test_cpu 是纯读——无原子测试清、无缓存行失效。
 	 * 这是“只检查不占用”一个 CPU 是否空闲的最快方式。
 	 * 用途：在用 test_and_clear 正式认领前先做预筛。 */
-	/* 讲解：只读检查可先廉价过滤，减少昂贵的原子认领次数。 */
+	/* 只读检查可先廉价过滤，减少昂贵的原子认领次数。 */
 	{
 		u32 local_cpu = bpf_get_smp_processor_id();
 		#pragma unroll
@@ -1035,7 +1035,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	/* 基准：完整 Disruptor 交接读取——模拟 cake_stopping。
 	 * 依次读取本地 CPU 邮箱 CL0 的全部 5 个字段。
 	 * 测量把所有交接数据集中在一条缓存行带来的内存级并行(MLP)收益。 */
-	/* 讲解：字段同行时 CPU 可并行发起加载，验证这种布局的优势。 */
+	/* 字段同行时 CPU 可并行发起加载，验证这种布局的优势。 */
 #ifndef CAKE_RELEASE
 	{
 		u32 local_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
@@ -1066,7 +1066,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	/* 基准：get_task_ctx + 读 arena CL0——模拟 cake_running。
 	 * 测量 kfunc + 依赖式 arena 加载链。
 	 * 用 bpf_get_current_task_btf() 作为任务来源。 */
-	/* 讲解：还原 running 回调“取上下文再读字段”的真实依赖链成本。 */
+	/* 还原 running 回调“取上下文再读字段”的真实依赖链成本。 */
 	{
 		struct task_struct *cur = bpf_get_current_task_btf();
 		#pragma unroll
@@ -1096,7 +1096,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 	 * 强制跨 arena 页做 TLB 遍历。4KB 页时各 per_cpu 块（发布 64B/调试 128B）
 	 * 可能共享页；用大页（2MB）时 16 个都落在一个 TLB 项里。
 	 * 与 BENCH_ARENA_DEREF（单次热访问）的差值即 TLB 缺失的代价。 */
-	/* 讲解：量化 TLB 缺失开销，判断是否值得用大页。 */
+	/* 量化 TLB 缺失开销，判断是否值得用大页。 */
 #ifndef CAKE_RELEASE
 	{
 		#pragma unroll
@@ -1121,10 +1121,10 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
 
 	/* ═══ NEW ENTRIES (24–42): eBPF helpers + SCX kfuncs ═══ */
 	/* ═══ 新增条目（24–42）：eBPF 辅助函数 + SCX kfunc ═══ */
-	/* 讲解：这一组对比各类内核辅助函数的开销。 */
+	/* 这一组对比各类内核辅助函数的开销。 */
 
 	/* Bench: bpf_ktime_get_boot_ns() — suspend-aware monotonic clock */
-	/* 基准：bpf_ktime_get_boot_ns()——含休眠时间的单调时钟。讲解：跨挂起仍连续但略慢。 */
+	/* bpf_ktime_get_boot_ns()——含休眠时间的单调时钟。跨挂起仍连续但略慢。 */
 	#pragma unroll
 	for (int i = 0; i < BENCH_ITERATIONS; i++)
 		BENCH_ONE(&r->entries[BENCH_KTIME_BOOT_NS], bpf_ktime_get_boot_ns(), i);
@@ -1985,7 +1985,7 @@ static __always_inline void run_kfunc_bench(struct kfunc_bench_results *r,
  * arena 存储在 cake_init_task（可睡眠）中预先分配。
  * 热路径无需判空：init_task 保证在该任务任何调度回调触发前已完成分配。
  * __arena 限定符：让验证器知道这是 arena 支持的指针。 */
-/* 讲解：因初始化时已保证分配，热路径可放心省去判空以节省指令。 */
+/* 因初始化时已保证分配，热路径可放心省去判空以节省指令。 */
 static __always_inline struct cake_task_ctx __arena *
 get_task_ctx(struct task_struct *p)
 {
@@ -1998,7 +1998,7 @@ get_task_ctx(struct task_struct *p)
 /* 阶段 6：快速的每任务热字段查找（约 10ns，对比 arena 的 29ns）。
  * running + stopping + select_cpu + enqueue 都用它读取 CL0 字段。
  * 若 task_storage 尚未分配（init_task 未调用）则返回 NULL。 */
-/* 讲解：真正的调度热字段走这个更快的查找，与放遥测的 arena 分离。 */
+/* 真正的调度热字段走这个更快的查找，与放遥测的 arena 分离。 */
 static __always_inline struct cake_task_hot *
 get_task_hot(struct task_struct *p)
 {
@@ -2090,10 +2090,10 @@ get_task_hot(struct task_struct *p)
  * 用 __noinline 包装把栈使用隔离在这些帧里，
  * cake_select_cpu 便可获得 0 次 r10 引用。
  * 代价：每次 select_cpu 多一次调用——相对 kfunc 开销可忽略。 */
-/* 讲解：r10 是栈帧寄存器，减少对它的引用有利于验证器与寄存器分配。 */
+/* r10 是栈帧寄存器，减少对它的引用有利于验证器与寄存器分配。 */
 
 /* Returns cpu if idle found, -1 otherwise. */
-/* 找到空闲则返回该 cpu，否则返回 -1。讲解：封装内核默认选核并简化返回值。 */
+/* 找到空闲则返回该 cpu，否则返回 -1。封装内核默认选核并简化返回值。 */
 static __noinline s32 select_cpu_dfl_idle(
 	struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
@@ -2103,7 +2103,7 @@ static __noinline s32 select_cpu_dfl_idle(
 }
 
 /* Returns cpu >= 0 if idle found, < 0 otherwise. */
-/* 找到空闲返回 >=0 的 cpu，否则 <0。讲解：封装带亲和过滤的内核选核。 */
+/* 找到空闲返回 >=0 的 cpu，否则 <0。封装带亲和过滤的内核选核。 */
 static __noinline s32 select_cpu_and_idle(
 	struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 	u64 enq_flags)
@@ -2112,6 +2112,7 @@ static __noinline s32 select_cpu_and_idle(
 				      p->cpus_ptr, enq_flags);
 }
 
+/* 为进程选择cpu */
 s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -2120,7 +2121,7 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * callee-saved register + 2 insns (Rule 36). */
 	/* 发布版：本回调无任何 arena 解引用——都在 stats_on / #ifndef CAKE_RELEASE 之后。
 	 * 跳过 ARENA_ASSOC 以腾出一个被调用者保存寄存器 + 省 2 条指令（规则36）。 */
-	/* 讲解：选核热路径在发布版彻底不碰 arena，因而省掉关联开销。 */
+	/* 选核热路径在发布版彻底不碰 arena，因而省掉关联开销。 */
 #ifndef CAKE_RELEASE
 	ARENA_ASSOC();
 #endif
@@ -2141,14 +2142,14 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 	/* SYNC 剥离：游戏中唤醒都是纯信号（vsync、futex、GPU 完成）——
 	 * SYNC 带不来数据局部性。A/B 测试：在 Arc Raiders 游戏态开启 SYNC，
 	 * FPS 持平或略差。 */
-	/* 讲解：游戏态清除 SYNC 标志，避免把任务无谓迁到唤醒者的核而毁掉缓存。 */
+	/* 游戏态清除 SYNC 标志，避免把任务无谓迁到唤醒者的核而毁掉缓存。 */
 	/* Per-CPU sched_state_local: use prev_cpu (always valid, Rust syncs
 	 * all per-CPU copies identically). Avoids bpf_get_smp_processor_id()
 	 * kfunc which forces r1 spill across call (Rule 73). */
 	/* 每 CPU 的 sched_state_local：用 prev_cpu（总有效，Rust 会把所有
 	 * 每 CPU 副本同步成一致）。避免 bpf_get_smp_processor_id() kfunc
 	 * 导致跨调用溢出 r1（规则73）。 */
-	/* 讲解：用已有的 prev_cpu 下标读本地状态，省一次取 CPU 号的 kfunc。 */
+	/* 用已有的 prev_cpu 下标读本地状态，省一次取 CPU 号的 kfunc。 */
 	if (cpu_bss[prev_cpu & (CAKE_MAX_CPUS - 1)].sched_state_local == CAKE_STATE_GAMING)
 		wake_flags &= ~SCX_WAKE_SYNC;
 
@@ -2169,13 +2170,13 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 *   7. 对受限任务（Wine/Proton）的正确亲和处理
 	 * 规则62：以内核源码为依据。规则4：拓扑正确。
 	 * 规则54：适配所有消费级游戏拓扑与所有内核。 */
-	/* 讲解：优先复用内核成熟的空闲选核逻辑，按内核版本自动选正确 kfunc。 */
+	/* 优先复用内核成熟的空闲选核逻辑，按内核版本自动选正确 kfunc。 */
 	if (!__COMPAT_HAS_scx_bpf_select_cpu_and) {
 		/* Kernel ≤ 6.16: scx_bpf_select_cpu_dfl via noinline wrapper.
 		 * CO-RE prunes this entire block on 6.17+. */
 		/* 内核 ≤6.16：经 noinline 包装调用 scx_bpf_select_cpu_dfl。
 		 * 在 6.17+ 上 CO-RE 会整块裁掉。 */
-		/* 讲解：老内核走这个回退分支。 */
+		/* 老内核走这个回退分支。 */
 		s32 cpu = select_cpu_dfl_idle(p, prev_cpu, wake_flags);
 		if (cpu >= 0) {
 			u64 slice = p->scx.slice ?: quantum_ns;
@@ -2184,13 +2185,14 @@ s32 BPF_STRUCT_OPS(cake_select_cpu, struct task_struct *p, s32 prev_cpu,
 			return cpu;
 		}
 		/* !idle: fall through to Gate 2 (hybrid P/E scan). */
-		/* 非空闲：落到 Gate 2（混合 P/E 扫描）。讲解：内核未找到空闲则继续尝试。 */
+		/* 非空闲：落到 Gate 2（混合 P/E 扫描）。内核未找到空闲则继续尝试。 */
 		goto gate2;
 	}
 
 	{
 		s32 cpu = select_cpu_and_idle(p, prev_cpu, wake_flags, 0);
 		if (cpu >= 0) {
+			/* 成功找到了， 返回 */
 			u64 slice = p->scx.slice ?: quantum_ns;
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
 					    slice, wake_flags);
@@ -2229,8 +2231,8 @@ gate2:
 	 * 从 amd_pstate_prefcore_ranking 填充）。
 	 * EEVDF 拓扑：只要存在 P/E 核就一直生效，不限于游戏态。
 	 * 保证 GAME 任务总落在 P 核、BG 落在 E 核。
-	 * 成本：对称多处理器上 0ns（has_hybrid_cores=false → JIT 删除）。 */
-	/* 讲解：异构平台上按核性能有序找空闲核，让对的任务落在对的核上。 */
+	 * 对称多处理器上 0ns（has_hybrid_cores=false → JIT 删除）。 */
+	/* 异构平台上按核性能有序找空闲核，让对的任务落在对的核上。 */
 	if (has_hybrid_cores) {
 		/* READ TASK CLASS from BSS pid_class_cache (tunneled from stopping).
 		 * Zero bpf_task_storage_get → eliminates 1982ns tail jitter.
@@ -2240,7 +2242,7 @@ gate2:
 		 * 零 bpf_task_storage_get → 消除 1982ns 的尾部抖动。
 		 * BSS 读平均 14ns、抖动 96ns（对比 task_storage 的 28ns/1982ns）。
 		 * p->pid 在 L1 中（与 p->scx.slice 同一缓存行）。 */
-		/* 讲解：选核时用便宜的缓存读类别，避开慢且抖动大的存储查找。 */
+		/* 选核时用便宜的缓存读类别，避开慢且抖动大的存储查找。 */
 		u8 g2_tc = pid_class_cache[p->pid & (PID_CLASS_CACHE_SIZE - 1)];
 		bool is_game = (g2_tc == CAKE_CLASS_GAME);
 		const u8 *scan_order = is_game
@@ -2251,19 +2253,19 @@ gate2:
 			u8 candidate = scan_order[i];
 			if (candidate >= nr_cpus)
 				break;  /* 0xFF sentinel or out of range */
-				/* 遇到 0xFF 哨兵或越界即停。讲解：扫描到有效核末尾。 */
+				/* 遇到 0xFF 哨兵或越界即停。扫描到有效核末尾。 */
 
 			/* SMT-aware: XOR detects class mismatch in 1 insn.
 			 * Branchless: is_game ^ sib_game = true when mismatched. */
 			/* 感知 SMT：用异或一条指令检测类别不匹配。
 			 * 无分支：is_game ^ sib_game 为真即表示不匹配。 */
-			/* 讲解：避免把游戏与非游戏任务放到同一物理核的两个超线程上互相干扰。 */
+			/* 避免把游戏与非游戏任务放到同一物理核的两个超线程上互相干扰。 */
 			u8 sib = cpu_sibling_map[candidate & (CAKE_MAX_CPUS - 1)];
 			if (sib < nr_cpus && sib != candidate) {
 				bool sib_game = (game_cpu_mask[sib >> 6] >> (sib & 63)) & 1;
 				if (is_game ^ sib_game)
 					continue;  /* class mismatch — skip */
-					   /* 类别不匹配——跳过。讲解：不与异类兄弟核共核。 */
+					   /* 类别不匹配——跳过。不与异类兄弟核共核。 */
 			}
 
 			if (scx_bpf_test_and_clear_cpu_idle(candidate)) {
@@ -2316,7 +2318,7 @@ gate2:
  * kfunc：scx_bpf_dsq_insert_vtime、scx_bpf_kick_cpu。
  * 插入后仅 packed（enq_cpu+enq_llc 之父）存活 → 1 个被调用者保存寄存器。
  * 3 参数 + 1 存活 = 0 溢出。 */
-/* 讲解：精心控制参数与存活变量数量，使编译后不产生栈溢出，追求极致精简。 */
+/* 精心控制参数与存活变量数量，使编译后不产生栈溢出，追求极致精简。 */
 static __noinline void enqueue_dsq_dispatch(
 	struct task_struct *p,
 	u64 enq_flags,
@@ -2353,7 +2355,7 @@ static __noinline void enqueue_dsq_dispatch(
  * 用于内核线程或首次派发。2 个参数：p、enq_flags。
  * 总是用 scx_bpf_now()（冷路径——约 10ns 无关紧要）。
  * 内部自取 CPU/LLC → 独立的寄存器帧。 */
-/* 讲解：没有 stopping 预算好的暂存值时走这条冷路径，一切现算即可。 */
+/* 没有 stopping 预算好的暂存值时走这条冷路径，一切现算即可。 */
 static __noinline void enqueue_nostaged(struct task_struct *p, u64 enq_flags)
 {
 	u32 enq_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
@@ -2374,7 +2376,7 @@ static __noinline void enqueue_nostaged(struct task_struct *p, u64 enq_flags)
  * 3 args: p, enq_flags, hot. Fetches CPU/LLC/now internally. */
 /* OPT-19：enqueue_requeue_path——重新入队（让出/时间片耗尽）。
  * 3 个参数：p、enq_flags、hot。内部自取 CPU/LLC/now。 */
-/* 讲解：任务让出或跑完时间片后重新排队走这条路径。 */
+/* 任务让出或跑完时间片后重新排队走这条路径。 */
 static __noinline void enqueue_requeue_path(
 	struct task_struct *p, u64 enq_flags,
 	struct cake_task_hot *hot, u32 enq_cpu)
@@ -2387,7 +2389,7 @@ static __noinline void enqueue_requeue_path(
 	 * 规则62：EEVDF 模式——内核从 rq 结构体推导 CPU。 */
 	/* 讲解：把取 CPU 号提到上层复用，避免本函数再调一次 kfunc。 */
 	u64 now_cached = scx_bpf_now();  /* always fresh for non-wakeup */
-					 /* 非唤醒场景总取最新时间。讲解：重入队需要当前 vtime 基准。 */
+					 /* 非唤醒场景总取最新时间。重入队需要当前 vtime 基准。 */
 	u32 enq_llc = 0;
 	if (nr_llcs > 1) {
 		u32 task_cpu = scx_bpf_task_cpu(p);
@@ -2412,9 +2414,9 @@ static __noinline void enqueue_requeue_path(
 	/* 精简5：所有类别统一按 50% 计算重入队时间片。
 	 * 移除 GAME 75%/非GAME 50% 的区分——vtime 排序本身
 	 * 已提供 GAME 优先级。省掉 yl_flag 与一次变量乘法。 */
-	/* 讲解：优先级交给 vtime 排序，时间片折半即可。 */
+	/* 优先级交给 vtime 排序，时间片折半即可。 */
 	requeue_slice >>= 1;
-	/* 若时间片不足 200µs，则补足到 200µs（下限保护）。讲解：位运算实现无分支下限钳制。 */
+	/* 若时间片不足 200µs，则补足到 200µs（下限保护）。位运算实现无分支下限钳制。 */
 	requeue_slice += (200000 - requeue_slice) & -(requeue_slice < 200000);
 	p->scx.slice = requeue_slice;
 	enqueue_dsq_dispatch(p, enq_flags,
@@ -2441,7 +2443,7 @@ static __noinline void enqueue_requeue_path(
  *   p(r6)、enq_flags(r7)、is_game(r8) = 3 个值 < 4 个被调用者保存寄存器。
  * kfunc 之后：+ enq_cpu(r9) = 4 个值 = 4 个被调用者保存寄存器。
  * → 0 次溢出。 */
-/* 讲解：绝大多数入队都走这里，用父值派生把所有计算压到 kfunc 之前，实现零栈溢出。 */
+/* 绝大多数入队都走这里，用父值派生把所有计算压到 kfunc 之前，实现零栈溢出。 */
 static __noinline void enqueue_wakeup_path(
 	struct task_struct *p, u64 enq_flags,
 	struct cake_task_hot *hot, u32 enq_cpu)
@@ -2462,7 +2464,7 @@ static __noinline void enqueue_wakeup_path(
 	 * FunSearch：hot 判空已移除——可证明是死代码。
 	 * 证明：enqueue_body 只在 staged & VALID 时进入 wakeup_path。
 	 * 若 hot 为 NULL → staged=0 → VALID 未置位 → 走 nostaged 路径。 */
-	/* 讲解：一次性从 hot 榨出全部派生量，随后 hot 立即可释放。 */
+	/* 一次性从 hot 榨出全部派生量，随后 hot 立即可释放。 */
 	u64 staged = hot->staged_vtime_bits;
 	u32 dsq_weight = (u32)(staged & 0xFFFFFFFF);
 	u8 new_flow = (staged >> STAGED_BIT_NEW_FLOW) & 1;
@@ -2472,7 +2474,7 @@ static __noinline void enqueue_wakeup_path(
 	/* Write vtime to entity — kernel enqueue_entity pattern.
 	 * vtime, staged, dsq_weight, new_flow all DIE here. */
 	/* 把 vtime 写入实体——对应内核 enqueue_entity 模式。
-	 * vtime、staged、dsq_weight、new_flow 在此全部失效。讲解：新流可得奖励使 vtime 前移。 */
+	 * vtime、staged、dsq_weight、new_flow 在此全部失效。新流可得奖励使 vtime 前移。 */
 	p->scx.dsq_vtime = vtime;
 	/* GAME DOUBLE-SLICE: frame-time headroom during GAMING.
 	 * Only GAME+GAMING gets an explicit 2× quantum for frame pacing. */
@@ -2482,7 +2484,7 @@ static __noinline void enqueue_wakeup_path(
 	 * Avoids bpf_get_smp_processor_id() kfunc which causes 3 spills (Rule 73). */
 	/* 每 CPU 的 sched_state_local：使用 enq_cpu（已由调用方传入）。
 	 * 避免 bpf_get_smp_processor_id() kfunc 导致 3 次溢出（规则73）。 */
-	/* 讲解：游戏任务在游戏态下拿双倍时间片，减少帧内被抢占。 */
+	/* 游戏任务在游戏态下拿双倍时间片，减少帧内被抢占。 */
 	if (is_game && cpu_bss[enq_cpu].sched_state_local == CAKE_STATE_GAMING)
 		p->scx.slice = quantum_ns << 1;
 	/* hot is now DEAD — all 6 derivatives consumed or stored.
@@ -2503,7 +2505,7 @@ static __noinline void enqueue_wakeup_path(
 
 	/* ── Phase 3: LLC (dead-coded on single-CCD via RODATA nr_llcs=1) ── */
 	/* ── 阶段3：LLC（单 CCD 时借 RODATA nr_llcs=1 变为死代码） ── */
-	/* 讲解：单 LLC 机器上该分支被 JIT 直接消除。 */
+	/* 单 LLC 机器上该分支被 JIT 直接消除。 */
 	u32 enq_llc = 0;
 	if (nr_llcs > 1) {
 		u32 task_cpu = scx_bpf_task_cpu(p);
@@ -2512,7 +2514,7 @@ static __noinline void enqueue_wakeup_path(
 
 	/* ── Phase 5: Dispatch (3 args, 0 spills) ── */
 	/* ── 阶段5：派发（3 个参数，0 次溢出） ── */
-	/* 讲解：把 CPU 与 LLC 打包成一个 u64 传入派发函数。 */
+	/* 把 CPU 与 LLC 打包成一个 u64 传入派发函数。 */
 	u64 packed = ((u64)enq_cpu << 32) | enq_llc;
 	enqueue_dsq_dispatch(p, enq_flags, packed);
 
@@ -2529,24 +2531,24 @@ static __noinline void enqueue_wakeup_path(
  * kfunc 之后活跃：p(r6)、enq_flags(r7)、enq_cpu(r8)、hot(r9) = 4 个被调用者保存寄存器。
  * 从 enqueue_wakeup_path 消除 2 次溢出。受 EEVDF 启发：
  * 内核从 rq 结构体推导 CPU 并传给 enqueue_entity。 */
-/* 讲解：入口只负责取 hot 并按 staged/flags 三分支路由到具体入队路径。 */
+/* 入口只负责取 hot 并按 staged/flags 三分支路由到具体入队路径。 */
 static __noinline void enqueue_body(struct task_struct *p, u64 enq_flags)
 {
 	u32 enq_cpu = bpf_get_smp_processor_id() & (CAKE_MAX_CPUS - 1);
 	struct cake_task_hot *hot = get_task_hot(p);
 	u64 staged = hot ? hot->staged_vtime_bits : 0;
 
-	/* 无有效暂存值：走冷路径 nostaged。讲解：首次派发或内核线程通常在此。 */
+	/* 无有效暂存值：走冷路径 nostaged。首次派发或内核线程通常在此。 */
 	if (unlikely(!(staged & (1ULL << STAGED_BIT_VALID)))) {
 		enqueue_nostaged(p, enq_flags);
 		return;
 	}
-	/* 非唤醒且非抢占：让出/时间片耗尽的重入队。讲解：区别对待可复用暂存的 vtime。 */
+	/* 非唤醒且非抢占：让出/时间片耗尽的重入队。区别对待可复用暂存的 vtime。 */
 	if (!(enq_flags & (SCX_ENQ_WAKEUP | SCX_ENQ_PREEMPT))) {
 		enqueue_requeue_path(p, enq_flags, hot, enq_cpu);
 		return;
 	}
-	/* 其余为唤醒/抢占：走主热路径。讲解：占约 90% 的最常见分支。 */
+	/* 其余为唤醒/抢占：走主热路径。占约 90% 的最常见分支。 */
 	enqueue_wakeup_path(p, enq_flags, hot, enq_cpu);
 }
 
@@ -2556,8 +2558,9 @@ static __noinline void enqueue_body(struct task_struct *p, u64 enq_flags)
 /* Enqueue——极薄的 struct_ops 桩函数 → __noinline enqueue_body。
  * 桩函数把 BPF struct_ops 的参数提取与核心逻辑隔离开。
  * enqueue_body 获得独立寄存器帧（规则23：0 次溢出）。 */
-/* 讲解：入口桩只负责取参并转调实际逻辑，保证寄存器分配干净。
-20260709184618 */
+/*
+入队时执行这个回调
+入口桩只负责取参并转调实际逻辑，保证寄存器分配干净。 */
 void BPF_STRUCT_OPS(cake_enqueue, struct task_struct *p, u64 enq_flags)
 {
 #ifndef CAKE_RELEASE
@@ -3400,7 +3403,7 @@ static __noinline void stopping_quantum_pack(
  *（由 cake_running 从 task_struct 字段暂存）。
  *
  * 成本：get_task_ctx（约 29ns）+ arena CL0 读取（约 4ns）+ 工作（约 15ns）。 */
-/* 讲解：任务停止运行时的回调，是记账、重分类、推进 vtime、打包下次调度信息的枢纽。 */
+/* 讲解：任务停止运行时（下cpu)的回调，是记账、重分类、推进 vtime、打包下次调度信息的枢纽。 */
 void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 {
 #ifndef CAKE_RELEASE
@@ -3647,14 +3650,14 @@ void BPF_STRUCT_OPS(cake_stopping, struct task_struct *p, bool runnable)
 		/* Phase 7A: rc moved inside stopping_drr_classify.
 		 * Read post-increment counter and subtract 1 to match. */
 		/* 阶段7A：rc 已移入 stopping_drr_classify。
-		 * 读取后递增计数器并减 1 以对齐。讲解：区分本次是重分类还是被采样跳过。 */
+		 * 读取后递增计数器并减 1 以对齐。区分本次是重分类还是被采样跳过。 */
 		if (((hot->reclass_counter - 1) & 63) == 0)
 			s->nr_stop_classify++;
 		else
 			s->nr_stop_confidence_skip++;
 
 		/* BenchLab trigger (cold — only fires on TUI demand) */
-		/* BenchLab 触发器（冷路径——仅在 TUI 请求时触发）。讲解：按需运行 kfunc 微基准。 */
+		/* BenchLab 触发器（冷路径——仅在 TUI 请求时触发）。按需运行 kfunc 微基准。 */
 		if (unlikely(bench_request)) {
 			bench_request = 0;
 			run_kfunc_bench(&bench_results, p);
