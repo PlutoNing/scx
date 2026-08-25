@@ -86,6 +86,8 @@ struct Opts {
     /// (--autopower, --performance, --powersave, --balanced,
     /// --no-core-compaction) cannot be used with this option. When no option
     /// is specified, this is a default mode.
+    /// 
+    /* 自动决定调度器的省电模式 */
     #[clap(long = "autopilot", action = clap::ArgAction::SetTrue)]
     autopilot: bool,
 
@@ -102,6 +104,7 @@ struct Opts {
     /// This option cannot be used with other conflicting options (--autopilot,
     /// --autopower, --balanced, --powersave, --no-core-compaction)
     /// affecting the use of core compaction.
+    /* 开启性能模式 */
     #[clap(long = "performance", action = clap::ArgAction::SetTrue)]
     performance: bool,
 
@@ -116,14 +119,19 @@ struct Opts {
     /// and performance. This option cannot be used with other conflicting
     /// options (--autopilot, --autopower, --performance, --powersave,
     /// --no-core-compaction) affecting the use of core compaction.
+    /// /* balanced / powersave / performance 控制核心压缩策略。核心压缩 = 
+    /// 把任务集中到少数 CPU，让其余核深度休眠省电。performance 模式关闭压缩，
+    /// 所有核全开；powersave 激进压缩；balanced 居中。 */
     #[clap(long = "balanced", action = clap::ArgAction::SetTrue)]
     balanced: bool,
 
     /// Maximum scheduling slice duration in microseconds.
+    /// 最大调度片时长
     #[clap(long = "slice-max-us", default_value = "5000")]
     slice_max_us: u64,
 
     /// Minimum scheduling slice duration in microseconds.
+    /// 保证运行500us?时间片下限，延迟敏感任务的最短片长
     #[clap(long = "slice-min-us", default_value = "500")]
     slice_min_us: u64,
 
@@ -132,6 +140,10 @@ struct Opts {
     /// the same per-capacity load as non-turbulent CPUs. Values below 100
     /// route fewer tasks to turbulent CPUs; values above 100 route more.
     /// Range: 0-200. Default: 100.
+    /// 针对"turbulent CPU"（波动大、延迟不稳定的核心，比如 SMT 竞争激烈的核）
+    /// 的负载目标。100 = 和普通核持平，< 100 = 少派任务给它，> 100 = 多派。这是
+    ///  LAVD 感知延迟波动的核心机制之一。
+    /// 这里的smt竞争激烈不也是调度决策的结果? 除非用户绑核什么的?
     #[clap(long = "lat-load-target-pct", default_value = "100", value_parser=Opts::lat_load_target_pct_range)]
     lat_load_target_pct: u16,
 
@@ -141,6 +153,9 @@ struct Opts {
     /// on the is_stealer/is_stealee thresholds for more predictable load balancing.
     /// Default is 0 (disabled, uses dynamic threshold based on load with both
     /// probabilistic and force task stealing enabled). This is an experimental feature.
+    /// （默认 0，实验性） 负载迁移的阈值百分比。默认关闭时，LAVD 用动态阈值 + 概率性抢占（force task stealing）
+    /// 做负载均衡。开启后改为固定比例阈值，同时关闭 force stealing，换来更可预测的迁移行为，
+    /// 适合需要稳定调度的场景调试。
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
 
@@ -149,6 +164,8 @@ struct Opts {
     /// the maximum per-domain utilization is below this percentage.
     /// Default is 25 (skip periodic LB below 25% utilization).
     /// Set to 0 to disable. Set to 100 to always skip periodic LB.
+    ///（默认 25） 全局周期性负载均衡的跳过阈值。当所有域最高利用率低于 25% 时跳过
+    /// 周期 LB——低负载下没必要费劲均衡，减少开销。
     #[clap(long = "lb-low-util-pct", default_value = "25", value_parser=Opts::lb_low_util_pct_range)]
     lb_low_util_pct: u8,
 
@@ -158,6 +175,9 @@ struct Opts {
     /// the per-CPU utilization is below this percentage.
     /// Default is 10 (bypass deadline scheduling below 10% utilization).
     /// Set to 0 to disable. Set to 100 to always bypass deadline scheduling.
+
+    ///  Deadline 调度的旁路阈值。单 CPU 利用率低于 10% 时直接走本地 DSQ（FIFO），
+    /// 跳过 vtime/deadline 排序计算。低负载下竞争少，FIFO 就够用，省 overhead。
     #[clap(long = "lb-local-dsq-util-pct", default_value = "10", value_parser=Opts::lb_local_dsq_util_pct_range)]
     lb_local_dsq_util_pct: u8,
 
@@ -168,6 +188,7 @@ struct Opts {
     /// vtime task. This helps improve responsiveness for pinned tasks. By default,
     /// this option is on with a default value of 5000 (5 msec). To turn off the option,
     /// explicitly set the value to 0.
+    /// 有 CPU 亲和性任务（pinned task）运行时，所有任务统一使用的片长，设 0 关闭
     #[clap(long = "pinned-slice-us", default_value = "5000")]
     pinned_slice_us: Option<u64>,
 
@@ -175,6 +196,8 @@ struct Opts {
     /// tasks. When N is given as an argument, P is 0.5^N * 100. The default
     /// value is 6, which limits the preemption for the top 1.56% of
     /// latency-critical tasks.
+    /// （默认 6） 控制允许抢占的任务比例：P = 0.5^N × 100%。默认 N=6 → 只有前
+    ///  1.56% 最延迟敏感的任务才有资格抢占。防止抢占过于激进导致吞吐下降。N 越大限制越严，N 越小越多任务可抢占。
     #[clap(long = "preempt-shift", default_value = "6", value_parser=Opts::preempt_shift_range)]
     preempt_shift: u8,
 
@@ -183,6 +206,7 @@ struct Opts {
     /// (i.e., balanced or powersave mode is specified as an option or chosen
     /// in the autopilot or autopower mode). When "--cpu-pref-order" is given,
     /// it implies "--no-use-em".
+    /// 核心压缩时优先使用哪些核（比如优先 P-core 而非 E-core）。指定此项隐含 --no-use-em
     #[clap(long = "cpu-pref-order", default_value = "")]
     cpu_pref_order: String,
 
@@ -201,10 +225,13 @@ struct Opts {
     no_fast_lb: bool,
 
     /// Disable preemption.
+    /// 完全关闭抢占，退化为协作式调度。
     #[clap(long = "no-preemption", action = clap::ArgAction::SetTrue)]
     no_preemption: bool,
 
     /// Disable an optimization for synchronous wake-up.
+    /// 关闭同步唤醒优化。同步唤醒（wake sync）是指 waker 把 wakee 直接派到
+    /// 自己的 CPU 上以利用热缓存，关掉后走常规路径。
     #[clap(long = "no-wake-sync", action = clap::ArgAction::SetTrue)]
     no_wake_sync: bool,
 
@@ -240,6 +267,7 @@ struct Opts {
     /// the autopilot or autopower mode). This option cannot be used with the
     /// other options that control the core compaction (--autopilot,
     /// --autopower, --performance, --balanced, --powersave).
+    /// 强制关闭压缩，使用所有在线 CPU，与上述功耗模式互斥。
     #[clap(long = "no-core-compaction", action = clap::ArgAction::SetTrue)]
     no_core_compaction: bool,
 
@@ -477,6 +505,7 @@ impl<'a> Scheduler<'a> {
 
         // Enable futex tracing using ftrace if available. If the ftrace is not
         // available, use tracepoint, which is known to be slower than ftrace.
+        /* 挂载记录拿锁情况的钩子 */
         if !opts.no_futex_boost {
             if Self::attach_futex_ftraces(&mut skel)? == false {
                 info!("Fail to attach futex ftraces. Try with tracepoints.");
@@ -537,6 +566,8 @@ impl<'a> Scheduler<'a> {
         })
     }
 
+    /* trace这些函数
+    拿锁的进程被标记? */
     fn attach_futex_ftraces(skel: &mut OpenBpfSkel) -> Result<bool> {
         let ftraces = vec![
             ("__futex_wait", &skel.progs.fexit___futex_wait),

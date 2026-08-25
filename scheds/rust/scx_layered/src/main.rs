@@ -107,13 +107,17 @@ const NR_LLC_LSTATS: usize = bpf_intf::llc_layer_stat_id_NR_LLC_LSTATS as usize;
 
 const NR_LAYER_MATCH_KINDS: usize = bpf_intf::layer_match_kind_NR_LAYER_MATCH_KINDS as usize;
 
+/* 对 NVIDIA Management Library（NVIDIA 管理库，简称 NVML）的封装。NVML 是 NVIDIA 提供的一个 C 语言库，
+用于监控和管理 NVIDIA GPU（获取 GPU 利用率、温度、显存占用、功耗等信息）。 */
 static NVML: OnceCell<Nvml> = OnceCell::new();
 
 fn nvml() -> Result<&'static Nvml, NvmlError> {
     NVML.get_or_try_init(Nvml::init)
 }
 
+/* 声明"看起来像 static 但初始化表达式在编译期无法求值（非 const fn）"的全局变量。 */
 lazy_static! {
+    /* 把这些变量包装成只在第一次被访问时才真正求值（惰性初始化），并在内部用类似 OnceCell/Once 的机制保证线程安全、只初始化一次。 */
     static ref USAGE_DECAY: f64 = 0.5f64.powf(1.0 / USAGE_HALF_LIFE_F64);
     static ref DFL_DISALLOW_OPEN_AFTER_US: u64 = 2 * scx_enums.SCX_SLICE_DFL / 1000;
     static ref DFL_DISALLOW_PREEMPT_AFTER_US: u64 = 4 * scx_enums.SCX_SLICE_DFL / 1000;
@@ -685,6 +689,7 @@ enum CgroupEvent {
     },
 }
 
+/* 读取 proc */
 fn read_total_cpu(reader: &fb_procfs::ProcReader) -> Result<fb_procfs::CpuStat> {
     reader
         .read_stat()
@@ -693,6 +698,7 @@ fn read_total_cpu(reader: &fb_procfs::ProcReader) -> Result<fb_procfs::CpuStat> 
         .ok_or_else(|| anyhow!("Could not read total cpu stat in proc"))
 }
 
+/* 使用 fb procfs 库 */
 fn calc_util(curr: &fb_procfs::CpuStat, prev: &fb_procfs::CpuStat) -> Result<f64> {
     match (curr, prev) {
         (
@@ -747,6 +753,7 @@ fn copy_into_cstr(dst: &mut [i8], src: &str) {
     dst[0..bytes.len()].copy_from_slice(bytes);
 }
 
+/* 返回 bpf 定义的一组 cpu ctx */
 #[allow(clippy::needless_range_loop)]
 fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
     let mut cpu_ctxs = vec![];
@@ -837,13 +844,16 @@ impl<'b> Sub<&'b BpfStats> for &BpfStats {
     fn sub(self, rhs: &'b BpfStats) -> BpfStats {
         let vec_sub = |l: &[u64], r: &[u64]| l.iter().zip(r.iter()).map(|(l, r)| *l - *r).collect();
         BpfStats {
+            /* 减 gstats */
             gstats: vec_sub(&self.gstats, &rhs.gstats),
+            /* 减 lstats */
             lstats: self
                 .lstats
                 .iter()
                 .zip(rhs.lstats.iter())
                 .map(|(l, r)| vec_sub(l, r))
                 .collect(),
+            /* 减 lsums */
             lstats_sums: vec_sub(&self.lstats_sums, &rhs.lstats_sums),
             llc_lstats: self
                 .llc_lstats
@@ -913,6 +923,7 @@ struct Stats {
 
 impl Stats {
     #[allow(clippy::needless_range_loop)]
+    /* 读取 pmu 的内存带宽统计 */
     fn read_layer_membw_agg(cpu_ctxs: &[bpf_intf::cpu_ctx], nr_layers: usize) -> Vec<Vec<u64>> {
         let mut layer_membw_agg = vec![vec![0u64; NR_LAYER_USAGES]; nr_layers];
 
@@ -927,6 +938,7 @@ impl Stats {
         layer_membw_agg
     }
 
+    /* 这个 node 上面有多少 pin 的 usage */
     #[allow(clippy::needless_range_loop)]
     fn read_layer_node_pinned_usages(
         cpu_ctxs: &[bpf_intf::cpu_ctx],
@@ -934,6 +946,7 @@ impl Stats {
         nr_layers: usize,
         nr_nodes: usize,
     ) -> Vec<Vec<u64>> {
+        /* 每个 layer 在每个 node 的统计 */
         let mut usages = vec![vec![0u64; nr_nodes]; nr_layers];
 
         for cpu in 0..*NR_CPUS_POSSIBLE {
@@ -967,6 +980,7 @@ impl Stats {
         usages
     }
 
+    /* layer 全部进程的使用率? */
     #[allow(clippy::needless_range_loop)]
     fn read_layer_node_duty_raw(
         cpu_ctxs: &[bpf_intf::cpu_ctx],
@@ -1015,6 +1029,7 @@ impl Stats {
     ///
     /// Approximate per-task memory bandwidth using perf counters to measure _relative_ memory
     /// bandwidth usage.
+    /// 这里读取总的精确内存带宽
     fn resctrl_read_total_membw() -> Result<u64> {
         let mut total_membw = 0u64;
         for entry in WalkDir::new("/sys/fs/resctrl/mon_data")
@@ -1040,8 +1055,10 @@ impl Stats {
     ) -> Result<Self> {
         let nr_layers = skel.maps.rodata_data.as_ref().unwrap().nr_layers as usize;
         let nr_nodes = topo.nodes.len();
+        /*  */
         let cpu_ctxs = read_cpu_ctxs(skel)?;
         let bpf_stats = BpfStats::read(skel, &cpu_ctxs);
+        /*  */
         let pmu_membw = Self::read_layer_membw_agg(&cpu_ctxs, nr_layers);
 
         Ok(Self {
@@ -1095,6 +1112,7 @@ impl Stats {
         })
     }
 
+    /* 刷新? */
     fn refresh(
         &mut self,
         skel: &mut BpfSkel,
@@ -1161,6 +1179,7 @@ impl Stats {
             .iter()
             .map(|membw_agg| membw_agg[LAYER_USAGE_OPEN] + membw_agg[LAYER_USAGE_OWNED])
             .sum();
+        /* 读取 resctrl 内存带宽 */
         let resctrl_cur = Self::resctrl_read_total_membw()?;
         let factor = (resctrl_cur - resctrl_prev) as f64 / (pmu_cur - pmu_prev) as f64;
 
@@ -1197,6 +1216,7 @@ impl Stats {
         let cur_layer_membw: Vec<Vec<f64>> =
             compute_mem_diff(&cur_layer_membw_agg, &self.prev_layer_membw_agg);
 
+            /* 估算内存带宽 */
         let cur_layer_membw: Vec<Vec<f64>> = cur_layer_membw
             .iter()
             .map(|x| x.iter().map(|x| *x * factor).collect())
@@ -1504,6 +1524,7 @@ fn calc_peak_aware_target_range(
 }
 
 impl Layer {
+    /* 新建一个 layer */
     fn new(spec: &LayerSpec, topo: &Topology, core_order: &Vec<Vec<usize>>) -> Result<Self> {
         let name = &spec.name;
         let kind = spec.kind.clone();
@@ -1981,6 +2002,7 @@ impl<'a> Scheduler<'a> {
         let mut cgroup_regex_id = 0;
         let mut cgroup_regexes = HashMap::new();
 
+        /* 遍历每一个 layer 的 spec */
         for (spec_i, spec) in specs.iter().enumerate() {
             let layer = &mut skel.maps.bss_data.as_mut().unwrap().layers[spec_i];
 
@@ -2556,6 +2578,7 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /*  */
     fn init_llc_prox_map(skel: &mut BpfSkel, topo: &Topology) -> Result<()> {
         let num_proximity_maps = bpf_intf::consts_NUM_PROXIMITY_MAPS as usize;
         for prox_map_idx in 0..num_proximity_maps {
@@ -2617,6 +2640,7 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /*  */
     fn init(
         opts: &'a Opts,
         layer_specs: &[LayerSpec],
@@ -2828,6 +2852,7 @@ impl<'a> Scheduler<'a> {
         let ext_sched_class_addr = get_kallsyms_addr("ext_sched_class");
         let idle_sched_class_addr = get_kallsyms_addr("idle_sched_class");
 
+        /* 初始化内存带宽 pmu */
         let event = if membw_tracking {
             setup_membw_tracking(&mut skel)?
         } else {
@@ -2945,8 +2970,10 @@ impl<'a> Scheduler<'a> {
         // so that we can keep reusing the older map already pinned on scheduler
         // restarts.
         let layered_task_hint_map_path = &opts.task_hint_map;
+        /* 取得task_hint map */
         let hint_map = &mut skel.maps.scx_layered_task_hint_map;
         // Only set pin path if a path is provided.
+        /* 把task_hint map的路径设置到BPF中 */
         if !layered_task_hint_map_path.is_empty() {
             hint_map.set_pin_path(layered_task_hint_map_path).unwrap();
             rodata.task_hint_map_enabled = true;
@@ -2958,6 +2985,7 @@ impl<'a> Scheduler<'a> {
             rodata.enable_hi_fb_thread_name_match = true;
         }
 
+        /* 初始化 layers */
         let cgroup_regexes = Self::init_layers(&mut skel, &layer_specs, &topo)?;
         skel.maps.rodata_data.as_mut().unwrap().nr_cgroup_regexes = cgroup_regexes.len() as u32;
         Self::init_nodes(&mut skel, opts, &topo);
@@ -2992,6 +3020,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        /* 创建 perf 事件 */
         if membw_tracking {
             create_perf_fds(&mut skel, event)?;
         }
@@ -4103,6 +4132,7 @@ impl<'a> Scheduler<'a> {
             let input = ProgramInput {
                 ..Default::default()
             };
+            /* 调用 BPF 程序刷新层 CPU 掩码 */
             let prog = &mut self.skel.progs.refresh_layer_cpumasks;
             let _ = prog.test_run(input);
 
@@ -4260,6 +4290,7 @@ impl<'a> Scheduler<'a> {
         Ok(sys_stats)
     }
 
+    /* cgroup 创建的回调? */
     // Helper function to process a cgroup creation (common logic for walkdir and inotify)
     fn process_cgroup_creation(
         path: &Path,
@@ -4298,6 +4329,7 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /* 使用 inotify? */
     fn start_cgroup_watcher(
         shutdown: Arc<AtomicBool>,
         cgroup_regexes: HashMap<u32, Regex>,
@@ -4645,6 +4677,7 @@ struct HintLayerInfo {
     dsq_insert_below: Option<f64>,
 }
 
+/* 校验 layer 的限制 */
 fn verify_layer_specs(specs: &[LayerSpec]) -> Result<HashMap<u64, HintLayerInfo>> {
     let mut hint_to_layer_map = HashMap::<u64, (usize, String, Option<f64>, Option<f64>)>::new();
 
@@ -4934,11 +4967,13 @@ fn create_perf_fds(skel: &mut BpfSkel, event: u64) -> Result<()> {
     attr.set_disabled(0);
 
     let perf_events_map = &skel.maps.scx_pmu_map;
+    /* 获取 map 的 fd */
     let map_fd = unsafe { libbpf_sys::bpf_map__fd(perf_events_map.as_libbpf_object().as_ptr()) };
 
     let mut failures = 0u64;
 
     for cpu in 0..*NR_CPUS_POSSIBLE {
+        /* 创建 perf 事件 */
         let fd = unsafe { perf::perf_event_open(&mut attr as *mut _, -1, cpu as i32, -1, 0) };
         if fd < 0 {
             failures += 1;
@@ -4951,6 +4986,7 @@ fn create_perf_fds(skel: &mut BpfSkel, event: u64) -> Result<()> {
 
         let key = cpu as u32;
         let val = fd as u32;
+        /* 把 cpu 和事件存入 scx_pmu_map */
         let ret = unsafe {
             libbpf_sys::bpf_map_update_elem(
                 map_fd,
@@ -5081,6 +5117,7 @@ fn main(opts: Opts) -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    /* 启动 monitor 的线程 */
     if let Some(intv) = opts.monitor.or(opts.stats) {
         let shutdown_copy = shutdown.clone();
         let stats_columns = opts.stats_columns;

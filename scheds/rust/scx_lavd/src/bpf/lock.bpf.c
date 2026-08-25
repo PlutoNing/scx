@@ -14,6 +14,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+/* 如果有futex被拿了, frace hook会调用这个函数
+==========
+看来调度器可以在内核侧附加钩子，触发时修改bpf和scx相关变量 */
 static void __inc_futex_boost(struct cpu_ctx *cpuc)
 {
 	struct task_struct *p = bpf_get_current_task_btf();
@@ -52,6 +55,7 @@ static void __dec_futex_boost(struct cpu_ctx *cpuc)
 	 */
 }
 
+/* cpu当前进程拿锁了, 标记为boost */
 static void inc_futex_boost(void)
 {
 	__inc_futex_boost(NULL);
@@ -196,6 +200,7 @@ int BPF_PROG(fexit_futex_wake_op, u32 *uaddr1, unsigned int flags, u32 *uaddr2, 
 	return 0;
 }
 
+/* 附加上去的bpf钩子 */
 SEC("?fexit/futex_lock_pi")
 int BPF_PROG(fexit_futex_lock_pi, u32 *uaddr, unsigned int flags, ktime_t *time, int trylock, int ret)
 {

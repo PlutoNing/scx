@@ -38,22 +38,39 @@ pub struct CpuId {
     //   - llc_kernel_id: physical LLC domain ID provided by the kernel
     //     - core_rdx: a core under a LLC domain
     //       - cpu_rdx: a CPU under a core
+    /* numa_adx该 CPU 所属 NUMA 节点的全局绝对索引 */
     pub numa_adx: usize,
+    /* pd_adx 所属性能域（CPU 频率域）的全局绝对索引 */
     pub pd_adx: usize,
+    /* llc_adx所属 LLC（末级缓存/CCX）的全局绝对索引 */
     pub llc_adx: usize,
+    /* llc_rdxLLC 在当前 NUMA 节点下的相对索引 */
     pub llc_rdx: usize,
+    /* llc_kernel_id内核提供的物理 LLC ID */
     pub llc_kernel_id: usize,
+    /* core_rdx核心在 LLC 下的相对索引 */
     pub core_rdx: usize,
+    /* cpu_rdx该 CPU 在核心内的相对索引（0 = 物理核，>0 = SMT 超线程） */
     pub cpu_rdx: usize,
+    /* cpu_adxCPU 的全局绝对索引 */
     pub cpu_adx: usize,
+    /* smt_levelSMT 层级（0 = 非超线程，越大越靠后） */
     pub smt_level: usize,
+    /* cache_size 缓存大小 */
     pub cache_size: usize,
+    /* cpu_capCPU 算力容量（Capacity，反映芯片分档/大小核差异） */
     pub cpu_cap: usize,
+    /* big_core 是否为大核（true = 大核 / 非 Little 核） */
     pub big_core: bool,
+    /* turbo_core 是否为 Turbo 大核 */
     pub turbo_core: bool,
+    /* cpu_sibling SMT 兄弟 CPU 的绝对索引 */
     pub cpu_sibling: usize,
 }
 
+
+/* 用作 BTreeMap 的键，唯一标识一个计算域：同一 NUMA 节点
+ + 同一 LLC + 同类核（大核/小核）的 CPU 集合构成一个计算域。 */
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct ComputeDomainId {
     pub numa_adx: usize,
@@ -65,35 +82,51 @@ pub struct ComputeDomainId {
 
 #[derive(Debug, Clone)]
 pub struct ComputeDomain {
+    /* 本计算域的 ID（全局唯一递增） */
     pub cpdom_id: usize,
+    /* 对应的"另一类型"计算域 ID（大核对应最近小核域，反之亦然），用于大小核之间的快速查找 */
     pub cpdom_alt_id: Cell<usize>,
+    /* 该域包含的所有 CPU 绝对索引列表 */
     pub cpu_ids: Vec<usize>,
+    /* 邻居域映射：距离 → 邻居域 ID 列表，按环形排序便于任务窃取时保持局部性 */
     pub neighbor_map: RefCell<BTreeMap<usize, RefCell<Vec<usize>>>>,
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PerfCpuOrder {
+    /* 该档位能覆盖的最大性能容量上界 */
     pub perf_cap: usize,                 // performance in capacity
+    /* 该档位对应的系统利用率（perf_cap / tot_perf） */
     pub perf_util: f32,                  // performance in utilization, [0, 1]
+    /* 在该性能范围内优先使用的 CPU 列表（按偏好排序） */
     pub cpus_perf: RefCell<Vec<usize>>,  // CPU adx order within the performance range by @perf_cap
+    /* 超出该性能范围后需额外启用的 CPU 列表（溢出/扩展列表） */
     pub cpus_ovflw: RefCell<Vec<usize>>, // CPU adx order beyond @perf_cap
 }
 
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct CpuOrder {
+    /* 系统中所有 CPU 的掩码 */
     pub all_cpus_mask: Cpumask,
+    /* 按性能优先顺序排列的 CPU 拓扑信息列表 */
     pub cpuids: Vec<CpuId>,
+    /* 性能容量 → PerfCpuOrder 的表，用于根据负载选择最优 CPU */
     pub perf_cpu_order: BTreeMap<usize, PerfCpuOrder>,
+    /* 所有计算域的映射表 */
     pub cpdom_map: BTreeMap<ComputeDomainId, ComputeDomain>,
+    /* 各层级拓扑数量统计 */
     pub nr_cpus: usize,
     pub nr_cores: usize,
     pub nr_cpdoms: usize,
     pub nr_llcs: usize,
     pub nr_numa: usize,
+    /* 系统是否启用 SMT（超线程） */
     pub smt_enabled: bool,
+    /* 系统是否有大小核架构 */
     pub has_biglittle: bool,
+    /* 内核是否提供了能耗模型 */
     pub has_energy_model: bool,
 }
 
@@ -145,6 +178,14 @@ struct CpuOrderCtx {
 }
 
 impl CpuOrderCtx {
+    /* 
+    构建整个 CPU 排序信息。流程为：
+通过 CpuOrderCtx::new() 读取系统拓扑和能耗模型
+调用 build_topo_order(false) 生成性能优先的 CPU 顺序
+调用 build_topo_order(true) 生成省电优先的 CPU 顺序
+调用 build_cpdom() 构建计算域
+若有能耗模型，用 get_perf_cpu_order_table() 生成精确的性能档位表；否则用 get_fake_perf_cpu_order_table() 生成简化版本
+     */
     fn new(topology_args: Option<&scx_utils::TopologyArgs>, no_use_em: bool) -> Result<Self> {
         let topo = match topology_args {
             Some(args) => Topology::with_args(args)?,
@@ -173,6 +214,10 @@ impl CpuOrderCtx {
     }
 
     /// Build a CPU preference order based on its optimization target
+/* 遍历所有 NUMA → LLC → Core → CPU，构建 Vec<CpuId>，然后根据目标排序：
+省电模式（无大小核）：优先高算力 CPU，再按 SMT 层级排，让尽量少的核运行在高频
+省电模式（有大小核）：优先 LITTLE 小核（cpu_cap 升序），节省功耗
+性能模式（通用）：优先物理核（cpu_rdx=0），再优先高算力 CPU，充分利用所有大核 */
     fn build_topo_order(&self, prefer_powersave: bool) -> Option<Vec<CpuId>> {
         let mut cpu_ids = Vec::new();
         let smt_siblings = self.topo.sibling_cpus();
@@ -289,6 +334,11 @@ impl CpuOrderCtx {
     }
 
     /// Build a list of compute domains
+    /* 构建计算域
+按 (NUMA节点, LLC, 核心类型) 三元组将 CPU 分组为计算域
+用笛卡尔积计算每对计算域间的距离（核心类型差异 > NUMA 差异 > LLC 差异）
+对每个域的邻居列表进行环形排序（circular_sort）：使得相邻域在任务窃取时被优先访问，减少缓存行颠簸
+为每个域填充 cpdom_alt_id：找到同 LLC 下对应的另一种核（大核→小核，小核→大核），用于跨类型调度 */
     fn build_cpdom(cpu_ids: &Vec<CpuId>) -> Option<BTreeMap<ComputeDomainId, ComputeDomain>> {
         // Note that building compute domain is independent to CPU order
         // so it is okay to use any cpus_*.
@@ -399,6 +449,10 @@ impl CpuOrderCtx {
     }
 
     /// Circular sorting of a list from a starting point
+    
+    /* 环形排序
+给定起点 start 和其他域 ID，将它们按"距离起点的环形距离"从近到远排序。例如 8 个域排成一圈，
+从域 0 出发的顺序是 0, 1, 7, 2, 6, 3, 5, 4，保证任务窃取时优先访问最近的邻居。 */
     fn circular_sort(start: usize, the_rest: &Vec<usize>) -> Vec<usize> {
         // Create a full list including 'start'
         let mut list = the_rest.clone();
@@ -459,27 +513,34 @@ impl CpuOrderCtx {
 
 #[derive(Debug)]
 struct EnergyModelOptimizer<'a> {
+    /* 系统能耗模型引用 */
     // Energy model of performance domains
     em: &'a EnergyModel,
 
     // CPU preference order in a performance mode purely based on topology
+    /* 按拓扑顺序排列的 CPU 绝对索引，用于最终排序 */
     cpus_topological_order: Vec<usize>,
 
     // CPU preference order within a performance domain
+    /* 每个性能域内的 CPU 偏好顺序 */
     pd_cpu_order: BTreeMap<usize, RefCell<Vec<usize>>>,
 
     // Total performance capacity of the system
+    /* 系统总性能容量 */
     tot_perf: usize,
 
     // All possible combinations of performance domains & states
     // indexed by performance.
+    /* 所有可能的性能域+状态组合，以性能容量为键，保留相同性能下功耗最低的组合集 */
     pdss_infos: RefCell<BTreeMap<usize, RefCell<HashSet<PDSetInfo<'a>>>>>,
 
     // Performance domains and states to achieve a certain performance level,
     // which is derived from @pdss_infos.
+    /* 经过筛选后的"性能 → 最优域集合"表，最终用于构建 perf_cpu_order */
     perf_pdsi: RefCell<BTreeMap<usize, PDSetInfo<'a>>>,
 
     // CPU orders indexed by performance
+    /* 最终生成的性能档位 CPU 排序表 */
     perf_cpu_order: RefCell<BTreeMap<usize, PerfCpuOrder>>,
 }
 
@@ -550,6 +611,14 @@ impl<'a> EnergyModelOptimizer<'a> {
         }
     }
 
+    /* 第一步 gen_all_pds_combinations()：枚举所有性能域+P-state 的组合，用二分递归探索 0%~100%
+     利用率区间，对每种性能容量保留功耗最低的域集合。
+
+第二步 gen_perf_pds_table()：从上述组合中，针对 5%, 10%, 20%...100% 等利用率目标，各选一个最优的域集合
+（PDSetInfo），优先最小化活跃性能域数量（减少漏电），并最大化与前一档位的重叠（减少域切换开销）。
+
+第三步 assign_cpu_vids()：将每个性能档位的域集合映射到具体 CPU，生成按拓扑顺序排列的 cpus_perf
+（主要 CPU 列表）和 cpus_ovflw（超载溢出 CPU 列表），最终填入 perf_cpu_order 表中。 */
     fn get_perf_cpu_order_table(
         em: &'a EnergyModel,
         cpus_pf: &'a Vec<CpuId>,
@@ -1138,6 +1207,11 @@ impl<'a> PDSetInfo<'_> {
     /// cpuset with higher cache locality. Finally, we minimize the number of
     /// CPUs involved, thereby reducing the chance of contention for shared
     /// hardware resources (e.g., shared cache).
+    
+    
+    /* 优先最小化新增活跃性能域数（权重最大，PD_UNIT=1e8），其次最大化CPU 数量
+    （避免用太少 CPU），最后用最小 PD ID 作为平局决胜，整体目标是在性能档位切换时
+    降低功耗跳变和缓存热度损失。 */
     fn dist(&self, base: Option<&PDSetInfo<'a>>) -> usize {
         let nr_pds = self.pd_id_set.len();
         let nr_pds_overlap = match base {

@@ -126,6 +126,7 @@ enum consts_internal {
 };
 
 enum consts_flags {
+	/* cpu上面当前进程拿futex了, 要被boost */
 	LAVD_FLAG_FUTEX_BOOST		= (0x1 << 0), /* futex acquired or not */
 	LAVD_FLAG_NEED_LOCK_BOOST	= (0x1 << 1), /* need to boost lock for deadline calculation */
 	LAVD_FLAG_IS_GREEDY		= (0x1 << 2), /* task's overscheduling ratio compared to its nice priority */

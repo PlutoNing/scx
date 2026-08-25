@@ -868,6 +868,7 @@ pub fn server_data() -> StatsServerData<StatsReq, StatsRes> {
         )
 }
 
+/* monitor 线程函数 */
 pub fn monitor(
     intv: Duration,
     shutdown: Arc<AtomicBool>,

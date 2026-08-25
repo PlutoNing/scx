@@ -91,8 +91,43 @@ static inline void ___consts_sanity_check___(void) {
 }
 
 enum layer_kind {
+	/* 没有自己的地盘，哪里空闲去哪里
+Open 适合：
+
+默认兜底 layer；
+没有特殊隔离要求的普通任务；
+系统线程或通用 workload；
+希望尽可能利用全机空闲算力的任务。 */
 	LAYER_KIND_OPEN,
+	/* 有自己的地盘，但外面空闲时可以借
+	目标不是严格隔离，而是：
+
+平时把同组任务聚在一起；
+尽量保持缓存和拓扑局部性；
+系统有空闲算力时仍然保持 work-conserving；
+避免因为硬限制而让 CPU 闲着、任务却排队。
+
+适合：
+
+希望任务主要集中在部分 LLC/CPU；
+但不能接受任务排队时外部 CPU 闲置；
+前台服务、普通业务层；
+需要在局部性和吞吐量之间折中的任务。
+
+官方定义就是“类似 Confined，但允许在分配 CPU 之外存在空闲 CPU 时溢出”。*/
 	LAYER_KIND_GROUPED,
+	/* 有自己的地盘，原则上不许出去
+动态调整：
+平均每 CPU 利用率高于 90%：增加 CPU；
+低于 80%：减少 CPU；
+CPU 数量限制在 1～8。
+
+适合：
+
+后台任务、离线任务；
+希望压缩到少量 CPU 的任务；
+避免任务在整机迁移、污染 LLC；
+需要较强 CPU 隔离的 workload。 */
 	LAYER_KIND_CONFINED,
 };
 
@@ -195,6 +230,7 @@ struct cpu_ctx {
 	bool			is_protected;
 
 	u64			layer_usages[MAX_LAYERS][NR_LAYER_USAGES];
+	/* 这个 layer 的 pin 的 usage */
 	u64			node_pinned_usage[MAX_LAYERS];
 	u64			layer_membw_agg[MAX_LAYERS][NR_LAYER_USAGES];
 	u64			gstats[NR_GSTATS];

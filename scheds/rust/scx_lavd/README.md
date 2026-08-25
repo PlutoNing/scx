@@ -21,6 +21,7 @@ printing sampled scheduling decisions).
 interactivity and reduce stuttering while playing games on Linux. Hence, this
 scheduler's typical use case involves highly interactive applications, such as
 gaming, which requires high throughput and low tail latencies.
+减少长尾延迟
 
 ## Production Ready?
 
@@ -29,3 +30,4 @@ a separate scheduling domain per-LLC, per-core type (e.g., P or E core on
 Intel, big or LITTLE on ARM), and per-NUMA domain, so the default balanced
 profile or autopilot mode should be performant. It mainly targets single CCX
 / single-socket systems.
+ccx和socket不大一样

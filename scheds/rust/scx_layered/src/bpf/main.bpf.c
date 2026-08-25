@@ -36,13 +36,16 @@ const volatile u64 max_exec_ns;
 const volatile u32 nr_cpu_ids = 1;
 const volatile u32 nr_possible_cpus = 1;
 const volatile u64 numa_cpumasks[MAX_NUMA_NODES][MAX_CPUS / 64];
+/* 每个llc属于哪个node */
 const volatile u32 llc_numa_id_map[MAX_LLCS];
+/* 每个cpu属于哪个llc */
 const volatile u32 cpu_llc_id_map[MAX_CPUS];
 const volatile u32 nr_layers = 1;
 const volatile u32 nr_nodes = 32;	/* !0 for veristat, set during init */
 const volatile u32 nr_llcs = 32;	/* !0 for veristat, set during init */
 const volatile bool smt_enabled = true;
 const volatile bool has_little_cores = true;
+/* 也是在数组存sibling */
 const volatile s32 __sibling_cpu[MAX_CPUS];
 const volatile bool monitor_disable = false;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
@@ -86,6 +89,7 @@ u64 unprotected_seq = 0;
 
 private(all_cpumask) struct bpf_cpumask __kptr *all_cpumask;
 private(big_cpumask) struct bpf_cpumask __kptr *big_cpumask;
+/* 存储全部layer */
 struct layer layers[MAX_LAYERS];
 u32 fallback_cpus[MAX_NUMA_NODES];
 u32 layered_root_tgid = 0;
@@ -158,6 +162,7 @@ static __always_inline struct layer *lookup_layer(u32 id)
 	return &layers[id];
 }
 
+/* 每个layer在每个llc上有一个dsq */
 // return the dsq id for the layer based on the LLC id.
 static __noinline u64 layer_dsq_id(u32 layer_id, u32 llc_id)
 {
@@ -166,6 +171,7 @@ static __noinline u64 layer_dsq_id(u32 layer_id, u32 llc_id)
 
 // XXX - older kernels get confused by RCU state when subprogs are called from
 // sleepable functions. Use __always_inline.
+/* 每个llc负责一些cpu */
 static __always_inline u32 cpu_to_llc_id(s32 cpu_id)
 {
         const volatile u32 *llc_ptr;
@@ -178,6 +184,7 @@ static __always_inline u32 cpu_to_llc_id(s32 cpu_id)
         return *llc_ptr;
 }
 
+/* 每个llc属于哪个node */
 u32 llc_node_id(u32 llc_id)
 {
         const volatile u32 *llc_ptr;
@@ -190,11 +197,13 @@ u32 llc_node_id(u32 llc_id)
         return *llc_ptr;
 }
 
+/* high fallback dsq 也是每个llc有一个？ */
 static u64 hi_fb_dsq_id(u32 llc_id)
 {
 	return HI_FB_DSQ_BASE | llc_id;
 }
 
+/* low fallback dsq 也是每个llc有一个？ */
 static u64 lo_fb_dsq_id(u32 llc_id)
 {
 	return LO_FB_DSQ_BASE | llc_id;
@@ -212,6 +221,7 @@ struct {
 	__uint(max_entries, 1);
 } cpu_ctxs SEC(".maps");
 
+/* 每个cpu有一个cpu_ctx */
 static struct cpu_ctx *lookup_cpu_ctx(int cpu)
 {
 	struct cpu_ctx *cpuc;
@@ -251,6 +261,8 @@ struct {
  * the time until which the entry is valid. Entries are checked and
  * possibly removed at layer matching time, and updated when the GPU
  * API is used by a task group.
+ key是使用GPU的task group的tgid
+ value是该task group最近一次使用GPU API的时间戳
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -262,6 +274,8 @@ struct {
 
 /*
  * See comment for gpu_tgid - same mechanism, except for individual tasks.
+ key是使用GPU的task的tid
+ 与gpu_tgid的区别是，gpu_tgid是task group的tgid，而gpu_tid是task的tid
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -290,6 +304,7 @@ struct {
 	__uint(map_flags, 0);
 } node_data SEC(".maps");
 
+/* 每个node有一个node_ctx */
 static struct node_ctx *lookup_node_ctx(u32 node)
 {
 	struct node_ctx *nodec;
@@ -302,6 +317,7 @@ static struct node_ctx *lookup_node_ctx(u32 node)
 // XXX - Converting this to bss array triggers verifier bugs. See
 // BpfStats::read(). Should also be cacheline aligned which doesn't work with
 // the array map.
+/* 每个llc有一个llc_ctx */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, u32);
@@ -310,6 +326,7 @@ struct {
 	__uint(map_flags, 0);
 } llc_data SEC(".maps");
 
+/* 每个llc有一个llc_ctx */
 static struct llc_ctx *lookup_llc_ctx(u32 llc_id)
 {
 	struct llc_ctx *llcc;
@@ -379,6 +396,7 @@ struct {
 	__uint(map_flags, 0);
 } layer_node_cpumasks SEC(".maps");
 
+/* 每个layer在每个node上有一个cpumask */
 static struct cpumask *lookup_layer_node_cpumask(u32 layer_id, u32 node_id)
 {
 	struct layer_node_cpumask_wrapper *w;
@@ -392,6 +410,7 @@ static struct cpumask *lookup_layer_node_cpumask(u32 layer_id, u32 node_id)
 	return NULL;
 }
 
+/*  */
 static struct cpumask *lookup_layer_cpumask(u32 layer_id)
 {
 	struct layer_cpumask_wrapper *cpumaskw;
@@ -404,6 +423,7 @@ static struct cpumask *lookup_layer_cpumask(u32 layer_id)
 	}
 }
 
+/* 每个layer有一个cpuset */
 static struct bpf_cpumask *lookup_layer_cpuset(u32 layer_id)
 {
 	struct layer_cpumask_wrapper *cpumaskw;
@@ -473,6 +493,7 @@ static inline bool refresh_layer_cpuc(struct cpu_ctx *cpuc, struct layer *layer)
 /*
  * Create a bpf_cpumask for the layer out of the serialized cpuset store by userspace.
  * Deserialization logic identical to refresh_cpumasks.
+ 创建一个bpf_cpumask用于layer，逻辑与refresh_cpumasks相同
  */
 static void layer_cpuset_bpfmask(int layer_id)
 {
@@ -514,12 +535,14 @@ __weak s32 refresh_cpumasks(u32 layer_id)
 	struct cpu_ctx *cpuc;
 	int cpu, llc_id;
 
+	/* 获取layer */
 	layer = MEMBER_VPTR(layers, [layer_id]);
 	if (!layer) {
 		scx_bpf_error("can't happen");
 		return 0;
 	}
 
+	/* 如果 */
 	if (!__sync_val_compare_and_swap(&layer->refresh_cpus, 1, 0))
 		return 0;
 
@@ -601,6 +624,7 @@ __weak s32 refresh_cpumasks(u32 layer_id)
 	 * LLC without draining enabled. Either they see 0 nr_llcs_cpus and
 	 * enable drain or we see the task it enqueued and enable drain.
 	 */
+	 /*为什么这个函数这么多分支和loop也能过verifier */
 	bpf_for(llc_id, 0, nr_llcs) {
 		if (layer->nr_llc_cpus[llc_id])
 			layer_llc_drain_disable(layer, llc_id);
@@ -630,6 +654,7 @@ static __always_inline void maybe_refresh_layer_cpumasks()
 
 /*
  * Refreshes all layer cpumasks, this is called via BPF_PROG_RUN from userspace.
+ 用户态调用这个函数，更新所有layer的cpumask
  */
 SEC("syscall")
 int BPF_PROG(refresh_layer_cpumasks)
@@ -699,6 +724,7 @@ struct task_ctx {
 	u64			running_at;
 	u64			runtime_avg;
 	u64			duty_cycle;	/* EWMA, 1.0 = 1 << DUTY_CYCLE_SHIFT */
+	/* 上次 update duty_cycle 的时间 */
 	u64			last_stopped_at;
 	u64			dsq_id;
 	u32			llc_id;
@@ -729,6 +755,7 @@ static struct task_ctx *lookup_task_ctx_may_fail(struct task_struct *p)
 	return bpf_task_storage_get(&task_ctxs, p, 0, 0);
 }
 
+/* 获取task_ctx */
 static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 {
 	struct task_ctx *taskc = lookup_task_ctx_may_fail(p);
@@ -739,6 +766,7 @@ static struct task_ctx *lookup_task_ctx(struct task_struct *p)
 	return taskc;
 }
 
+/* 获取task_hint */
 static struct task_hint *lookup_task_hint(struct task_struct *p)
 {
 	struct task_hint *hint;
@@ -752,6 +780,7 @@ static struct task_hint *lookup_task_hint(struct task_struct *p)
 	return hint;
 }
 
+/* 从task hint map查hint， 然后从hint_to_layer_id_map查layer_id */
 static struct hint_layer_info *lookup_task_hint_layer_id(struct task_struct *p) {
 	struct task_hint *hint;
 	u32 hint_val;
@@ -779,6 +808,7 @@ static bool is_task_layer_hint_stale(struct task_struct *p, struct task_ctx *tas
 	return taskc->layer_id != info->layer_id;
 }
 
+/* 根据task hint，决定是否需要切换layer */
 static void maybe_refresh_task_layer_from_hint(struct task_struct *p, struct task_ctx *taskc)
 {
 	struct hint_layer_info *info;
@@ -791,6 +821,7 @@ static void maybe_refresh_task_layer_from_hint(struct task_struct *p, struct tas
 	if (taskc->refresh_layer)
 		return;
 
+	/* 获取task的layer_id */
 	info = lookup_task_hint_layer_id(p);
 	if (!info)
 		return;
@@ -822,7 +853,9 @@ static void maybe_refresh_task_layer_from_hint(struct task_struct *p, struct tas
 		}
 	}
 
-	/* All conditions satisfied for layer matching. */
+	/* All conditions satisfied for layer matching.
+	 * 如果需要切换layer，则切换到新的layer
+	 */
 	if (switch_layer)
 		switch_to_layer(p, taskc, info->layer_id, scx_bpf_now());
 }
@@ -1678,6 +1711,7 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	if (!(cpuc = lookup_cpu_ctx(-1)) || !(taskc = lookup_task_ctx(p)))
 		return prev_cpu;
 
+		/* 查查hint，看看是不是得切换layer */
 	maybe_refresh_task_layer_from_hint(p, taskc);
 	/*
 	 * We usually update the layer in layered_runnable() to avoid confusion.
@@ -1885,6 +1919,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 
 	/* Only invoke if we never went through select_cpu path. */
+	/* 如果enq_flags没有设置，则查查hint，看看是不是得切换layer */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags))
 		maybe_refresh_task_layer_from_hint(p, taskc);
 
@@ -2259,6 +2294,7 @@ static void account_used(struct task_struct *p, struct cpu_ctx *cpuc, struct tas
 		cpuc->layer_membw_agg[task_lid][LAYER_USAGE_OPEN] += bytes;
 	}
 
+	/*  */
 	if (taskc->pinned_node < MAX_NUMA_NODES)
 		cpuc->node_pinned_usage[task_lid] += used;
 
@@ -2885,6 +2921,7 @@ replenish:
 static void update_duty_cycle(struct cpu_ctx *cpuc, struct task_ctx *taskc,
 			      u64 now)
 {
+	/*  */
 	u64 period = now - taskc->last_stopped_at;
 
 	if (period > 0) {
@@ -3239,6 +3276,7 @@ int match_layer(u32 layer_id, struct task_ctx *taskc,
 	return -ENOENT;
 }
 
+/* 切换到新的layer */
 static void switch_to_layer(struct task_struct *p, struct task_ctx *taskc, u64 layer_id, u64 now)
 {
 	struct cpu_ctx *cpuc;
@@ -3262,7 +3300,9 @@ static void switch_to_layer(struct task_struct *p, struct task_ctx *taskc, u64 l
 	    !(llcc = lookup_llc_ctx(cpuc->llc_id)))
 		return;
 
+	/* 更新task的layer_id */
 	taskc->layer_id = layer_id;
+	/* 更新task的llc_id， 确实是以layer和llc为基础 */
 	taskc->llc_id = cpuc->llc_id;
 	taskc->layered_cpus.seq = -1;
 	taskc->layered_cpus_llc.seq = -1;
@@ -3276,6 +3316,7 @@ static void switch_to_layer(struct task_struct *p, struct task_ctx *taskc, u64 l
 		if (layer->member_expire_ms)
 			taskc->recheck_layer_membership = now + layer->member_expire_ms * 1000 * 1000;
 	}
+	/* 更新layer的task数量 */
 	__sync_fetch_and_add(&layer->nr_tasks, 1);
 
 	refresh_cpus_flags(taskc, p->cpus_ptr);
@@ -3295,6 +3336,7 @@ static void switch_to_layer(struct task_struct *p, struct task_ctx *taskc, u64 l
 	p->scx.dsq_vtime = llcc->vtime_now[layer_id];
 }
 
+/* 可能刷新layer */
 static void maybe_refresh_layer(struct task_struct *p __arg_trusted, struct task_ctx *taskc, u64 now)
 {
 	const char *cgrp_path;
@@ -3512,7 +3554,7 @@ void on_wakeup(struct task_struct *p, struct task_ctx *taskc)
 	lstat_inc(LSTAT_XLAYER_WAKE, layer, cpuc);
 }
 
-
+/* 当task被加入到队列时，更新task的layer_id */
 void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
@@ -4663,6 +4705,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 	if (ret < 0)
 		return ret;
 
+	/* 安装带宽统计事件 */
 	if (membw_event) {
 		ret = scx_pmu_install(membw_event);
 		if (ret)

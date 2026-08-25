@@ -1197,13 +1197,13 @@ struct cake_stats {
 /* 调度器运行状态——由 Rust TUI 设置，BPF 热路径读取。
  * 优先级：GAMING > COMPILATION > IDLE。
  * 由用户态写入 sched_state 这个 BSS u32，BPF 侧只读。 */
-/* 讲解：整个调度行为（类别、权重、时间片上限、频率提升）都随该状态切换。 */
+/* 整个调度行为（类别、权重、时间片上限、频率提升）都随该状态切换。 */
 #define CAKE_STATE_IDLE        0  /* Fair, unthrottled — desktop/browsing */
-				  /* 空闲态：公平、不限流——桌面/浏览。讲解：基线行为，仅 NORMAL/HOG。 */
+				  /* 空闲态：公平、不限流——桌面/浏览。基线行为，仅 NORMAL/HOG。 */
 #define CAKE_STATE_COMPILATION 1  /* Compile jobs: 8ms bulk ceiling, no squeeze */
-				  /* 编译态：批处理上限 8ms，不压制。讲解：为构建局部性做集群协同调度。 */
+				  /* 编译态：批处理上限 8ms，不压制。为构建局部性做集群协同调度。 */
 #define CAKE_STATE_GAMING      2  /* Game mode: HOG+bg squeeze, Gate 1P active */
-				  /* 游戏态：压制 HOG+后台，启用 Gate 1P。讲解：完整优先级系统生效。 */
+				  /* 游戏态：压制 HOG+后台，启用 Gate 1P。完整优先级系统生效。 */
 
 /* Gate 1C-P / Gate 1P: adaptive preemption thresholds.
  * STANDARD: 100µs — hog has done meaningful work before yielding to normal tasks.
@@ -1222,7 +1222,7 @@ struct cake_stats {
  *       标准阈值阻止它从跑不到 100µs 的大户手里收回归属 CPU。50µs 既保证
  *       大户拿到合理时间片，又让 VIP 避免约 10-40ns 的 L3 迁移代价。
  *       通过 STAGED_BIT_GAME_MEMBER 选择（已在寄存器里，约 0ns）。 */
-/* 讲解：对游戏关键线程用更低的抢占门槛，快速夺回其“家”CPU，减少代价高昂的迁移。 */
+/* 对游戏关键线程用更低的抢占门槛，快速夺回其“家”CPU，减少代价高昂的迁移。 */
 #define CAKE_PREEMPT_YIELDER_THRESHOLD_NS (100 * 1000) /* 100µs — normal tasks */
 						       /* 普通任务抢占阈值 100µs。讲解：平衡收益与切换成本。 */
 #define CAKE_PREEMPT_VIP_THRESHOLD_NS      (50 * 1000) /*  50µs — game family VIPs */

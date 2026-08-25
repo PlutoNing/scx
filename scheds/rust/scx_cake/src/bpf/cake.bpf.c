@@ -191,13 +191,13 @@ u32 bench_xorshift_state = 0xDEADBEEF;
 
 /* F2 FIX: 256-bit CPU mask support for Threadripper/EPYC */
 /* F2 修复：支持 256 位 CPU 掩码，兼容 Threadripper/EPYC。 */
-/* 讲解：高核数平台超过 64 核，需用 u64[4] 表示完整的 CPU 掩码。 */
+/* 高核数平台超过 64 核，需用 u64[4] 表示完整的 CPU 掩码。 */
 #define CAKE_CPU_MASK_WORDS (CAKE_MAX_CPUS / 64)
 			    /* 掩码字数 = 最大 CPU 数 / 64。讲解：256/64=4，即用 4 个 u64。 */
 
 /* Heterogeneous Routing Masks — u64[4] for 256 CPUs */
 /* 异构路由掩码——用 u64[4] 覆盖 256 个 CPU */
-/* 讲解：区分大核/小核/V-Cache 等，用于按硬件特性选核。 */
+/* 区分大核/小核/V-Cache 等，用于按硬件特性选核。 */
 const u64  big_core_phys_mask[CAKE_CPU_MASK_WORDS] = {};
 			/* 大核（物理）掩码。讲解：Intel 混合架构的 P 核物理核。 */
 const u64  big_core_smt_mask[CAKE_CPU_MASK_WORDS]  = {};
@@ -214,7 +214,7 @@ const bool has_hybrid_cores   = false; /* Set by loader — gate for Gate 2 scan
  * All CPUs run at full speed during GAMING. */
 /* has_cpuperf_control 已移除：768/1024 的 cpuperf 缩放被取消。
  * 游戏期间所有 CPU 都以全速运行。 */
-/* 讲解：简化频率策略，游戏时不再区分档位，全部拉满。 */
+/* 简化频率策略，游戏时不再区分档位，全部拉满。 */
 
 /* Audio stack TGIDs — detected once at startup, baked into RODATA.
  * PipeWire/PulseAudio/JACK daemons + PipeWire socket clients (mixers like
@@ -226,7 +226,7 @@ const bool has_hybrid_cores   = false; /* Set by loader — gate for Gate 2 scan
  *（如 goxlr-daemon、easyeffects 这类混音器）。会话期内稳定
  *（登录时启动、注销前 PID 不变）。JIT 会把它们折叠成立即数。
  * 以 0 结尾：未用槽位为 0（不会有合法 TGID 匹配 pid 0）。 */
-/* 讲解：游戏时把音频进程提升到 GAME 优先级，保证声音与画面延迟一致、不爆音。 */
+/* 游戏时把音频进程提升到 GAME 优先级，保证声音与画面延迟一致、不爆音。 */
 const u32 nr_audio_tgids = 0;
 const u32 audio_tgids[CAKE_MAX_AUDIO_TGIDS] = {};
 
@@ -237,7 +237,7 @@ const u32 audio_tgids[CAKE_MAX_AUDIO_TGIDS] = {};
 /* 合成器 TGID——启动时检测一次，烘焙进 RODATA。
  * Wayland 合成器（kwin_wayland、mutter、sway、Hyprland 等）负责每帧
  * 呈现到显示器，游戏期间必须及时派发。与音频守护进程一样会话期内稳定。 */
-/* 讲解：合成器决定画面何时上屏，游戏时给它 GAME 优先级以保证呈现延迟对等。 */
+/* 合成器决定画面何时上屏，游戏时给它 GAME 优先级以保证呈现延迟对等。 */
 const u32 nr_compositor_tgids = 0;
 const u32 compositor_tgids[CAKE_MAX_COMPOSITOR_TGIDS] = {};
 
@@ -259,20 +259,20 @@ const u32 compositor_tgids[CAKE_MAX_COMPOSITOR_TGIDS] = {};
  *   - 调试版：128B/CPU（2 缓存行）——CL0 遥测 + CL1 BenchLab 交接
  *   - 只需 1 个 BSS 全局指针、1 个 TLB 项、1 次空指针检查
  * ═══════════════════════════════════════════════════════════════════════════ */
-/* 讲解：把每 CPU 的邮箱合并成一整块 arena 分配，减少指针、TLB 项与判空的数量。 */
+/* 把每 CPU 的邮箱合并成一整块 arena 分配，减少指针、TLB 项与判空的数量。 */
 struct cake_per_cpu {
 	struct mega_mailbox_entry
 		mbox; /* release: 64B (1 CL), debug: 128B (2 CL) */
-		      /* 发布：64B（1 缓存行），调试：128B（2 缓存行）。讲解：尺寸随构建模式变化。 */
+		      /* 发布：64B（1 缓存行），调试：128B（2 缓存行）。尺寸随构建模式变化。 */
 } __attribute__((aligned(CAKE_MBOX_ALIGN)));
 _Static_assert(sizeof(struct cake_per_cpu) == CAKE_MBOX_SIZE,
 	       "cake_per_cpu must match CAKE_MBOX_SIZE for per-CPU isolation");
-	       /* 讲解：编译期断言尺寸正确，保证每 CPU 块严格隔离在各自缓存行。 */
+	       /* 编译期断言尺寸正确，保证每 CPU 块严格隔离在各自缓存行。 */
 struct cake_per_cpu __arena *per_cpu;
 
 /* Global stats BSS array - 0ns lookup vs 25ns helper, 256-byte aligned per CPU */
 /* 全局统计 BSS 数组——查表 0ns（对比辅助函数 25ns），每 CPU 按 256 字节对齐。 */
-/* 讲解：直接索引 BSS 数组比调用 per-cpu kfunc 快得多，对齐则避免跨 CPU 伪共享。 */
+/* 直接索引 BSS 数组比调用 per-cpu kfunc 快得多，对齐则避免跨 CPU 伪共享。 */
 struct cake_stats global_stats[CAKE_MAX_CPUS] SEC(".bss")
 	__attribute__((aligned(256)));
 
@@ -286,12 +286,12 @@ struct cake_stats global_stats[CAKE_MAX_CPUS] SEC(".bss")
  * 永久跳过对共享 DSQ 的检查。实测 1880 万次跳过，使
  * 操作系统线程（ksoftirqd、rcu）饿死达 6.5 秒。
  * 现改用 cake_dispatch 中 O(1) 的 scx_bpf_dsq_nr_queued()。 */
-/* 讲解：过度“优化”的缓存提示反而导致饥饿，改回精确的队列计数才正确。 */
+/* 过度“优化”的缓存提示反而导致饥饿，改回精确的队列计数才正确。 */
 
 
 /* BSS tail guard - absorbs BTF truncation bugs instead of corrupting real data */
 /* BSS 尾部护栏——吸收 BTF 截断类 bug，避免污染真实数据。 */
-/* 讲解：在 BSS 末尾放一段哨兵区，越界写入会落在这里而不是破坏有效数据。 */
+/* 在 BSS 末尾放一段哨兵区，越界写入会落在这里而不是破坏有效数据。 */
 u8 __bss_tail_guard[64] SEC(".bss") __attribute__((aligned(64)));
 
 /* pid_to_tctx (BPF_MAP_TYPE_HASH) removed — replaced by SEC("iter/task") cake_task_iter.
@@ -301,7 +301,7 @@ u8 __bss_tail_guard[64] SEC(".bss") __attribute__((aligned(64)));
 /* pid_to_tctx（哈希表）已移除——改用 SEC("iter/task") 的 cake_task_iter。
  * cake_init_task 与 cake_exit_task 现已完全无锁：不再有 map 更新/删除调用。
  * 用户态从 iter fd 读取定长的 cake_iter_record 记录，而不再遍历 65536 项的全局哈希表。 */
-/* 讲解：用 BPF iter 取代带全局锁的哈希表，让任务创建/销毁路径彻底无锁。 */
+/* 用 BPF iter 取代带全局锁的哈希表，让任务创建/销毁路径彻底无锁。 */
 
 
 
@@ -313,7 +313,7 @@ u8 __bss_tail_guard[64] SEC(".bss") __attribute__((aligned(64)));
  * BSS 加载不会产生 arena map 重定位——只有直接引用 &arena 才会。
  * 内联汇编约束把 &arena 强制放入寄存器（ld_imm64 重定位），
  * 且不产生栈存储。相比 volatile 写法是 2 条指令而非 3 条。 */
-/* 讲解：这是让验证器认得 arena map 的一个必要“把戏”，同时尽量少产生指令。 */
+/* 这是让验证器认得 arena map 的一个必要“把戏”，同时尽量少产生指令。 */
 #define ARENA_ASSOC() asm volatile("" : : "r"(&arena))
 
 static __always_inline struct cake_stats *get_local_stats(void)
@@ -329,7 +329,7 @@ static __always_inline struct cake_stats *get_local_stats(void)
  * when caller already has CPU ID in a register. */
 /* 规则30：当调用方已在寄存器里持有 CPU 号时，避免重复调用
  * bpf_get_smp_processor_id() 这个 kfunc（约 15ns 的跳板开销）。 */
-/* 讲解：提供一个直接传入 CPU 号的版本，省去重复取 CPU 号。 */
+/* 提供一个直接传入 CPU 号的版本，省去重复取 CPU 号。 */
 static __always_inline struct cake_stats *get_local_stats_for(u32 cpu)
 {
 	return &global_stats[cpu & (CAKE_MAX_CPUS - 1)];
@@ -337,7 +337,7 @@ static __always_inline struct cake_stats *get_local_stats_for(u32 cpu)
 
 /* User exit info for graceful scheduler exit */
 /* 用户退出信息，用于调度器优雅退出。 */
-/* 讲解：UEI 记录退出原因，卸载调度器时回传给用户态。 */
+/* UEI 记录退出原因，卸载调度器时回传给用户态。 */
 UEI_DEFINE(uei);
 
 /* Per-LLC DSQs with vtime-encoded priority.
@@ -350,7 +350,7 @@ UEI_DEFINE(uei);
  * 让出者排前（vtime 更小），非让出者排后。
  * 派发：始终只需 1 次 kfunc。
  * DSQ ID：LLC_DSQ_BASE + 0、+1……（每 LLC 一个）。 */
-/* 讲解：单队列 + vtime 排序即可同时表达“分层优先级”和“层内公平”，派发只需一次 kfunc。 */
+/* 单队列 + vtime 排序即可同时表达“分层优先级”和“层内公平”，派发只需一次 kfunc。 */
 
 /* ── Kfunc BenchLab: BSS globals ──
  * bench_request: TUI writes 1 → BPF runs bench on next stopping → clears to 0.
@@ -358,7 +358,7 @@ UEI_DEFINE(uei);
 /* ── Kfunc BenchLab：BSS 全局变量 ──
  * bench_request：TUI 写 1 → BPF 在下次 stopping 运行基准 → 清回 0。
  * bench_results：由 run_kfunc_bench() 填充，供 TUI 读取。 */
-/* 讲解：这几个变量是 TUI 与 BPF 之间触发/回传基准测试的握手通道。 */
+/* 这几个变量是 TUI 与 BPF 之间触发/回传基准测试的握手通道。 */
 u32 bench_request = 0;
 u32 bench_active = 0;  /* 1 while benchmark is running — suppresses telemetry */
 		       /* 基准运行期间为 1——用于抑制遥测。讲解：避免测量被遥测开销污染。 */
@@ -376,14 +376,14 @@ struct kfunc_bench_results bench_results = {};
  * game_tgid == 0 表示未检测到游戏（系统行为如常）。
  * 独占缓存行：写入很少（约 2 次/秒），每次派发都读（约 6K 次/秒）。
  * 稳定后在所有核上处于 shared-S 状态（读取约 1ns）。 */
-/* 讲解：写少读多的变量单独占一条缓存行，稳定后各核共享只读副本，读取几乎零成本。 */
+/* 写少读多的变量单独占一条缓存行，稳定后各核共享只读副本，读取几乎零成本。 */
 u32 game_tgid __attribute__((aligned(64))) = 0;
 /* Parent PID of game process — all Proton/Wine siblings share the same
  * pv-adverb container PPID.  Written by Rust TUI alongside game_tgid.
  * Same cache-line lifecycle: written rarely (~2/s), read in cake_stopping. */
 /* 游戏进程的父 PID——所有 Proton/Wine 兄弟进程共享同一个 pv 容器 PPID。
  * 由 Rust TUI 与 game_tgid 一起写入。缓存行生命周期相同：写入很少（约 2 次/秒），在 cake_stopping 中读取。 */
-/* 讲解：靠共同父进程把游戏相关的一整族进程都识别为 GAME。 */
+/* 靠共同父进程把游戏相关的一整族进程都识别为 GAME。 */
 u32 game_ppid = 0;
 /* Scheduler operating state: IDLE=0, COMPILATION=1, GAMING=2.
  * Written by Rust TUI every poll (~500ms). Read by BPF hot path to select
@@ -395,7 +395,7 @@ u32 game_ppid = 0;
  * 相应策略（压制、vprot 踢核、时间片上限）。
  * 与 game_tgid/game_ppid 处于同一缓存行——写入很少，
  * 各核以 MESI-S 状态共享读取，约 1ns 代价。 */
-/* 讲解：这是全局“模式开关”，决定调度器当前采用哪套策略。 */
+/* 这是全局“模式开关”，决定调度器当前采用哪套策略。 */
 u32 sched_state = CAKE_STATE_IDLE;
 /* Precomputed quantum ceiling — set by userspace when sched_state changes.
  * Eliminates sched_state == COMPILATION branch from stopping hot path.
@@ -405,14 +405,14 @@ u32 sched_state = CAKE_STATE_IDLE;
  * 从 stopping 热路径中消除了 sched_state == COMPILATION 的分支。
  * 编译态 → 8ms，否则 → 2ms。为 BSS 摆放而零初始化；Rust 启动时
  * 设初值（AQ_BULK_CEILING_NS）。TUI 以约 2Hz 写入。 */
-/* 讲解：把“该用哪个上限”提前算好存起来，热路径直接读，省掉一次分支判断。 */
+/* 把“该用哪个上限”提前算好存起来，热路径直接读，省掉一次分支判断。 */
 u64 quantum_ceiling_ns = 0;
 /* Confidence score for game detection: 100=Steam-confirmed, 90=Wine .exe,
  * 50=native/unknown, 0=none. Written by Rust TUI alongside sched_state.
  * Same cache line — available for future BPF hot-path policy scaling. */
 /* 游戏检测置信度：100=Steam 确认，90=Wine .exe，50=原生/未知，0=无。
  * 由 Rust TUI 与 sched_state 一起写入。同一缓存行——为将来 BPF 热路径策略缩放预留。 */
-/* 讲解：置信度越高说明游戏识别越可靠，可据此决定锁定/让位策略。 */
+/* 置信度越高说明游戏识别越可靠，可据此决定锁定/让位策略。 */
 u8 game_confidence = 0;
 
 /* G1+G4: EEVDF intra-tier virtual clock.
@@ -428,7 +428,7 @@ u8 game_confidence = 0;
 /* vtime_now 已移除：它曾是每个 CPU 每次上下文切换都写的全局 BSS u64，
  * 导致 15 核的 MESI 失效风暴。现改用每 CPU 的 bss->vtime_local——
  * 每个 CPU 各自推进自己的单调递增最大值。 */
-/* 讲解：全局单变量被高频跨核写是性能杀手，改成每核本地维护即可避免。 */
+/* 全局单变量被高频跨核写是性能杀手，改成每核本地维护即可避免。 */
 
 /* PID→task_class cache: tunnels task_class from stopping → select_cpu Gate 2.
  * Eliminates bpf_task_storage_get (28ns avg, 1982ns worst-case jitter)
@@ -439,7 +439,9 @@ u8 game_confidence = 0;
  * 从 select_cpu 唤醒路径中消除了 bpf_task_storage_get（平均 28ns，最坏抖动 1982ns）。
  * BSS 读取平均 14ns、抖动 96ns。4096 项（4KB），以 p->pid & 4095 为下标。
  * 约 100 个游戏任务下的哈希冲突概率 <0.1%。在 stopping 写、在 select_cpu 读。 */
-/* 讲解：用一个小数组缓存 pid→类别，避免选核时做昂贵且抖动大的 task_storage 查找。 */
+/* 
+一个简单hash
+用一个小数组缓存 pid→类别，避免选核时做昂贵且抖动大的 task_storage 查找。 */
 #define PID_CLASS_CACHE_SIZE 4096
 static u8 pid_class_cache[PID_CLASS_CACHE_SIZE];
 
@@ -451,7 +453,7 @@ static u8 pid_class_cache[PID_CLASS_CACHE_SIZE];
  * 在 cake_running 中原子（or/and）写入，在 cake_enqueue 中读取。
  * F2 修复：扩宽为 u64[4] 以支持 256 个 CPU。
  * 找抢占目标时用 tzcnt 逐字扫描（每字 1 个周期）。 */
-/* 讲解：位掩码让“找一个非游戏 CPU 来抢占”变成一条位运算指令，极快。 */
+/* 位掩码让“找一个非游戏 CPU 来抢占”变成一条位运算指令，极快。 */
 static u64 game_cpu_mask[CAKE_CPU_MASK_WORDS];
 
 /* Phase 5: Per-CPU BSS — arena-free running.
@@ -460,7 +462,7 @@ static u64 game_cpu_mask[CAKE_CPU_MASK_WORDS];
 /* 阶段 5：每 CPU BSS——不依赖 arena 的运行态存储。
  * 每项 64B 对齐（每 CPU 一条缓存行）。
  * running 写、stopping 读（同 CPU）+ vprot 踢核读（远端 CPU）。 */
-/* 讲解：把运行态热数据放进独占缓存行的 BSS 数组，单写多读、无锁、无跨核抖动。 */
+/* 把运行态热数据放进独占缓存行的 BSS 数组，单写多读、无锁、无跨核抖动。 */
 struct cake_cpu_bss cpu_bss[CAKE_MAX_CPUS];
 
 /* DSQ MAILBOX: per-LLC flag tracks whether a kick has been sent to drain
@@ -473,7 +475,7 @@ struct cake_cpu_bss cpu_bss[CAKE_MAX_CPUS];
  * 入队时置位（仅 0→1 跳变，先读后写）。cake_dispatch 成功把任务移入本地队列后清零。
  * 防止当所有 CPU 都走 Gate 1 直接派发（完全绕过 cake_dispatch）时，任务烂在 DSQ 里。
  * MESI：先读——若已置位则保持 Shared，不产生缓存抖动。 */
-/* 讲解：直接派发会绕过 dispatch，此标志确保 DSQ 里的任务总有 CPU 被唤醒来消费。 */
+/* 直接派发会绕过 dispatch，此标志确保 DSQ 里的任务总有 CPU 被唤醒来消费。 */
 u8 dsq_kick_needed[CAKE_MAX_LLCS];
 
 /* BenchLab ringbuf: tiny ringbuf for measuring reserve+submit overhead.
@@ -482,7 +484,7 @@ u8 dsq_kick_needed[CAKE_MAX_LLCS];
 /* BenchLab ringbuf：用于测量 reserve+submit 开销的小型环形缓冲。
  * 大小 4096 = 最小的页对齐分配。用户态从不消费它；
  * 基准通过 reserve+discard 来测量该 API 的成本。 */
-/* 讲解：这是只为测量 ringbuf API 开销而存在的“空跑”缓冲区。 */
+/* 这是只为测量 ringbuf API 开销而存在的“空跑”缓冲区。 */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 4096);
@@ -510,7 +512,7 @@ struct {
 /* 阶段 6：把每任务热字段放进内核 task_storage（查找约 10ns）。
  * 取代 running+stopping 中对 Arena CL0 的读取（省下 2×19ns=38ns）。
  * Arena CL0 仍存在用于遥测，但在发布版中是死代码。 */
-/* 讲解：真正的调度热存储用查找更快的 task_storage，arena 只留给遥测。 */
+/* 真正的调度热存储用查找更快的 task_storage，arena 只留给遥测。 */
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);

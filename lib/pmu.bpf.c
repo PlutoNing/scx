@@ -36,6 +36,7 @@ u64 scx_event_idx[SCX_MAX_PMU_COUNTERS];
 /* Start at 1 so that the initial per-task counter vals are invalid at gen 0. */
 u64 scx_pmu_gen = 1;
 
+/* 存储 pmu 统计 */
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -91,6 +92,7 @@ int scx_pmu_event_stop(struct task_struct __arg_trusted *p)
 	return 0;
 }
 
+/* 安装 pmu 统计 */
 int scx_pmu_event_start(struct task_struct __arg_trusted *p, bool update)
 {
 	struct bpf_perf_event_value value;
@@ -104,6 +106,7 @@ int scx_pmu_event_start(struct task_struct __arg_trusted *p, bool update)
 		return -ENOENT;
 
 	#pragma unroll(2)
+	/* 遍历已安装的 pmu 事件 */
 	for (idx = 0; idx < SCX_MAX_PMU_COUNTERS; idx++) {
 		/* Is the counter even installed? */
 		if (scx_event_idx[idx] == 0ULL)
@@ -114,6 +117,8 @@ int scx_pmu_event_start(struct task_struct __arg_trusted *p, bool update)
 			cntrs->agg[idx] = 0;
 
 		key = bpf_get_smp_processor_id() + idx * SCX_PMU_STRIDE;
+		/* map 里存的是事件
+		调用 helper 去读取统计值 */
 		ret = bpf_perf_event_read_value(&scx_pmu_map, key, &value, sizeof(value));
 		if (ret)
 			return ret;
@@ -196,6 +201,7 @@ int scx_pmu_task_fini(struct task_struct __arg_trusted *p)
  * Start tracking a PMU for all registered tasks. NOTE: This is not the
  * actual perf counter, it is all the module-wide metadata. The counter
  * must be installed by userspace.
+ 安装一个 pmu 统计事件
  */
 __weak
 int scx_pmu_install(u64 event)
@@ -233,6 +239,7 @@ int scx_pmu_uninstall(u64 event)
 }
 
 
+/* 读取 pmu 统计 */
 __weak
 int scx_pmu_read(struct task_struct __arg_trusted *p, u64 event, u64 *value, bool clear)
 {
