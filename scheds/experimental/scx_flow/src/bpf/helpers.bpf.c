@@ -137,6 +137,7 @@ static __always_inline s64 calc_budget_refill(const struct task_struct *p, u64 s
 	return refill_ns;
 }
 
+/* 更新任务的预算 */
 static __always_inline void update_budget_on_wakeup(const struct task_struct *p,
 						    struct task_ctx *tctx,
 						    u64 now)

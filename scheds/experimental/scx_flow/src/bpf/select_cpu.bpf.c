@@ -1,5 +1,6 @@
 /* CPU selection — included by main.bpf.c via #include */
 
+/* CPU selection 的实现 */
 s32 BPF_STRUCT_OPS(flow_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct task_ctx *tctx;

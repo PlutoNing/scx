@@ -3,7 +3,14 @@
  * Wakeup and pinned tasks bypass the carriage and are dispatched
  * directly to local DSQs.  Non-wakeup tasks go through
  * carriage_enqueue_task() which inserts into per-CPU vtime DSQs
- * (FLOW_VTIME_DSQ_BASE + cpu) via scx_bpf_dsq_insert_vtime. */
+ * (FLOW_VTIME_DSQ_BASE + cpu) via scx_bpf_dsq_insert_vtime.
+ 翻译：
+ 入队路由 - 由 main.bpf.c 通过 #include 包含
+ 唤醒和 pinned 任务 bypass 了等待区和直接调度到本地 DSQ。
+ 非唤醒任务 go through carriage_enqueue_task() 插入到 per-CPU vtime DSQs
+ (FLOW_VTIME_DSQ_BASE + cpu) 通过 scx_bpf_dsq_insert_vtime。
+ ops.dispatch() 在同一 CPU 上消耗该 CPU 的 DSQ，并在空闲时从其他 CPU 窃取。
+ */
 
 void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 {
@@ -106,7 +113,8 @@ void BPF_STRUCT_OPS(flow_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/* Non-wakeup re-enqueue: Waiting Room.
-	 * carriage_enqueue_task always dispatches (no pool-full blocking). */
+	 * carriage_enqueue_task always dispatches (no pool-full blocking). 
+	 非唤醒任务*/
 	carriage_enqueue_task(p, tctx);
 
 	clear_wake_target(tctx);
