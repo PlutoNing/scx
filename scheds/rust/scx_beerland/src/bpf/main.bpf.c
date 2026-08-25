@@ -6,22 +6,26 @@
 
 /*
  * Maximum amount of CPUs supported by the scheduler for per-CPU data.
+ * 支持的最大 CPU 数量
  */
 #define MAX_CPUS	4096
 
 /*
  * Return true if @cpu is valid, false otherwise.
+ * 判断 CPU 是否有效
  */
 #define IS_CPU_VALID(__cpu) ((__cpu) >= 0 && (__cpu) < MAX_CPUS)
 
 /*
  * Return the LLC id associated to a CPU, or -1 if the CPU is invalid.
+ * 获取 CPU 的 LLC id
  */
 #define CPU_LLC_ID(__cpu) \
 	(IS_CPU_VALID(__cpu) ? cpu_llc_id(__cpu) : -1)
 
 /*
  * Return the capacity of a CPU, or -1 if the CPU is invalid.
+ * 获取 CPU 的容量
  */
 #define CPU_CAPACITY(__cpu) \
 	(IS_CPU_VALID(__cpu) ? cpu_capacity[__cpu] : -1)
@@ -32,6 +36,7 @@ UEI_DEFINE(uei);
 
 /*
  * Default time slice.
+ * 默认时间片大小是 1ms
  */
 const volatile u64 slice_ns = NSEC_PER_MSEC;
 
@@ -41,11 +46,14 @@ const volatile u64 slice_ns = NSEC_PER_MSEC;
  * Increasing this value can help to increase the responsiveness of interactive
  * tasks at the cost of making regular and newly created tasks less responsive
  * (0 = disabled).
+ 最大时间片延迟是 40ms
+ 增加这个值可以提高交互式任务的响应性，但会使常规任务和新建任务的响应性降低（0 = 禁用）。
  */
 const volatile u64 slice_lag = 40ULL * NSEC_PER_MSEC;
 
 /*
  * Maximum amount of CPUs supported by the system.
+ 系统支持的最大 CPU 数量
  */
 static u64 nr_cpu_ids;
 
@@ -67,6 +75,7 @@ const volatile u64 busy_threshold;
 
 /*
  * Fast event-driven per-CPU busy state. This reacts within a scheduling slice.
+ * 快速事件驱动的每个 CPU 繁忙状态。这个在调度切片内反应。
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -77,17 +86,20 @@ struct {
 
 /*
  * Subset of CPUs to prioritize.
+ 优先级 CPU 集合
  */
 private(BEERLAND) struct bpf_cpumask __kptr *primary_cpumask;
 
 /*
  * Set to true when @primary_cpumask is empty (primary domain includes all
  * the CPU).
+ * 当 @primary_cpumask 为空时（主域包含所有 CPU），设置为 true。
  */
 const volatile bool primary_all = false;
 
 /*
  * Cache CPU capacity values.
+ 存储 CPU 的容量值
  */
 const volatile u64 cpu_capacity[MAX_CPUS];
 
@@ -105,10 +117,13 @@ static u64 vtime_now;
  * Per-CPU context.
  */
 struct cpu_ctx {
+	/* SMT 兄弟 CPU 集合 */
 	struct bpf_cpumask __kptr *smt;
+	/* 上次运行时间 */
 	u64 last_run_at;
 };
 
+/* 存储每个 CPU 的上下文 */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
@@ -127,13 +142,18 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
 
 /*
  * Per-task context.
+ 每个任务的上下文
  */
 struct task_ctx {
+	/* 上次运行时间 */
 	u64 last_cputime;
+	/* 睡眠虚拟时间延迟 */
 	s64 sleep_vlag;
+	/* 是否有睡眠虚拟时间延迟 */
 	bool has_sleep_vlag;
 };
 
+/* 存储 */
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -160,6 +180,9 @@ static bool is_task_queued(const struct task_struct *p)
 
 /*
  * Return true if @cpu is marked busy enough to steal from.
+ 判断 CPU 是否繁忙到可以窃取
+
+ 为什么可以使用时间作为度量？
  */
 static inline bool is_cpu_busy(u64 cpu, u64 now)
 {
@@ -178,6 +201,7 @@ static inline bool is_cpu_busy(u64 cpu, u64 now)
 	return until && time_before(now, *until);
 }
 
+/* 计算 */
 static inline bool task_used_enough_cpu_time(const struct task_struct *p,
 					     const struct task_ctx *tctx,
 					     u64 runtime)
@@ -192,6 +216,8 @@ static inline bool task_used_enough_cpu_time(const struct task_struct *p,
 	return total_delta >= runtime * busy_threshold / 1024;
 }
 
+/* 标记 CPU 繁忙
+在未来的一个调度切片内，这个 CPU 都是繁忙的 */
 static inline void mark_cpu_busy(s32 cpu, u64 now)
 {
 	u64 *until;
@@ -241,6 +267,8 @@ static void task_save_sleep_vlag(struct task_struct *p, struct task_ctx *tctx)
 }
 
 /*
+获取任务 @p 的虚拟时间
+但是先进行信用和负债的调整
  * Re-align a waking task's vruntime to the current vtime_now, applying its
  * saved virtual lag.
  *
@@ -262,10 +290,12 @@ static u64 task_apply_sleep_vlag(struct task_struct *p, struct task_ctx *tctx)
 
 /*
  * Evaluate the deadline of task @p.
+ 评估任务 @p 的截止时间
  */
 static u64 task_dl(struct task_struct *p, struct task_ctx *tctx)
 {
 	bool was_sleeper = tctx->has_sleep_vlag;
+	/* 获取任务 @p 的虚拟时间 */
 	u64 vtime = task_apply_sleep_vlag(p, tctx);
 	u64 vtime_min;
 
@@ -300,6 +330,7 @@ static u64 task_dl(struct task_struct *p, struct task_ctx *tctx)
 }
 
 /*
+获取任务 @p 的当前虚拟时间
  * Return @p's vruntime including runtime accumulated since it started running.
  *
  * @last_run_at is sourced from the per-CPU context rather than @p's task-local
@@ -453,6 +484,7 @@ static bool is_smt_contended(s32 cpu)
 }
 
 /*
+返回是否应该尝试将任务迁移到空闲 CPU
  * Return true if we should attempt a task migration to an idle CPU from
  * ops.enqueue(), false otherwise.
  *
@@ -609,6 +641,7 @@ static s32 task_cpu(const struct task_struct *p, s32 cpu)
 }
 
 /*
+选择一个最优的空闲 CPU 用于任务 @p（尽可能接近 @prev_cpu）
  * Pick an optimal idle CPU for task @p (as close as possible to
  * @prev_cpu).
  *
@@ -666,6 +699,7 @@ static bool is_cpu_allowed(const struct task_struct *p, s32 cpu)
 }
 
 /*
+选择 cpu 的回调
  * Called on task wakeup to give the task a chance to migrate to an idle
  * CPU.
  */
@@ -701,6 +735,7 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 	 */
 	cpu = pick_idle_cpu(p, prev_cpu, this_cpu, wake_flags);
 	if (cpu >= 0) {
+		/* 插入到本地 dsq */
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 		return cpu;
 	}
@@ -709,6 +744,7 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 }
 
 /*
+入队回调
  * Called when a task expired its time slice and still needs to run or on
  * wakeup when there's no idle CPU available.
  */
@@ -768,6 +804,7 @@ void BPF_STRUCT_OPS(beerland_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /*
+偷取任务
  * Try to steal the runnable task with the earliest vruntime and dispatch it on
  * @dst_cpu.
  */
@@ -775,8 +812,10 @@ static bool try_steal_task(s32 dst_cpu)
 {
 	u64 min_vtime = ULLONG_MAX, i, cpu, min_cpu, now;
 
+	/* 获取当前时间 */
 	now = bpf_ktime_get_ns();
 
+	/* 遍历所有 CPU */
 	bpf_for(i, 0, nr_cpu_ids) {
 		struct task_struct *p;
 
@@ -789,10 +828,13 @@ static bool try_steal_task(s32 dst_cpu)
 		if (cpu >= nr_cpu_ids)
 			cpu -= nr_cpu_ids;
 
+		/* 如果 CPU 不繁忙，跳过 */
 		if (!is_cpu_busy(cpu, now))
 			continue;
 
+		/* 获取 CPU 的下一个任务 */
 		p = __COMPAT_scx_bpf_dsq_peek(cpu);
+		/* 如果任务不在目标 CPU 上，跳过 */
 		if (!p || !bpf_cpumask_test_cpu(dst_cpu, p->cpus_ptr))
 			continue;
 
@@ -802,10 +844,12 @@ static bool try_steal_task(s32 dst_cpu)
 		}
 	}
 
+	// 把任务移动到本地
 	return min_vtime < ULLONG_MAX && scx_bpf_dsq_move_to_local(min_cpu, 0);
 }
 
 /*
+dispatch 回调
  * Called when a CPU becomes available: dispatch the next task on the CPU
  * or let the CPU go idle.
  */
@@ -813,11 +857,13 @@ void BPF_STRUCT_OPS(beerland_dispatch, s32 cpu, struct task_struct *prev)
 {
 	bool need_running = prev && keep_running(prev, cpu);
 
+	/* 先偷 */
 	if (try_steal_task(cpu)) {
 		__sync_fetch_and_add(&nr_remote_dispatch, 1);
 		return;
 	}
 
+	/* 把任务移动到本地 */
 	if (scx_bpf_dsq_move_to_local(cpu, 0)) {
 		__sync_fetch_and_add(&nr_local_dispatch, 1);
 		return;
@@ -834,6 +880,9 @@ void BPF_STRUCT_OPS(beerland_dispatch, s32 cpu, struct task_struct *prev)
 	}
 }
 
+/*
+运行回调
+ */
 void BPF_STRUCT_OPS(beerland_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
