@@ -152,7 +152,11 @@ volatile u32 nr_overflow_domains = 1;
 // let one cache domain's stamp mask another cache domain's aging -- a task buried on the
 // unmonitored cache domain was invisible to STEP 2 / the safety net and aged to the 30s
 // watchdog -> ejection on multi-cache domain parts. Indexed by dom at every arm/clear/read.
+/* 每个 per-domain 溢出 DSQ 从空转非空时打的时间戳,enqueue() 入队处 CAS 置位,overflow_drain_clear() 抽空
+时清零。是"停滞检测"的信号——不是单个任务的等待时间,是"这个溢出队列已经不空多久了"。 */
 static u64 batch_enqueue_ns[MAX_OVERFLOW_DOMAINS];
+
+/* 每颗核自己 per-CPU DSQ 的同类时间戳,dispatch/tick 用来发现"卡住没人抽"的核。 */
 static u64 interactive_enqueue_ns[MAX_OVERFLOW_DOMAINS];
 
 // PER-CPU DSQ SOJOURN: TRACKS WHEN EACH PER-CPU DSQ TRANSITIONS
@@ -164,6 +168,10 @@ struct pcpu_stamp { u64 ns; } __attribute__((aligned(64)));
 static struct pcpu_stamp pcpu_enqueue_ns[MAX_CPUS];
 
 static u64 starvation_rescue_ns;
+/* codel_target_ns 被振荡器调节后,直接赋给 overflow_sojourn_rescue_ns——即"stall 判定
+阈值"本身在动态收紧/放松,
+救援触发的越多,阈值被拉得越低(更容易再触发),再靠弹簧项拉回 codel_target_equilibrium_ns
+(R_eff 谱推出的平衡点)。 */
 static u64 overflow_sojourn_rescue_ns;
 static u32 pcpu_depth_base;
 
@@ -1019,6 +1027,9 @@ static __always_inline bool domain_overflow_drain_local(u32 my_dom,
 // THE TICK-DRIVEN CODEL OSCILLATOR. STEP 2 SETS THIS TRUE (REPRESENTATIVE
 // PRESSURE SIGNAL); SAFETY NET SETS IT FALSE (BACKSTOP-ONLY, NOT THE NORMAL
 // SIGNAL THE OSCILLATOR SHOULD MODEL).
+/* 溢出 DSQ 的"从空变非空"时间戳
+判定就是 i_age > thresh、b_age > thresh 这两个布尔值,thresh 传两次不同的值(starvation_rescue_ns
+ 或 overflow_sojourn_rescue_ns),没有额外状态。 */
 static __always_inline bool try_service_older_overflow(u64 now,
 						        u32 my_dom,
 						        u64 thresh,
@@ -1273,6 +1284,15 @@ static __always_inline void pcpu_drain_clear(u32 cpu)
 // SO A SURVIVED (STILL NON-ZERO) STAMP MEANS A GENUINE WAITER. RETURNS TRUE IFF
 // IT KICKED. THE nr_queued PROBE RUNS ONLY ON A STAMP ALREADY AGED PAST
 // THRESHOLD (THE RARE SUSPICIOUS CASE), SO THE COMMON PATH IS UNCHANGED.
+/* 先调 pcpu_drain_clear(cpu) 自愈——如果这颗 CPU 的 DSQ 其实已经是空的(任务被别的路径拿走了,
+比如任务退出、或者 setaffinity 导致的 dequeue 绕过了 dispatch(),时间戳没人清),这里会顺手把陈旧
+时间戳清零,然后直接返回 false、不踢。只有清完之后时间戳仍然非零(证明确实有人在等)才真的
+ SCX_KICK_PREEMPT 踢这颗 CPU,逼它下次重新进 dispatch() 走 STEP 0 把自己 DSQ 清空。
+
+为什么需要这层:per-CPU DSQ 深度门控(1~2 个槽)加上 STEP 1 窃取,已经能处理绝大多数情况——本核自己变
+空闲会走 STEP 0,邻居窃取会走 STEP 1。这条纯粹是给"这颗 CPU 既没有自己变空闲的机会、又没被邻居窃取
+命中"的边角兜底,而且是唯一一个能覆盖"完全空闲、连 tick 都不触发的 CPU"的机制(靠别的忙核代劳扫描)。
+ */
 static bool pcpu_kick_if_waiter(u32 cpu)
 {
 	if (cpu >= MAX_CPUS)
@@ -2143,6 +2163,7 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 			}
 			u32 nq = scx_bpf_dsq_nr_queued((u64)peer);
 			if (nq >= 1) {
+				/* nq > 1,peer 的 DSQ 里排了 ≥2 个任务,需要额外判定下是不是有任务在等太久了 */
 				// PHI STEAL-RESIST (SHAPE-BLIND): sojourn >= codel_target +
 				// b*R_eff, built only from values we already produce. SOJOURN is
 				// `enq` above (no remote head peek, no remote task_ctx deref). THE
@@ -2151,6 +2172,13 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 				// multiply: an SMT sibling (R_eff~0) stays freely relievable while a
 				// cross-domain pull needs ~tau of sustained backlog. reff_value all-zero
 				// (monolithic / --phi-scale 0) => flat codel_target, prior behavior.
+				/* enq 是 pcpu_enqueue_ns[peer]——peer 这颗 CPU 的 per-CPU DSQ 从空变非空那一刻
+				的时间戳,不是某个具体任务的时间戳。
+nq > 1 时:门槛是 phi_thresh = codel_target_ns + dist_extra(dist_extra 是 R_eff 距离罚金)。只要
+ now - enq ≥ phi_thresh 就允许偷——因为排了两个以上,拉走一个不影响"peer 上正在跑或马上要跑的那个"。
+nq == 1 时:门槛变成 phi_thresh + overflow_sojourn_rescue_ns,比 nq>1 情况多等一整个
+ overflow_sojourn_rescue_ns。这就是"孤独任务"救援:peer DSQ 里唯一一个任务,默认宁可让它留着等 peer 自己来抽
+(cache 热、没必要挪),只有等得比正常情况还要久出一大截才出手偷走。 */
 				u32 *dxp = bpf_map_lookup_elem(&reff_value, &key);
 				u32 dx = dxp ? *dxp : 0;
 				u64 dist_extra = (dx == (u32)-1) ? 0 : (u64)dx;
@@ -2160,6 +2188,12 @@ void BPF_STRUCT_OPS(pandemonium_dispatch, s32 cpu, struct task_struct *prev)
 					break;
 				}
 			}
+			/* 如果 peer 恰好是一颗"一直在跑别的东西、迟迟不变空闲"的忙核,它自己的 STEP 0 压根没机会执行
+			(dispatch 只在 CPU 变空闲时被调用),这个孤独任务就只能指望 tick 里的两种救援去踢它——但踢的前提
+			是 peer 上"有别的任务在跑触发 tick"且被上面讲的陈旧扫描命中;在核少、大量空闲的拓扑下,触发 tick
+			 的机会本身就稀疏,远程轮转扫描覆盖不过来,孤独任务可能等到几十毫秒甚至数十秒。加了这条以后,STEP 1 
+			窃取本身(不依赖 tick、每次 dispatch 都会跑)在等待时间明显超标后会直接把它捞走,兜住这个 tick 
+			覆盖不到的空当。 */
 			if (++checked >= pcpu_spill_search_budget)
 				break;
 		}
@@ -2741,6 +2775,13 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 		u64 pcpu_sojourn_thresh = knobs
 			? knobs->sojourn_thresh_ns : 5000000;
 
+			/* 只查"我自己"这颗 CPU 的 pcpu_enqueue_ns[this_cpu]。如果它非零(说明有任务被
+			塞进了我自己的 per-CPU DSQ 排队)且已经等了超过 pcpu_sojourn_thresh
+			(= knobs->sojourn_thresh_ns,MWU 每秒写一次,默认 5ms),就调用 pcpu_kick_if_waiter(this_cpu)。
+			如果真踢了(返回 true),return 掉,这次 tick 不再往下走后面的 per-CPU 抢占段。
+
+正常情况下这段几乎不该命中:自己 DSQ 里有活,自己下次变空闲进 dispatch() 的 STEP 0 就会抽走。会命中的场景是"这颗
+ CPU 一直没机会变空闲"(比如一直在跑同一个/接力的任务)。 */
 		// LOCAL: OWN PER-CPU DSQ
 		if (this_cpu < MAX_CPUS) {
 			u64 pcpu_oldest = pcpu_enqueue_ns[this_cpu].ns;
@@ -2761,6 +2802,13 @@ void BPF_STRUCT_OPS(pandemonium_tick, struct task_struct *p)
 		// ON NONEXISTENT CPUs.
 		// AT nr_cpu_ids > 4, ROTATE 4 CPUs PER TICK; WRAP WITHIN THE
 		// ACTIVE RANGE VIA MODULO SO THE BUDGET IS SPENT ON REAL CPUs.
+		/* 远程一段:因为一个完全空闲的 CPU 永远不会自己触发 tick,它 DSQ 里万一卡了个任务,
+		只能靠别的正在运行任务、因而正在触发 tick 的 CPU替它看一眼。做法是每次 tick 只看 4 颗别的 CPU:
+
+nr_cpu_ids ≤ 4:干脆全扫(去掉自己最多 3 个)。
+nr_cpu_ids > 4:用 now2 >> 20(约 1ms 粒度变化的一个数)作为起点,取 (起点+i) % nr 这 4 个,不同时刻起点不同,
+长期下来轮转覆盖到所有 CPU,而不是每次 tick 都扫全部(避免扫描成本随核数线性增长)。
+命中同样调 pcpu_kick_if_waiter(scan_cpu),但不 return,4 个都扫完才算完(不像本地段命中就提前退出)。 */
 		if (nr_cpu_ids > 0) {
 			u32 nr = nr_cpu_ids;
 			if (nr <= 4) {

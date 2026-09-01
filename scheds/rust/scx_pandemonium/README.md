@@ -575,3 +575,148 @@ Copies source into `scheds/rust/scx_pandemonium/`, renames the crate, replaces `
 ## License
 
 GPL-2.0
+
+总体设计与工作窃取的对照图在 [scx_pandemonium 设计](/data/home/paulning/.cursor/projects/data-home-paulning-scx/canvases/scx-pandemonium-design.canvas.tsx)，可在聊天旁打开。下面按源码（不是 README）说明。
+
+---
+
+## 总体设计
+
+PANDEMONIUM 是 **sched_ext 上的行为自适应调度器**：BPF（C23）走每条 wakeup/dispatch 热路径，Rust 只做启动时拓扑计算和 1 Hz 控制环。它**没有加权虚拟时间**；队列顺序就是停留时间。
+
+核心命题可以压成一句：**把任务按行为分档，用 sojourn 决定谁先跑，用拓扑图的有效电阻给“搬到哪颗核”定价。**
+
+两层分工：
+
+| 层 | 频率 | 做什么 |
+|---|---|---|
+| **BPF** | 每次调度决策 | 分类、放置、dispatch 瀑布、CoDel 振荡器、抢占 |
+| **Rust** | 启动一次 + 每秒 | Laplacian → R_eff 表、MWU 调旋钮、混沌体制检测、procdb |
+
+所有时标（救援阈值、搜索预算、振荡器阻尼）都从拓扑谱派生：
+
+\[
+\tau = \frac{160\,\mathrm{ms}}{\sqrt{\lambda_2 \cdot N}}
+\]
+
+\(\lambda_2\) 是加权 Laplacian 的 Fiedler 值（代数连通度）。核少或切分差时 \(\tau\) 变松，而不是按 `nr_cpus` 手调一张表。
+
+### 设计特点
+
+1. **三档行为分类**  
+   `lat_cri = (wakeup_freq × csw_rate) / effective_runtime_ms` → `LAT_CRITICAL` / `INTERACTIVE` / `BATCH`。RT 策略钉死 LAT_CRITICAL；高优先级 kthread 反而打到 BATCH，避免 ZFS/存储线程抢音频。
+
+2. **Sojourn 选择器，不是 vtime**  
+   DSQ 键是 `now − warp`。warp 有上界 `lag_cap_ns`（约 \(1\cdot\tau\)），成熟后才挣满；BATCH warp=0。因此「比 warp 更老的 BATCH」永远排在新 LAT_CRITICAL 前面，饥饿有构造性上界。
+
+3. **Per-CPU DSQ 主导，共享溢出只做安全网**  
+   热任务进本核 DSQ（深度门限 1 或 2）。溢出去 per-domain interactive/batch DSQ。dispatch 优先抽本核，再考虑偷邻居、再抽溢出。
+
+4. **电阻亲和 + 迁移势 Φ**  
+   CPU 拓扑建成电网络（L2 电导 1000，同 L3=3，同 socket=1，跨 socket=0.3）。\(R_\mathrm{eff}(i,j)=L^+_{ii}+L^+_{jj}-2L^+_{ij}\) 是真正的度量。Φ 把「搬多远」换成「头任务还要再等多久才值得搬」。
+
+5. **放置与窃取共用同一释放点**  
+   `home_cpu` 在首次运行钉死，不追被迁移改写的 `last_cpu`。warm-stay 和 STEP 1 窃取在同一个 `codel_target + dist_extra` 上释放，避免「刚钉住就被偷走」。
+
+6. **Flow signature 只管放置，不管窃取**  
+   成熟时按唤醒伙伴数分成 TIGHT（≤2）/ STORM（伙伴数 ≥ 核数一半）。形状只影响是否聚在热核上。窃取曾经按形状门控，结果把 STORM 类的音频线程饿在忙核上，所以现在 **shape-blind**。
+
+7. **控制面是 MWU，不是规则表**  
+   6 个专家（LATENCY / BALANCED / THROUGHPUT / IO_HEAVY / FORK_STORM / SATURATED）按体制独立学习。第 6 条损失是跨域散射，但 **排除** Φ 正确的窃取和 STEP 5 守恒，避免惩罚该付的 cache 费。
+
+---
+
+## 实现：从放到偷
+
+### 任务进队（谁把活放到哪）
+
+`select_cpu` 只做 idle 快路径和 warm-stay **defer**；忙核上的真正入队在 `enqueue`，必须 `KICK_PREEMPT`（`KICK_IDLE` 打忙核是空操作，曾经造成约 90% deadline miss）。
+
+- **TIER 0 warm-stay**：home 未拥塞 → 钉在 `home_cpu` 的 per-CPU DSQ，**禁止 spill**。
+- **TIER 1**：找到空闲核 → 直接坐那颗核的 per-CPU DSQ（kick == drain）。
+- **TIER 2**：wakeup / LAT_CRITICAL / handoff 伙伴 → `pick_pcpu_dsq_with_spill(last_cpu)`。
+- **TIER 3**：否则进本域溢出 DSQ；未成熟任务故意不进 batch，避免 fork 风暴饿死。
+
+**Spill**（放置侧）不是窃取：本核 DSQ 满了，沿 `affinity_rank` 找有空位的近邻。同域立刻收下；只有跨域有空位时取**最浅**队列——否则 8C 不对称 online 会把所有溢出灌进同一颗跨域核。
+
+Handoff 对（成熟、非 BATCH、伙伴 ≤ 2）设 `keep_own`，**跳过 spill**：A 马上阻塞，本核 STEP 0 会立刻排 B；spill 会把 B 放到 A 看不到的 DSQ 上，只能靠限速窃取或 tick，IPC 尾延迟约 1.3ms。
+
+### Dispatch 瀑布（以实现为准）
+
+README 仍写 `near_tbl` / `far_tbl` / STEP 4b，**当前代码没有这些表**。实际步骤：
+
+| 步 | 做什么 | 早退条件 |
+|---|---|---|
+| **0** | `move_to_local` 本核 per-CPU DSQ | 成功且溢出两侧都未过救援窗 |
+| **1** | Φ 定价，从 peer per-CPU DSQ 偷 | 同上 sojourn gate |
+| **安全网** | 溢出头年龄 > `starvation_rescue_ns`（~τ，12C 约 167ms） | 不喂振荡器 |
+| **2** | 溢出头年龄 > `overflow_sojourn_rescue_ns`（= CoDel 平衡点） | 喂振荡器 |
+| **3 / 4** | 抽本域 interactive / batch 溢出 | — |
+| **5** | 扫**其他域**溢出 DSQ | 纯空闲守恒，不算 Φ |
+| **KEEP** | prev 仍要 CPU | — |
+
+`sojourn_gate_pass` 是负载关键：没有它，每个有本核队列的 CPU 在 STEP 0 就返回，溢出任务会一直老化到 watchdog（含 `scx_watchdog_workfn`）。
+
+---
+
+## 工作窃取（STEP 1）细拆
+
+这是唯一接近经典 work stealing 的路径：**空闲（或刚做完本核活）的 CPU，从别人的 per-CPU DSQ 拉一个任务。**
+
+### 走查顺序
+
+对 `this_cpu` 读 `affinity_rank[cpu * 128 + slot]`，slot 0 是 R_eff 最小的邻居（通常 SMT/L2）。预算 `pcpu_spill_search_budget ≈ λ₂/2`（12C 为 6），sentinel `(u32)-1` 提前结束。
+
+### Φ 阈值（热路径零乘法）
+
+文档写 \(\Phi = R_\mathrm{eff} - \beta\cdot\mathrm{sojourn}\)。BPF 做成：
+
+```
+sojourn >= codel_target_ns + dist_extra
+```
+
+`dist_extra` 由 Rust 在拓扑探测时写入 `reff_value`：
+
+```
+dist_extra = (R_eff × 1e6 × phi_dist_scale_q16) >> 16
+phi_dist_scale_q16 = τ × 65536 / max(R_eff)
+```
+
+标定结果：
+
+- SMT 兄弟 \(R_\mathrm{eff}\approx 0\) → 几乎在平坦 CoDel 目标上就能偷（cache 几乎免费）。
+- 最远一对 → 需要大约 \(\tau\) 的持续积压才值得跨域。
+- `--phi-scale 0` 时罚金全 0，退回无定价行为。
+
+等价于：排队救济必须盖过「CoDel 目标 + 图电阻」。近处松、远处紧，**没有「同域/跨域」二进制门**，连续度量在单 L3 机器上会自动标定到 L2 缝。
+
+### 孤独任务（nq == 1）
+
+默认还要求 `nr_queued > 1`，避免把唯一的 cache-hot 任务拽走。但实测：busy peer 的 STEP 0 **不会**服务别人 DSQ 上的单任务，tick 扫描又稀疏，2C 上尾延迟可到秒级。于是：
+
+- `nq > 1`：过 Φ 阈值就偷  
+- `nq == 1`：还要再加一个 `overflow_sojourn_rescue_ns`——过了溢出窗才认为不再值得钉住  
+
+距离仍然由 Φ 定价；新鲜单任务仍钉在原核。
+
+### 成本护栏
+
+- `last_spill_scan`：每核每 `codel_target_ns` 只扫一次（peer 走查是 wake-heavy 下最大 cache 成本）。
+- `pcpu_enqueue_ns[peer]==0`：空队列连 `nr_queued` 都不碰。
+- 命中第一个合格 peer 就 `break`（排名已按代价升序，即最小费用流）。
+
+### STEP 5 不是 Φ 窃取
+
+本域 per-CPU 和本域溢出都空了，才去其他域的溢出 DSQ。这是 **idle-time work conservation**：空着一颗核比跨 L3 更亏。MWU 的跨域损失通路明确排除 `XDOM_STEAL` 和 `XDOM_STEP5`。
+
+### 与放置的对偶
+
+`warm_stay_anchor` 读 home 的 `reff_value` slot 0（到最近邻居的罚金）。sojourn 低于 `codel_target + home_dist_extra` 就钉住；高于则去找空闲核——因为 STEP 1 马上也会把它偷走，不如现在放对地方。LAT_CRITICAL 永不 stay。home DSQ 已有 waiter 也释放，避免 1:N 扇出堆在同一颗核上。
+
+### 尚未接到热路径的部分
+
+`topology.rs` 用最小电导切做出 emergent domain tree，把 LCA 的 φ 写入 `domain_phi`，注释说 T3 bounded-local steal 会沿树爬升。**`pandemonium_dispatch` 从不读这张 map。** 当前跨域边界完全由连续 R_eff 罚金 + STEP 5 溢出扫描承担。`domain_phi` 是建好但未消费的脚手架。
+
+---
+
+**一句话**：窃取不是「空核随便抢」，而是沿电阻排名找最近的、头任务已经等够「CoDel + 图距离」的 peer 队列；近处几乎免费，远处要付约一个混合时间 \(\tau\) 的积压。放置（warm-stay / spill）和窃取共用这把尺，所以 cache 局部性和 work conservation 打在同一个阈值上，而不是两套互抢的启发式。
