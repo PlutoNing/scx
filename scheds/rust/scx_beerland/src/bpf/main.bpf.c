@@ -499,6 +499,10 @@ static bool try_migrate(const struct task_struct *p, s32 prev_cpu, u64 enq_flags
 	 *  - migration was not attempted already via ops.select_cpu(),
 	 *  - the CPU is contended by other tasks,
 	 *  - SMT is enabled and the SMT core is contended by other tasks.
+	 满足任一条件才再找 idle：
+select_cpu 被跳过，且任务当前没在跑
+prev CPU 的 DSQ 已经有人排队（这个核已经挤了）
+SMT sibling 在忙，系统里还有完整空闲 core
 	 */
 	return (!scx_bpf_task_running(p) && !__COMPAT_is_enq_cpu_selected(enq_flags)) ||
 	       __COMPAT_scx_bpf_dsq_peek(prev_cpu) ||
@@ -642,6 +646,9 @@ static s32 task_cpu(const struct task_struct *p, s32 cpu)
 
 /*
 选择一个最优的空闲 CPU 用于任务 @p（尽可能接近 @prev_cpu）
+pick_idle_cpu() 优先在 primary domain（turbo/performance 等）里挑 idle，
+找不到再在任务 cpus_ptr 上挑。内核 helper scx_bpf_select_cpu_and() 会按
+ prev 附近、NUMA、idle SMT 等做默认搜索。
  * Pick an optimal idle CPU for task @p (as close as possible to
  * @prev_cpu).
  *
@@ -700,8 +707,13 @@ static bool is_cpu_allowed(const struct task_struct *p, s32 cpu)
 
 /*
 选择 cpu 的回调
+只做唤醒时的 idle 选核，真正的负载均衡分散在三条路径上：唤醒迁核、入队再迁、空闲时偷任务。
  * Called on task wakeup to give the task a chance to migrate to an idle
  * CPU.
+ 在任务唤醒时调用的钩子。目标很窄：尽量把刚醒的任务放到一个空闲、且靠近原来位置的 CPU 上。
+ 找到 idle 就直接塞进该核的本地队列，后面不再走 enqueue。
+ =============================
+ 这个调度器的select cpu比较轻。
  */
 s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
@@ -711,10 +723,12 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 	/*
 	 * On wakeup if the waker's CPU is faster than the wakee's CPU, try
 	 * to move the wakee closer to the waker.
+	 唤醒者更快时，先考虑把任务拉近
 	 */
 	if ((wake_flags & SCX_WAKE_TTWU) &&
 	    is_cpu_faster(this_cpu, prev_cpu) && is_this_cpu_allowed) {
 		/*
+		SCX_WAKE_TTWU（被另一个任务唤醒）+ 当前核（waker）capacity 高于 wakee 原来的核 + 任务允许跑在 waker 上。
 		 * If both the waker's CPU and the wakee's CPU are in the
 		 * same LLC and the wakee's CPU is a fully idle SMT core,
 		 * don't migrate.
@@ -722,6 +736,8 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 		if (is_cpu_allowed(p, prev_cpu) &&
 		    cpus_share_cache(this_cpu, prev_cpu) &&
 		    (!is_smt_contended(prev_cpu)) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+				/* waker 和 prev 同 LLC、prev 是完整空闲 SMT core，就不迁，直接 SCX_DSQ_LOCAL
+				 钉在 prev。否则把搜索起点改成 waker，相当于“跟着更快的唤醒者走”。 */
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 			return prev_cpu;
 		}
@@ -733,9 +749,12 @@ s32 BPF_STRUCT_OPS(beerland_select_cpu, struct task_struct *p, s32 prev_cpu, u64
 	 * Try to find an optimal idle CPU for the task. If no idle CPU is
 	 * found, keep using the same one.
 	 */
+	 /* 找一个idle cpu */
 	cpu = pick_idle_cpu(p, prev_cpu, this_cpu, wake_flags);
 	if (cpu >= 0) {
-		/* 插入到本地 dsq */
+		/* 插入到本地 dsq
+		找到 idle：立刻 scx_bpf_dsq_insert(..., SCX_DSQ_LOCAL)，
+		返回该 CPU。任务直接进目标核本地队列，跳过 enqueue。 */
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 		return cpu;
 	}
@@ -762,10 +781,12 @@ void BPF_STRUCT_OPS(beerland_enqueue, struct task_struct *p, u64 enq_flags)
 		return;
 
 	is_wakeup = (enq_flags & SCX_ENQ_WAKEUP) && tctx->has_sleep_vlag;
+	/* 作为排队的key */
 	dl = task_dl(p, tctx);
 
 	/*
 	 * Attempt a migration to an idle CPU if possible.
+	 时间片用完、或唤醒时 select_cpu 没找到 idle（或被跳过）时走这里。
 	 */
 	if (try_migrate(p, prev_cpu, enq_flags)) {
 		s32 cpu;
@@ -776,6 +797,8 @@ void BPF_STRUCT_OPS(beerland_enqueue, struct task_struct *p, u64 enq_flags)
 			cpu = pick_idle_cpu(p, prev_cpu, -ENOENT, 0);
 
 		if (cpu >= 0) {
+			/* 找到 idle 就 SCX_DSQ_LOCAL_ON | cpu 并 kick 目标核。找不到才进 prev CPU
+			 自己的 per-CPU DSQ（按 vtime/deadline 排序）。 */
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
 					   slice_ns, enq_flags);
 			if (prev_cpu != cpu || !scx_bpf_task_running(p))
@@ -789,6 +812,8 @@ void BPF_STRUCT_OPS(beerland_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	curr = __COMPAT_scx_bpf_cpu_curr(prev_cpu);
 	if (curr) {
+		/* 公平性抢占，不是跨核均衡：sleep wakeup 且 deadline 比当前任务更早，
+		会 SCX_ENQ_PREEMPT 抢同一颗核。 */
 		preempt_wakeup = should_preempt_curr(curr, prev_cpu, dl, is_wakeup);
 		if (preempt_wakeup)
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu,
@@ -850,6 +875,17 @@ static bool try_steal_task(s32 dst_cpu)
 
 /*
 dispatch 回调
+====================================
+负载均衡
+beerland 刻意把迁移窗口收得很窄：轻载只在唤醒时迁，重载才 pull 远程任务。三处一起构成均衡。
+
+1. 唤醒 push：select_cpu + pick_idle_cpu
+上面这条路径。轻载时这是主均衡：任务从忙核迁到空闲核，并尽量保住 LLC / SMT / 大核。
+
+2. 入队二次迁移：enqueue 里的 try_migrate
+时间片用完、或唤醒时 select_cpu 没找到 idle（或被跳过）时走这里。
+3. 饱和 pull：dispatch 里的 try_steal_task
+这才是真正的跨核负载均衡（work-stealing）。
  * Called when a CPU becomes available: dispatch the next task on the CPU
  * or let the CPU go idle.
  */

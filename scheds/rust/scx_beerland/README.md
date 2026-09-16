@@ -20,7 +20,8 @@ Cache-intensive workloads, systems with a large amount of CPUs.
 
 Yes.
 
-`scx_beerland` 是一个以 **locality + scalability** 为核心的 `sched_ext` 调度器：每个 CPU 一张按 deadline 排序的 DSQ，非饱和时任务尽量不迁；饱和时才从远程 DSQ 偷最早 deadline 的任务。实现分用户态（Rust）和内核态（BPF）两层。
+`scx_beerland` 是一个以 **locality + scalability** 为核心的 `sched_ext` 调度器：
+每个 CPU 一张按 deadline 排序的 DSQ，非饱和时任务尽量不迁；饱和时才从远程 DSQ 偷最早 deadline 的任务。实现分用户态（Rust）和内核态（BPF）两层。
 
 ---
 
@@ -52,7 +53,8 @@ Yes.
 	}
 ```
 
-任务默认进 **自己 prev CPU 的 DSQ**，用 `dsq_vtime` 当 deadline。这是 locality 的根基：不饱和时几乎不跨核，cache 热度能保住。
+任务默认进 **自己 prev CPU 的 DSQ**，用 `dsq_vtime` 当 deadline。
+这是 locality 的根基：不饱和时几乎不跨核，cache 热度能保住。
 
 ---
 
