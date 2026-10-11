@@ -30,6 +30,7 @@
 
 #define cpdom_to_dsq(cpdom_id)		((cpdom_id) | LAVD_DSQ_TYPE_CPDOM << LAVD_DSQ_TYPE_SHFT)
 #define cpdom_to_turb_dsq(cpdom_id)	((cpdom_id) | LAVD_DSQ_TYPE_CPDOM_TURB << LAVD_DSQ_TYPE_SHFT)
+/* 从 DSQ id 提取 cpdom id */
 #define dsq_to_cpdom(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_to_cpu(dsq_id)		((dsq_id) & LAVD_DSQ_ID_MASK)
 #define dsq_type(dsq_id)		(((dsq_id) & LAVD_DSQ_TYPE_MASK) >> LAVD_DSQ_TYPE_SHFT)
@@ -247,30 +248,46 @@ struct task_ctx {
  * Compute domain context
  * - system > numa node > llc domain > compute domain per core type (P or E)
  建模系统的拓扑
+ LAVD 把 CPU 按拓扑(LLC / NUMA / 大小核)划分为多个计算域(compute domain,cpdom)。
+ 每个 cpdom 有自己的 DSQ(调度队列),任务入队后主要留在本域内调度。
  */
 struct cpdom_ctx {
 	/* --- cacheline 0 boundary (0 bytes): read-only --- */
+	/* 域的id */
 	u64	id;				    /* id of this compute domain */
 	u64	alt_id;				    /* id of the closest compute domain of alternative type */
 	u8	numa_id;			    /* numa domain id */
 	u8	llc_id;				    /* llc domain id */
 	u8	is_big;				    /* is it a big core or little core? */
 	u8	is_valid;			    /* is this a valid compute domain? */
+	/* 
+	nr_neighbors[d]、neighbor_ids[]
+	按距离 d(最多 LAVD_CPDOM_MAX_DIST=3)分层的邻居域数量及 ID,同一距离内按环形顺序排列 */
 	u8	nr_neighbors[LAVD_CPDOM_MAX_DIST];  /* number of neighbors per distance */
+	/* 本域包含的 CPU 位图 */
 	u64	__cpumask[LAVD_CPU_ID_MAX/64];	    /* cpumasks belongs to this compute domain */
 	u8	neighbor_ids[LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR]; /* neighbor IDs per distance in circular distance order */
 
 	/* --- cacheline 8 boundary (512 bytes): read-write, read-mostly --- */
+	/* 本域应该去别处偷任务(负载偏低) */
 	u8	is_stealer __attribute__((aligned(CACHELINE_SIZE))); /* this domain should steal tasks from others */
+	/* 本域是被偷对象(负载偏高) */
 	u8	is_stealee;			    /* stealer domain should steal tasks from this domain */
+	/* 本域活跃(未被 core compaction 关闭)的 CPU 数。0 表示整个域"休眠" */
 	u16	nr_active_cpus;			    /* the number of active CPUs in this compute domain */
 	u16	nr_acpus_temp;			    /* temp for nr_active_cpus */
+	/* 排队负载:域 DSQ 中所有排队任务的 task_load_metric()(即 util_est,范围 [0,1024])之和。入队/出队时原子增减,是实时值 */
 	u64	qload_invr;			    /* queued load: sum of task_load_metric() for all queued tasks, tracked atomically */
+	/* 均衡用的域总负载 = avg_util_invr_sum + qload_invr(no_fast_lb 模式下另有算法) */
 	u64	load_invr;			    /* domain load for balancing: avg_util_invr_sum + qload_invr */
+	/* 域内排队任务数(no_fast_lb 路径使用) */
 	u32	nr_queued_task;			    /* the number of queued tasks in this domain */
+	/* 当前周期的墙钟利用率之和,用于检测"休眠域上还有任务在跑"(overflow) */
 	u32	cur_util_wall_sum;		    /* the sum of CPU utilization in the current interval */
+	/* 墙钟时间口径的平均利用率之和(未做频率/算力归一化) */
 	u32	avg_util_wall_sum;		    /* the sum of average CPU utilization */
 	u32	cur_util_invr_sum;		    /* the sum of invariant CPU utilization in the current interval */
+	/* **invariant(频率/算力不变)**口径的平均利用率之和,代表域上"正在运行"的负载 */
 	u32	avg_util_invr_sum;		    /* the sum of average invariant CPU utilization */
 	u32	cur_steal_util_wall_sum;	    /* the sum of steal utilization in the current interval */
 	u32	avg_steal_util_wall_sum;	    /* the sum of average steal utilization */
@@ -280,8 +297,11 @@ struct cpdom_ctx {
 	u32	avg_dom_pinned_util_wall_sum;	    /* the sum of average domain-pinned task utilization */
 	u32	cur_dom_pinned_util_invr_sum;	    /* the sum of invariant domain-pinned task utilization in the current interval */
 	u32	avg_dom_pinned_util_invr_sum;	    /* the sum of average invariant domain-pinned task utilization */
+	
+	/* 活跃 CPU 的算力(capacity)之和,大小核异构时用来按算力比例分配负载 */
 	u32	cap_sum_active_cpus;		    /* the sum of capacities of active CPUs in this domain */
 	u32	cap_sum_temp;			    /* temp for cap_sum_active_cpus */
+	/* 监控用:consume DSQ 的延迟,反映 DSQ 竞争程度 */
 	u32	dsq_consume_lat;		    /* latency to consume from dsq, shows how contended the dsq is */
 
 	/* per-cpdom preemption vulnerability threshold tracking */
@@ -290,10 +310,13 @@ struct cpdom_ctx {
 	u32	util_sum_turb;		    /* sum of util_est for turbulent CPUs in this cpdom */
 	u32	cap_sum_steady;		    /* sum of capacity for steady CPUs in this cpdom */
 	u32	cap_sum_turb;		    /* sum of capacity for turbulent CPUs in this cpdom */
+	/* 非"湍流"CPU 的数量(湍流 = IRQ/steal 时间高) */
 	u16	nr_steady_cpus;		    /* count of steady CPUs in this cpdom */
 	u16	nr_turb_cpus;		    /* count of turbulent CPUs in this cpdom */
 
+	/* 出口预算:本轮最多还能从该域迁出多少负载(s64,可为负) */
 	s64	stealee_budget_invr;		    /* egress budget: how much load can leave this domain per round */
+	/* 入口预算:本轮该域最多还能接收多少负载 */
 	s64	stealer_budget_invr;		    /* ingress budget: how much additional load this stealer can accept */
 } __attribute__((aligned(CACHELINE_SIZE)));
 
@@ -369,6 +392,7 @@ struct cpu_ctx {
 	u8		cpdom_alt_id;	/* compute domain id of alternative type */
 	u8		is_online;	/* is this CPU online? */
 	u8		__pad0[2];
+	/* cpu的capacity? */
 	u32		cpuperf_cur;	/* CPU's current performance target */
 	volatile s32	futex_op;	/* futex op in futex V1 */
 
@@ -694,6 +718,8 @@ u32 preemption_vulnerability(u16 normalized_lat_cri, u32 util_est)
 }
 
 /*
+直接返回 taskc->util_est(RAVG 估计,半衰期 128ms,代表任务占空比)。注释说明不能用
+内核 PELT,因为 sched_ext 下 PELT 不更新。
  * Return the task's load contribution for queued load tracking.
  * Uses RAVG util_est: [0, 1024], 128ms half-life, tracks duty cycle.
  * Updated in lavd_runnable/lavd_quiescent — active under sched_ext.

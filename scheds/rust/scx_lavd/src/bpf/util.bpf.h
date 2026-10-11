@@ -61,6 +61,9 @@ static inline bool rt_or_dl_task(struct task_struct *p)
 struct cpu_ctx;
 u64 __get_task_ctx_slowpath(struct task_struct *p, struct cpu_ctx *cpuc);
 
+/* 获取cpu上面的task的ctx
+p为task的hint
+这个ctx是个arena内存 */
 static __always_inline u64
 __get_task_ctx_curcpu(struct task_struct *p, struct cpu_ctx *cpuc)
 {
@@ -79,6 +82,8 @@ __get_task_ctx_curcpu(struct task_struct *p, struct cpu_ctx *cpuc)
 	return __get_task_ctx_slowpath(p, cpuc);
 }
 
+/* 获取cpu上面的task的ctx?
+并且task可能是p */
 #define get_task_ctx_curcpu(p, cpuc) \
 	((task_ctx *)__get_task_ctx_curcpu((p), (cpuc)))
 #define get_task_ctx(p)	get_task_ctx_curcpu((p), get_cpu_ctx())

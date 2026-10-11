@@ -54,6 +54,7 @@ UEI_DEFINE(uei);
 
 /*
  * per-CPU globals
+ percpu的状态
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -62,10 +63,12 @@ struct {
 	__uint(max_entries, 1);
 } cpu_ctx_stor SEC(".maps");
 
+/* 获取cpu上面的task的ctx */
 __hidden
 u64 __get_task_ctx_slowpath(struct task_struct __arg_trusted *p,
 			    struct cpu_ctx *cpuc)
 {
+	/* 获取进程的arena内存 */
 	u64 raw = (u64)scx_task_data(p);
 
 	if (cpuc && raw) {
@@ -76,6 +79,7 @@ u64 __get_task_ctx_slowpath(struct task_struct __arg_trusted *p,
 	return raw;
 }
 
+/* 获取当前CPU的percpu状态 */
 __hidden
 struct cpu_ctx *get_cpu_ctx(void)
 {
@@ -267,6 +271,7 @@ bool use_full_cpus(void)
 	return sys_stat.nr_active >= nr_cpus_onln;
 }
 
+/* 设置亲和性标志 */
 __hidden
 void set_affinity_flags(task_ctx __arg_arena *taskc,
 			const struct cpumask *cpumask)

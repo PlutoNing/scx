@@ -1,0 +1,662 @@
+================================================================================
+  scx (sched_ext) Rust 调度器负载均衡 / 任务搬运机制梳理
+================================================================================
+
+范围：/data/home/paulning/tk5/scx/scheds/rust 下全部 15 个调度器
+      重点：scx_lavd、scx_layered、scx_cake、scx_p2dq、scx_rusty
+      其余：scx_bpfland、scx_cosmos、scx_flash、scx_beerland、scx_forge、
+            scx_tickless、scx_pandemonium、scx_mitosis、scx_chaos、scx_rustland
+方法：直接阅读各调度器 BPF 代码（src/bpf/*.bpf.c）与用户态代码（src/*.rs）。
+      文中 "文件:行号" 基于当前工作副本，仅供定位，后续代码变动可能偏移。
+
+--------------------------------------------------------------------------------
+目录
+--------------------------------------------------------------------------------
+  一、先说结论
+  二、sched_ext 里"负载均衡"能用的几种基本手段（概念框架）
+  三、总览对照表
+  四、重点调度器详解
+      4.1 scx_lavd      —— 计划/执行分离的"预算式 pull" + 有条件的唤醒捐赠
+      4.2 scx_layered   —— 用户态"搬 CPU" + BPF 按亲近度 pull + 跨 NUMA 令牌桶
+      4.3 scx_cake      —— 唤醒直投 push + per-LLC 共享队列 + 有门槛的跨 LLC 偷
+      4.4 scx_p2dq      —— "迁移队列" + power-of-two-choices pull
+      4.5 scx_rusty     —— 用户态层次化 push 决策（改归属域）+ BPF greedy 临时偷
+  五、其它调度器
+      5.1 scx_bpfland / scx_cosmos / scx_flash  —— 唤醒 push + 共享队列
+      5.2 scx_beerland / scx_forge              —— 唤醒 push + per-CPU DSQ 窃取
+      5.3 scx_pandemonium                       —— 分层 push + 有"代价定价"的窃取
+      5.4 scx_tickless                          —— 全局队列 + 主核定时分发
+      5.5 scx_mitosis                           —— 按 cgroup 分 cell，搬 CPU 容量
+      5.6 scx_chaos                             —— 完全复用 p2dq
+      5.7 scx_rustland                          —— 用户态选核后推送
+  六、横向总结：负载均衡与任务搬运的共性思想
+  七、阅读代码时发现的存疑点
+  八、成熟度说明
+
+
+================================================================================
+一、先说结论
+================================================================================
+
+1) 没有一个"著名"调度器是纯 pull 或纯 push 的，几乎全是混合式。
+   但"谁负责什么"的分工非常一致：
+
+   - 唤醒/入队时（ops.select_cpu / ops.enqueue）做 PUSH：
+     给任务找一个空闲 CPU，直接插到那个 CPU 的本地队列
+     （SCX_DSQ_LOCAL / SCX_DSQ_LOCAL_ON|cpu），必要时 scx_bpf_kick_cpu 唤醒它。
+     这是"第一道"也是最便宜的均衡，轻载时它几乎就是全部的均衡。
+
+   - CPU 没活干时（ops.dispatch）做 PULL / 工作窃取：
+     先吃本地/本 LLC 队列，空了再按拓扑距离由近到远去别的队列拉
+     （scx_bpf_dsq_move_to_local）。这是重载时真正的跨核均衡手段。
+
+2) 各调度器的差别主要在"PULL 这一步加了多少约束"：
+   - lavd：先由 10ms 定时器做全局规划，给每个计算域打 stealer/stealee 标签和
+     迁移"预算"，dispatch 按预算偷；本域空了再无条件"强制偷"保证不空转。
+   - layered：按随机化的 LLC 亲近度表逐个拉；远端 LLC 排队量不够不偷；
+     跨 NUMA 有每层每方向的令牌桶限速，速率由用户态算。
+   - cake：本 LLC 优先；跨 LLC 只偷"队列里有 2 个以上任务"的 LLC。
+   - p2dq：只有被标记为"可迁移"的任务才进迁移队列；dispatch 随机挑两个 LLC，
+     选负载高者且必须比自己重 20% 以上才偷（power of two choices）。
+   - rusty：BPF 侧只做简单的轮询 greedy 偷；真正的均衡由用户态每 2 秒计算，
+     挑出"负载最合适"的任务改写它的归属域（这一步本质是 PUSH 决策）。
+
+3) 另一个重要思想是"搬 CPU 而不是搬任务"：
+   - layered：用户态每 100ms 根据各层利用率增减分给该层的 CPU；
+   - mitosis：按 cgroup 划 cell，周期性重分配 cell 的 cpumask；
+   - lavd：核心压缩（active/overflow CPU 集合），按需求扩缩可用 CPU。
+   负载变化时调整"哪些 CPU 服务哪些任务"，任务本身在共享队列里由 pull 自然流过去。
+
+4) 一句话：唤醒时推、空闲时拉、远处拉得越来越犹豫、
+   粗粒度的不均衡交给周期性规划（或直接重划 CPU）。
+
+
+================================================================================
+二、sched_ext 里"负载均衡"能用的几种基本手段（概念框架）
+================================================================================
+
+sched_ext 没有 CFS 那种"在 rq 之间迁移任务"的 load_balance()/active_balance
+机制，BPF 调度器能操控的只是 DSQ（dispatch queue）。因此所有"均衡"最终都落到
+下面几种原语组合上：
+
+  (A) PUSH —— 放置时直接把任务送到目标 CPU
+      ops.select_cpu 返回目标 CPU 并 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, ...)；
+      或在 ops.enqueue 里 scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, ...)，
+      再 scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE) 唤醒目标 CPU。
+      只能在"任务正在被放置"的时刻发生（唤醒、时间片用完重入队、fork/exec 等），
+      BPF 无法从一个正在运行/已在别人本地队列里的任务身上"抢"过来。
+
+  (B) PULL / 工作窃取 —— 空闲 CPU 主动去别的队列拿
+      ops.dispatch 中 scx_bpf_dsq_move_to_local(other_dsq)。
+      前提：任务必须排在"自定义 DSQ"里（per-LLC / per-node / per-CPU 自建 DSQ），
+      内核内建的本地 DSQ（SCX_DSQ_LOCAL）是拉不动的。
+      所以"要不要让任务直接进本地队列"本身就是均衡设计的一部分：
+      进了本地队列 = 放弃被别人偷的机会。
+
+  (C) kick-to-pull —— 忙方不直接推，而是踢醒一个空闲 CPU，让它去 dispatch 里拉
+      scx_bpf_kick_cpu(idle_cpu, SCX_KICK_IDLE)。代价比直投低，且由被踢方
+      根据自己的规则决定拉什么。cake 的 tick、rusty 的 KICK_GREEDY 都是此类。
+
+  (D) 共享队列的隐式均衡
+      多个 CPU 共享一个 DSQ（per-LLC / per-node / 全局），谁空谁取，
+      队列内部天然 work-conserving；均衡问题被缩小为"共享队列之间"的问题。
+
+  (E) 搬 CPU（调整容量归属）而不是搬任务
+      改变某组任务可以使用的 CPU 集合（layered 的层、mitosis 的 cell、
+      lavd 的 active/overflow 集合），由 (B)(D) 让任务自然流动。
+
+  (F) 改变任务"归属"而让迁移惰性发生
+      用户态修改任务的 home 域（rusty 的 target_dom），任务下一次入队时
+      才真正进入新域的队列。
+
+  另外还有一类"不是迁移但影响分布"的手段：抢占（SCX_ENQ_PREEMPT /
+  SCX_KICK_PREEMPT），让高优先级任务在目标 CPU 上立即获得运行机会，
+  lavd、layered、pandemonium 都会用。
+
+
+================================================================================
+三、总览对照表
+================================================================================
+
+  调度器        主队列结构                    PUSH(唤醒/入队)   PULL(dispatch窃取)          周期性规划/再平衡                         总体定性
+  ------------  ----------------------------  ----------------  --------------------------  ----------------------------------------  ------------------------------
+  lavd          per-计算域DSQ(+可选per-CPU)   有,但跨域受限     有,预算式+强制偷            BPF 10ms 定时器标 stealer/stealee+预算    pull 为主,push 为辅
+  layered       per-层×per-LLC DSQ+fallback   有(含抢占)        有,LLC亲近序+xllc/xnuma门   用户态 100ms 分 CPU 给层; xnuma 令牌桶    搬CPU + pull + push
+  cake          per-LLC DSQ                   有(直投为主)      有,仅偷深度>=2 的 LLC       tick 每~8ms 踢空 LLC 的 CPU 来偷           push+pull,无全局规划
+  p2dq          per-LLC DSQ + mig_dsq         有(饱和/fork)     有,pick-2 + slack 阈值      BPF 250ms 定时器算 LLC 负载/lb 提示       pull 为主,push 为辅
+  rusty         per-域(LLC) DSQ               有(DIRECT_GREEDY) 有,轮询 greedy              用户态 2s 层次化 push 决策(改 target_dom) 用户态 push 决策 + BPF pull
+  bpfland       per-CPU + per-node DSQ        有                否(仅共享 node DSQ)         无(只调频)                                push + 共享队列
+  cosmos        全局/per-node 共享 DSQ        有                否(仅共享 DSQ)              无(只调频)                                push + 共享队列
+  flash         per-node 共享 DSQ             有                否(仅共享 DSQ)              无(只调频)                                push + 共享队列
+  beerland      per-CPU DSQ                   有                有,扫描忙 CPU 偷最早 vtime  无                                        push + pull
+  forge         可配(默认 per-CPU)            有                CPU 模式下有                无                                        push + pull / 共享队列
+  pandemonium   per-CPU + 域溢出 DSQ          有(分层)          有,按距离/等待时间定价      用户态 ~1s 调参(不搬任务)                 push + pull
+  tickless      全局 SHARED_DSQ               主核定时分发      否                          BPF 定时器驱动分发                        共享队列 + 主核派发
+  mitosis       per-cell×LLC + per-CPU        有(可借别 cell)   cell 内跨 LLC 偷            用户态按利用率差重分 cell 的 CPU          搬CPU + cell 内 pull
+  chaos         同 p2dq                       同 p2dq           同 p2dq                     同 p2dq                                   同 p2dq
+  rustland      per-CPU + SHARED              用户态选核推送    否(SHARED 兜底)             用户态调度循环                            用户态 push + 共享队列
+
+
+================================================================================
+四、重点调度器详解
+================================================================================
+
+--------------------------------------------------------------------------------
+4.1 scx_lavd —— 计划/执行分离的"预算式 pull" + 有条件的唤醒捐赠
+--------------------------------------------------------------------------------
+
+【均衡单位：计算域（compute domain, cpdom）】
+  同一 NUMA 节点 + 同一 LLC + 同一核类型（大核/小核）的 CPU 构成一个计算域
+  （cpu_order.rs: build_cpdom）。域之间按距离分层（核类型差异 > NUMA 差异 >
+  LLC 差异，最多 3 层，LAVD_CPDOM_MAX_DIST=3），同距离内按环形顺序排列，
+  用作偷取时的遍历顺序。
+  每个域一个共享 DSQ（cpdom DSQ），另有可选 per-CPU DSQ 和"turbulent" DSQ
+  （给 IRQ/steal time 高的 CPU 吃非延迟敏感任务）。
+
+【第一阶段：规划（BPF 定时器，每 10ms）】
+  sys_stat.bpf.c 的定时器（LAVD_SYS_STAT_INTERVAL_NS = 10ms）调用
+  plan_x_cpdom_migration()（balance.bpf.c:163）：
+
+  1. 计算每个活跃域的负载 load_invr = 运行负载(avg_util_invr_sum)
+     + 排队负载(qload_invr，入队/开跑时原子维护)。
+  2. 若所有域每 CPU 平均利用率都低于 lb_low_util_wall，认为不值得均衡，
+     清空所有标记直接返回。
+  3. 每个域的"公平份额" = 总负载 × 本域容量 / 总容量（按 CPU 算力比例）。
+     允许偏差 x_mig_delta 随系统忙碌程度变化（calc_mig_delta）：
+       - 没有任何域有排队：±25%（轻载时容忍大一点，少折腾）
+       - 部分域有排队：    ±12.5%
+       - 所有域都有排队：  ±6.25%（重载时要求更均衡）
+  4. classify_cpdom()（balance.bpf.c:62）给每个域打标签：
+       - 负载 <= 份额-偏差      → stealer（偷取方），入口预算 = 缺口的一半
+       - 负载 >= 份额+偏差 且确实有排队任务 → stealee（被偷方），出口预算 = 超出的一半
+       - 其余                    → 中立
+     "只搬一半"是刻意的：防止一轮搬过头造成乒乓，也防止多个 stealer 同时
+     把一个 stealee 抽干（惊群）。排队为空的过载域不当 stealee（只是运行负载高，
+     没东西可偷）。
+
+【第二阶段：执行（每个 CPU 的 ops.dispatch）】
+  lavd_dispatch() → consume_task()（balance.bpf.c:543），顺序为：
+
+  1. 如果本域是 stealer：try_to_steal_task()（balance.bpf.c:364）
+     - 有概率门控（no_fast_lb 模式下约每个规划周期偷两次）；
+     - 按距离逐层遍历邻居域，只找 is_stealee 且出口预算 > 0 的域；
+     - 在被偷域里挑 qload 最高的那个 DSQ（域 DSQ 或某个 per-CPU DSQ，
+       pick_most_loaded_dsq）；
+     - 先 peek 队头任务的负载，偷成功后同时扣减双方预算
+       （预算用完自动清除 stealer/stealee 标记）；
+     - 每跨到更远的一层，都要再过一次概率门（1/LAVD_CPDOM_MIG_PROB_FT），
+       距离越远越"犹豫"，跨 NUMA 迁移概率指数级下降。
+  2. 消费本地：在 per-CPU DSQ、本域 DSQ、turbulent DSQ 中按队头 vtime
+     最小者优先（turbulent CPU 只吃 turbulent DSQ，除非饿死风险）。
+  3. 仍然没活：force_to_steal_task()（balance.bpf.c:474）
+     - 不看标签和预算，按距离遍历所有邻居域，能偷就偷——保证 work-conserving；
+     - 仍会扣预算以保持记账一致；
+     - 若用户指定了固定 mig_delta_pct，则关闭强制偷，只按阈值均衡。
+
+【唤醒路径的"捐赠"（push）】
+  pick_idle_cpu()（idle.bpf.c:636）的决策顺序体现了"能不跨域就不跨域"：
+    粘性 CPU（prev 或 sync 唤醒者）整核空闲 → 粘性域内整核空闲 →
+    粘性 CPU 半空闲 → sync 唤醒者空闲 → ……
+    → 只有当"本域是 stealee 且邻域是 stealer 且邻域有整核空闲"时，
+      migrate_to_neighbor()（idle.bpf.c:579）才把唤醒任务直接放到邻域。
+    → 否则宁可留在 prev CPU，"寄希望于负载均衡机制去解决"。
+  源码注释原话：轻载时任务捐赠（donation）比偷取效果好，
+  因为 DSQ 大多是空的，很难偷到东西。——这正是 lavd 同时保留 push 的理由。
+  捐赠的任务从未在 stealee 排过队，所以不扣预算。
+
+  选中空闲 CPU 后：select_cpu 里若目标 CPU 的 DSQ 为空，直接插 SCX_DSQ_LOCAL；
+  enqueue 里则 SCX_DSQ_LOCAL_ON|cpu 并 scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE)
+  （main.bpf.c:997/1014）。否则进域 DSQ，并尝试找一个运行低优先级任务的
+  "受害者"CPU 抢占（try_find_and_kick_victim_cpu，preempt.bpf.c:340）。
+
+【exec 时的激进迁移】
+  进程调用 execve 时（tracepoint），若当前 CPU 所在域是 stealee，
+  给任务打 LAVD_FLAG_MIGRATION_AGGRESSIVE 并自我抢占（main.bpf.c:2689），
+  之后 pick_idle_cpu 允许把它放到邻域的"半空闲"CPU 上。
+  理由：exec 后地址空间全新，缓存局部性已经无所谓，正是迁移的最佳时机。
+
+【容量侧：核心压缩】
+  power.bpf.c 维护 active / overflow CPU 集合（省电/自动模式下按需求扩缩），
+  dispatch 时不在两个集合里的 CPU 基本不取任务（除非有绑在它上面的任务）。
+  这是"搬 CPU"的思路，与上面的任务级均衡叠加。
+
+【小结】
+  - 本质是 pull：规划只打标签，真正搬运永远发生在偷取方的 dispatch 里；
+  - 加上"有条件的唤醒捐赠"补足轻载场景；
+  - 防乒乓：按负载比例的份额 + 随忙碌度变化的死区 + 每轮只搬一半 +
+    预算扣减 + 距离指数衰减概率 + 跨域前先穷尽本域空闲 CPU。
+
+
+--------------------------------------------------------------------------------
+4.2 scx_layered —— 用户态"搬 CPU" + BPF 按亲近度 pull + 跨 NUMA 令牌桶
+--------------------------------------------------------------------------------
+
+【队列结构】
+  - 每层每 LLC 一个 DSQ：dsq_id = (layer_id << 16) | llc_id（layer_dsq_id）；
+  - 每 LLC 一个 hi-fallback DSQ（kthread 等高优先级兜底）和一个
+    lo-fallback DSQ（无法放入层队列的任务，保证最少份额 lo_fb_share_ppk）；
+  - 没有自建 per-CPU DSQ，直投用内建 SCX_DSQ_LOCAL / LOCAL_ON。
+  层的种类：Confined（只能用本层 CPU）、Grouped（可溢出到未被保护的 CPU）、
+  Open（可用任意未占用 CPU）。
+
+【粗粒度：用户态搬 CPU（每 0.1s）】
+  main.rs 默认 interval=0.1s，step() 中：
+  - 按层的利用率目标区间（如 80%~90%）计算每层需要的 CPU 数，增减分配
+    （calc_target_nr_cpus）；多 NUMA 时 alloc.rs 做水位填充，
+    layer_core_growth.rs 决定具体挑哪些核（局部优先/轮转/按节点铺开等）。
+  - 更新层 cpumask 后，BPF refresh_cpumasks 踢相关 CPU。
+  这是 layered 最主要的"均衡"：负载高的层拿到更多 CPU，
+  任务仍在本 LLC 的层队列里，靠新加入的 CPU 来 pull。
+
+【细粒度 PUSH：select_cpu / enqueue】
+  pick_idle_cpu()（main.bpf.c:1383）顺序：
+    prev CPU → 同 LLC 的层 CPU → （若本 LLC 该层排队量 < xllc_mig_min_ns 则
+    放弃跨 LLC，main.bpf.c:1516）→ 本节点层 CPU → 本节点开放 CPU →
+    按节点亲近序的远端节点（需本节点是 xnuma 迁出源且通过令牌桶 xnuma_gate）。
+  找到后 select_cpu 直插 SCX_DSQ_LOCAL；enqueue 里可 SCX_DSQ_LOCAL_ON|cpu；
+  找不到空闲则尝试抢占（try_preempt_cpu，LOCAL_ON + SCX_ENQ_PREEMPT），
+  再不行入当前 LLC 的层 DSQ。若某 LLC 该层没有 CPU 却有任务，
+  layer_kick_idle_node_cpu 踢节点内空闲 CPU 来拉。
+
+【细粒度 PULL：dispatch】
+  layered_dispatch()（main.bpf.c:2716）大致顺序：
+    antistall 队列 → keep_running(prev) → hi_fb → 本节点 fallback CPU
+    抢救"本节点没有 CPU 的层" → lo_fb（等待超过 lo_fb_wait_ns 后按份额强制）
+    → 按本 CPU 所属层类型决定的层顺序（*_layer_order）逐层 try_consume_layer。
+  try_consume_layer()（main.bpf.c:2573）：
+    - 每次随机挑一张 LLC 亲近度表（NUM_PROXIMITY_MAPS 张，避免同距离 LLC
+      总是同一个被偷），从近到远 scx_bpf_dsq_move_to_local；
+    - 远端 LLC 的该层排队运行时间 < xllc_mig_min_ns → 跳过（轻队列不跨 LLC）；
+    - 跨 NUMA 需对端节点被标为迁出源且过 xnuma_gate（2 节点系统失败直接 break）；
+    - Confined 层不被别的层 CPU 消费（抢救搁浅任务时除外）。
+
+【跨 NUMA 令牌桶（xnuma）】
+  - 用户态（main.rs refresh_xnuma）判断哪些节点需要向外迁移：
+    负载/分配比失衡、有富余、且"给该层加 CPU 已经加不动了（growth_denied）"
+    才开闸——即优先搬 CPU，搬不动才搬任务；
+  - 用水位填充算 src→dst 速率，再乘 0.5 阻尼慢慢收敛；
+  - BPF 侧每 (层, 源节点, 目的节点) 一个令牌桶（xnuma_bucket_refill，最多攒 1 秒），
+    select/抢占/dispatch 只检查不扣，真正跨节点开跑时在 layered_running
+    里按任务 duty_cycle 扣（xnuma_gate_charge）。
+
+【防饿死】
+  15s 定时器 antistall_scan 扫所有层/LLC/fallback DSQ，队头等待超过
+  antistall_sec（默认 3s）就给能跑它的 CPU 标记，dispatch 最先消费。
+
+【小结】
+  - 两级粒度：用户态 100ms 级"搬 CPU 给层"，BPF 任务级 push + pull；
+  - pull 遍历按 LLC 亲近度，并随机化同距离顺序；
+  - 迁移成本分级把关：同 LLC 自由，跨 LLC 看排队量，跨 NUMA 令牌桶限速；
+  - 防乒乓：xllc 最小排队量、xnuma 迟滞 + 0.5 阻尼 + 令牌、亲近度随机化。
+
+
+--------------------------------------------------------------------------------
+4.3 scx_cake —— 唤醒直投 push + per-LLC 共享队列 + 有门槛的跨 LLC 偷
+--------------------------------------------------------------------------------
+
+  定位：面向游戏/桌面的低延迟调度器，名字取自网络 QoS 的 CAKE/DRR++。
+  四类任务（GAME / NORMAL / HOG / BG）用不重叠的 vtime 权重区间排序，
+  而不是多条优先级队列。
+
+【队列结构】
+  每 LLC 一个按 vtime 排序的 DSQ（LLC_DSQ_BASE + llc），没有 per-CPU DSQ。
+  单 CCD 机器 nr_llcs=1，所有跨 LLC 代码被常量折叠掉。
+
+【PUSH：cake_select_cpu（cake.bpf.c:2118）】
+  1. 游戏态下清除 SCX_WAKE_SYNC：游戏的唤醒多为 vsync/futex/GPU 完成信号，
+     跟随唤醒者迁移只会毁掉 L1/L2，不带来数据局部性；
+  2. 直接复用内核空闲选核 scx_bpf_select_cpu_and / scx_bpf_select_cpu_dfl
+     （prev 空闲 → SMT 整核空闲 → LLC → NUMA → 全局），找到就
+     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, ...) 直投；
+  3. 大小核平台：GAME 任务按"快→慢"、其它按"慢→快"扫描空闲核，
+     并跳过与异类任务共享 SMT 的核；
+  4. 全忙：返回 prev_cpu 交给 enqueue，不抢占、不踢核，优先级交给 vtime 排序。
+
+【入队：enqueue_dsq_dispatch（cake.bpf.c:2324）】
+  任务进入其上次运行 CPU 所在 LLC 的 DSQ（保持 LLC 局部性）。
+  每个 LLC 有一个 dsq_kick_needed "邮箱"标志：从 0 变 1 时踢一次
+  当前执行 enqueue 的 CPU（有 idle 提示才带 SCX_KICK_IDLE），被消费后清零，
+  避免对同一 LLC 反复发 IPI。
+
+【PULL：cake_dispatch（cake.bpf.c:2595）】
+  1. 本 LLC DSQ 有任务 → move_to_local；
+  2. 多 LLC 时从 my_llc+1 开始轮转遍历其它 LLC，
+     只有对方队列深度 > 1 才偷（cake.bpf.c:2654）。
+     注释解释：单个任务更适合等本 CCD 的核空出来，跨 CCD 冷缓存迁移得不偿失，
+     类似 CFS 跨域迁移的 imbalance_pct 门槛；
+  3. 都没有 → prev 仍可运行则续一个时间片（避免无意义上下文切换），
+     并标记本 CPU idle_hint。
+
+【kick-to-pull：cake_tick（cake.bpf.c:4201）】
+  多 LLC 时每 8 个 tick 检查一次：本 LLC 队列深度 >= 2 且发现某 LLC 队列为空，
+  就踢那个 LLC 的一个 CPU（SCX_KICK_IDLE），让它醒来走 dispatch 的偷取路径。
+  这弥补了纯 pull 的弱点：空闲 CPU 在睡觉时不会自己去偷。
+
+【用户态】
+  只写拓扑/核性能排序/游戏状态等，不计算负载、不搬任务。
+
+【小结】
+  - 空闲时 push（直接利用内核成熟的选核逻辑），忙时 per-LLC 共享队列 + pull；
+  - 无全局负载统计，均衡判据极简：队列深度；
+  - 防乒乓：游戏态去掉 SYNC 唤醒亲和、跨 LLC 需深度 >= 2、tick 节流到 ~8ms、
+    邮箱标志去重 kick。
+
+
+--------------------------------------------------------------------------------
+4.4 scx_p2dq —— "迁移队列" + power-of-two-choices pull
+--------------------------------------------------------------------------------
+
+  名字即 "Pick 2 DSQ"。（scx_chaos 直接 #include 了它的 main.bpf.c，见 5.6。）
+
+【队列结构】
+  - 每 LLC 一个主 DSQ（llc_dsq，可分片 shard_dsqs）；
+  - 每 CPU 一个亲和 DSQ（affn_dsq，给 cpumask 受限的任务）；
+  - 每 LLC 一个迁移 DSQ（mig_dsq = llc_id | P2DQ_MIG_DSQ），
+    或 arena 实现的 mig_atq / mig_dhq。
+  dsq_index 只是时间片档位（默认 3 档，0 档视为交互任务），不是物理队列。
+
+【关键设计：只有"愿意迁"的任务才进 mig_dsq】
+  can_migrate()（main.bpf.c:955）条件：
+    多 LLC、任务允许所有 CPU、默认非交互任务、
+    llc_runs == 0（刚换 LLC 后要先在新 LLC 跑够若干次，粘滞计数）、
+    且系统或本 LLC 处于 saturated/overloaded 状态。
+  可迁移任务入 mig_dsq，其余入 llc_dsq（别的 LLC 偷不到）。
+  这样把"能否被偷"的判断前移到入队时刻，dispatch 时就不用逐个任务挑了。
+  min_llc_runs_pick2 还会随空闲 CPU 比例动态调整（main.bpf.c:3072）。
+
+【PULL：dispatch_pick_two（main.bpf.c:2596）】
+  dispatch 先吃本 CPU affn_dsq → 同 LLC 其它 CPU 的 affn_dsq → llc_dsq →
+  本 LLC mig_dsq → 分片互偷，都空才进 pick-2：
+    1. 门槛：本 LLC 排队数 >= min_nr_queued_pick2、距上个周期 >= backoff_ns；
+    2. 随机抽两个 LLC（只有 2 个 LLC 时固定取双方），按 LLC 负载
+       （PELT util_avg 或简单计数）排序；
+    3. 只有对方负载 >= 本 LLC 负载 × (1 + slack_factor/100)（默认 slack 20%）
+       才从它的 mig 队列拉（consume_llc）；先试重的，再试轻的；
+    4. 系统饱和时放宽条件。
+  为什么是"随机挑两个"：在 LLC 很多的机器上，全扫描代价高且容易让所有
+  空闲 CPU 同时扑向同一个最忙的 LLC；随机两选一在理论上就能把最大负载
+  从 O(log n / log log n) 降到 O(log log n)，又天然分散了偷取方。
+
+【PUSH 部分】
+  pick_idle_cpu()（main.bpf.c:1440）：交互任务粘 prev；饱和但不可迁的任务
+  不跨 LLC 找空闲；sync 唤醒默认留在本 LLC；llc_runs==0 时可参考定时器给出
+  的 lb_llc_id 提示跳到更轻 LLC；本 LLC 无空闲且可迁 → 本 NUMA → （饱和时）全局。
+  找到空闲直投 SCX_DSQ_LOCAL / LOCAL_ON + kick。
+  fork/exec 时 find_least_loaded_llc_for_fork 直接把新任务放到最轻的 LLC。
+
+【周期性：BPF 定时器（250ms）】
+  load_balance_timer（main.bpf.c:3418）：用旋转偏移成对比较 LLC 负载，
+  失衡超过 slack 则给重 LLC 设置 lb_llc_id（供唤醒选核参考）；
+  同时做 autoslice：按交互负载占比调整各档时间片。用户态不做均衡。
+
+【小结】
+  - pull 为主：跨 LLC 搬运发生在空闲侧的 pick-2；
+  - push 为辅：饱和时唤醒跨 LLC、fork/exec 放最轻 LLC；
+  - 防乒乓：llc_runs 粘滞、交互任务默认不迁、slack 阈值、backoff、
+    最小排队数门槛、只在饱和时开放跨 LLC。
+
+
+--------------------------------------------------------------------------------
+4.5 scx_rusty —— 用户态层次化 push 决策（改归属域）+ BPF greedy 临时偷
+--------------------------------------------------------------------------------
+
+  rusty 是最"经典"的设计：类似 CFS 的分层负载均衡，但计算放在用户态。
+
+【域与队列】
+  默认一个 LLC 一个域（domain.rs），每域一个 DSQ（id = dom_id）。
+  每个任务有 home 域（taskc->domc / target_dom）和域内可用 cpumask。
+  每域按权重分桶记录 duty-cycle 滑动平均（ravg），并维护最多 1024 个
+  活跃任务的环形缓冲，供用户态挑选迁移对象。
+
+【长期均衡：用户态 LoadBalancer（load_balance.rs，默认每 2s）】
+  1. 从 BPF 读各域各桶 duty cycle，经 LoadCalculator / infeasible 权重处理
+     得到每域负载；
+  2. 建层次：Root → NumaNode → Domain → Task；
+  3. 先在 NUMA 节点之间均衡（失衡阈值 17%，迁移代价高所以门槛高），
+     再在每个节点内部的域之间均衡（阈值 5%）；
+  4. 把域分为 push 域（过载）、pull 域（欠载）、balanced；
+     每次转移量 = min(push 超出, pull 缺口) × 0.5，单次推出量不超过失衡的 50%；
+  5. 在 push 域的活跃任务中按负载排序，挑"负载最接近需要转移量"且
+     cpumask 允许在目标域运行的任务（优先 preferred_dom_mask）；
+  6. 决定后只做一件事：写任务的 taskc.target_dom = pull 域（load_balance.rs:366）。
+  这一层是典型的 PUSH 决策（由过载方选任务推出去），
+  但执行是惰性的：任务下一次入队时，BPF rusty_enqueue 看到
+  domc->id != target_dom 才调用 task_set_domain 迁到新域
+  （main.bpf.c:1165，见第七节存疑点），并踢新域的一个 CPU。
+
+【短期 work-conservation：BPF greedy（不改归属）】
+  - DIRECT_GREEDY（select_cpu）：本域没空闲 CPU 时，直接把任务放到
+    direct_greedy_cpumask 中的外域空闲 CPU（push）；
+  - KICK_GREEDY（enqueue，main.bpf.c:1217）：入队后踢 kick_greedy_cpumask 中
+    的一个空闲 CPU，让它来偷（kick-to-pull）。注释提到高负载时
+    DIRECT_GREEDY 有负面影响而 KICK_GREEDY 没有；
+  - dispatch 偷取（main.bpf.c:1341）：本域 DSQ 空 → 轮询同 NUMA 其它域
+    move_to_local → （开启时）轮询跨 NUMA 域；
+  - REPATRIATE：在外域跑完时间片的任务重新入队时，踢本域 CPU 把它接回。
+  tuner.rs（默认每 100ms）按 /proc/stat 计算各域利用率，
+  利用率 < 90% 的域进入 direct_greedy_cpumask，< 100% 的进入
+  kick_greedy_cpumask——即"只允许不忙的域接外活"；整机打满时缩短时间片。
+
+【小结】
+  - 双时间尺度：秒级用户态精确计算 + 改归属（push 决策、惰性执行）；
+    微秒级 BPF greedy push/pull 临时补位，不改归属，之后会被接回；
+  - 跨 NUMA 门槛远高于跨 LLC；每次只转移一半失衡量。
+
+
+================================================================================
+五、其它调度器
+================================================================================
+
+--------------------------------------------------------------------------------
+5.1 scx_bpfland / scx_cosmos / scx_flash —— 唤醒 push + 共享队列
+--------------------------------------------------------------------------------
+
+  三者同一作者家族（Andrea Righi），思路接近：
+  - 唤醒时 pick_idle_cpu（大多基于 scx_bpf_select_cpu_and，按 SMT 整核 →
+    LLC → NUMA 的顺序，偏好 prev，大小核平台偏向更快的核），
+    找到空闲直接插本地/目标 CPU 队列；
+  - enqueue 时若 select_cpu 被跳过或任务需要迁移（task_should_migrate）、
+    或 prev 的 SMT 兄弟在忙，再找一次空闲 CPU，找到就插目标 CPU 队列并
+    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE)（bpfland main.bpf.c:938-955）——push；
+  - 否则进共享 DSQ：bpfland 是 per-node DSQ（另有 per-CPU DSQ），
+    cosmos 是全局或 per-node，flash 是 per-node；
+  - dispatch 只消费"自己的 per-CPU DSQ + 本节点/全局共享 DSQ"，
+    按队头 deadline 选早的，不去扫别的 CPU 的 per-CPU DSQ。
+  - 没有跨核再均衡定时器，周期逻辑只用于 cpufreq 调频。
+  均衡完全依赖"唤醒时 push + 共享队列内谁空谁取"。跨 NUMA 节点之间
+  基本不主动均衡（共享队列按节点划分），靠唤醒选核时的全局扫描兜底。
+  flash 还会清除 WAKE_SYNC，避免跟随唤醒者的盲目迁移。
+
+--------------------------------------------------------------------------------
+5.2 scx_beerland / scx_forge —— 唤醒 push + per-CPU DSQ 窃取
+--------------------------------------------------------------------------------
+
+  beerland：每 CPU 一个自定义 DSQ，均衡分三层（源码注释已写明）：
+    1. 唤醒 push：select_cpu 找空闲 CPU 直插（轻载时的主要均衡）；
+    2. 入队二次迁移：enqueue 中 try_migrate 成立则再找空闲 CPU，
+       LOCAL_ON + KICK_IDLE；否则进 prev CPU 的 per-CPU DSQ；
+    3. 饱和 pull：dispatch 先 try_steal_task()（main.bpf.c:836）——
+       从 dst_cpu 偏移开始遍历所有"忙"的 CPU（忙 = cpu_busy_until 未过期），
+       peek 每个 per-CPU DSQ 队头，取 vtime 最早且允许在本 CPU 运行的任务拉过来；
+       然后才吃自己的队列。
+    注意它是"先偷再吃本地"，并且偷的是全局最早 vtime，更偏公平性而非局部性。
+
+  forge：DSQ 拓扑可配置（CPU / LLC / NODE / GLOBAL）。默认 CPU 模式下：
+    唤醒 push 同上；dispatch 先本 CPU DSQ，再 pick_remote_cpu 找最早任务的
+    远端 per-CPU DSQ 偷（main.bpf.c:1310），再依次尝试 LLC / NODE / 全局 DSQ。
+    选 LLC/NODE/GLOBAL 模式时退化为纯共享队列。
+
+--------------------------------------------------------------------------------
+5.3 scx_pandemonium —— 分层 push + 有"代价定价"的窃取
+--------------------------------------------------------------------------------
+
+  - 队列：每 CPU DSQ + 每 cache 域的 interactive/batch 溢出 DSQ；
+    拓扑、亲近度排序（affinity_rank）等由用户态 topology.rs 写入；
+  - push：select_cpu/enqueue 分层找落点（亲和空闲核 → 温缓存留守 →
+    L2 兄弟 → 内核默认选核），放不下溢出到域 DSQ 并 kick；
+    温缓存任务可钉在忙的锚点 CPU 上并 KICK_PREEMPT；
+  - pull：dispatch 先本 CPU，再按亲近度扫描邻居的 per-CPU DSQ，
+    只偷"等待时间（sojourn）超过按距离定价的阈值 Φ"的任务——
+    距离越远阈值越高；扫描本身有速率限制；
+    单个任务（nq==1）一般留给原 CPU 保缓存温度，但等待超过溢出窗口也会被偷；
+    之后再排空本域/跨域溢出 DSQ；
+  - 用户态 adaptive.rs 约每秒检测负载形态，调整时间片/CoDel/Φ 等参数，
+    不直接搬任务。
+  思想上接近"用等待时间作为偷取收益、用拓扑距离作为偷取成本"的定价模型。
+
+--------------------------------------------------------------------------------
+5.4 scx_tickless —— 全局队列 + 主核定时分发
+--------------------------------------------------------------------------------
+
+  所有任务进全局 SHARED_DSQ，时间片通常为无限（减少 tick）。
+  由少数"主"CPU 在 dispatch 和 BPF 定时器（tick_interval_ns）中统一
+  把任务从 SHARED_DSQ 用 scx_bpf_dsq_move 挪到各 CPU 的 SCX_DSQ_LOCAL_ON|cpu
+  并踢醒（dispatch_all_cpus）。这是一种集中式 push：
+  均衡问题被单一全局队列消解，分发由主核集中完成。
+
+--------------------------------------------------------------------------------
+5.5 scx_mitosis —— 按 cgroup 分 cell，搬 CPU 容量
+--------------------------------------------------------------------------------
+
+  - cgroup 子目录 → cell，每个 cell 有自己的 CPU 集合；
+    队列为 cell×LLC DSQ（或扁平）+ per-CPU DSQ（受限亲和任务）；
+  - 跨 cell：用户态 cell_manager.rs 按 cpuset 和（可选）需求权重计算
+    每个 cell 的 cpumask；main.rs maybe_rebalance 在 cell 间利用率差
+    >= rebalance_threshold（默认 20%）且过冷却期（默认 5s）时重算并下发。
+    任务归属不变，变的是 cell 拥有的 CPU——典型"搬容量"；
+  - 可选 borrowing：本 cell 无空闲 CPU 时临时把任务放到别 cell 的空闲 CPU（push）；
+  - cell 内：dispatch 本 LLC DSQ 空时 try_stealing_work 轮询同 cell 兄弟 LLC
+    DSQ 偷（pull）；CPU 被调离某 LLC 后 try_draining_work 把孤儿队列排走。
+
+--------------------------------------------------------------------------------
+5.6 scx_chaos —— 完全复用 p2dq
+--------------------------------------------------------------------------------
+
+  main.bpf.c 中 #define P2DQ_CREATE_STRUCT_OPS 0 后 #include "scx_p2dq/main.bpf.c"，
+  select_cpu/enqueue/dispatch 都调用 p2dq 的实现，只是在入队时叠加延迟/降级等
+  故障注入。负载均衡逻辑与 p2dq 相同。它是测试工具，不是生产调度器。
+
+--------------------------------------------------------------------------------
+5.7 scx_rustland —— 用户态选核后推送
+--------------------------------------------------------------------------------
+
+  BPF（scx_rustland_core）把任务通过 ringbuf 交给用户态；
+  用户态按 deadline 排序，调用 select_cpu 选空闲 CPU 后下发：
+  指定 CPU 则进该 CPU 的 per-CPU DSQ 并 KICK_IDLE，否则进 SHARED_DSQ。
+  BPF dispatch 只消费本 CPU DSQ 和 SHARED，不偷别的 per-CPU DSQ。
+  本质是"集中式（用户态）push + 共享队列兜底"，主要用作用户态调度框架示范。
+
+
+================================================================================
+六、横向总结：负载均衡与任务搬运的共性思想
+================================================================================
+
+1. push 和 pull 各管一段，而不是二选一
+   - push 发生在"任务本来就要被放置"的时刻（唤醒、重入队、fork/exec），
+     额外成本几乎为零，且能让空闲 CPU 立刻有活干；
+   - pull 发生在"CPU 本来就要找活干"的时刻（dispatch），只在确实空闲时才付出
+     扫描/跨缓存的代价；
+   - lavd 注释点明了互补关系：轻载时队列多为空，偷不到东西，靠捐赠(push)；
+     重载时空闲 CPU 稀少，push 找不到目标，靠偷取(pull)。
+
+2. "能被偷"是一种需要设计的状态
+   sched_ext 只能从自定义 DSQ 拉任务，进了 SCX_DSQ_LOCAL 就拉不走了。
+   所以各调度器都在入队时决定任务放在哪：
+   - 直投本地（承诺在这个 CPU 跑，放弃被偷）：只在目标 CPU 空闲时做；
+   - 进共享队列（per-LLC/per-node/全局）：同一共享域内天然均衡；
+   - 进迁移队列（p2dq 的 mig_dsq）：显式声明"可以跨 LLC 被偷"；
+   - 进 per-CPU 自定义 DSQ（beerland/forge/pandemonium）：既保局部性，
+     又保留被偷的可能，代价是偷取方要扫描很多队列。
+
+3. 迁移成本分级，门槛逐级提高
+   SMT 兄弟 < 同 LLC < 跨 LLC < 跨 NUMA。几乎所有调度器都是：
+   - 同 LLC 内基本不设限（共享队列或自由选空闲核）；
+   - 跨 LLC 要求对方"足够多"：cake 深度>=2，layered 排队运行时间 >= xllc_mig_min，
+     p2dq 负载高 20% 且仅可迁移任务，lavd 需对方是 stealee；
+   - 跨 NUMA 要么概率指数衰减（lavd），要么令牌桶限速（layered），
+     要么阈值更高（rusty 17% vs 5%），要么默认关闭（rusty x_numa greedy 默认 0）。
+
+4. 规划与执行分离
+   精确的负载统计和全局比较代价高，不适合放在 dispatch 热路径：
+   - lavd：BPF 10ms 定时器出"标签 + 预算"，dispatch 只看标签；
+   - p2dq：BPF 250ms 定时器出 lb_llc_id 提示和时间片；
+   - layered：用户态 100ms 出 CPU 分配和 xnuma 速率；
+   - rusty：用户态 2s 出具体的任务迁移名单；
+   - mitosis：用户态秒级出 cell 的 CPU 分配。
+   热路径里只剩下"查标签/查阈值 + move_to_local"。
+
+5. 搬 CPU 往往比搬任务更好
+   layered/mitosis/lavd 都会先调整"哪组 CPU 服务哪组任务"，任务在共享队列里
+   被新的 CPU 自然 pull 走。layered 更明确：只有给层加 CPU 加不动了，
+   才打开跨 NUMA 任务迁移。
+
+6. 防乒乓的常见手段
+   - 死区/阈值：lavd 份额±(6.25%~25%)，p2dq slack 20%，rusty 5%/17%；
+   - 每轮只纠正一半失衡：lavd 预算=差额/2，rusty xfer×0.5，layered 速率×0.5；
+   - 粘滞计数：p2dq 的 llc_runs；
+   - 预算/令牌：lavd 预算、layered 令牌桶；
+   - 随机化：p2dq 随机挑两个 LLC，layered 随机亲近度表，
+     cake/beerland 从自身偏移开始轮转，避免所有空闲 CPU 扑向同一个目标；
+   - 冷却期/退避：p2dq backoff_ns，mitosis 冷却 5s，cake tick 8ms 节流；
+   - 不迁单个任务：cake 深度>1，pandemonium nq>1 才常规偷；
+   - 临时迁移可回迁：rusty 的 greedy 不改归属，之后 REPATRIATE。
+
+7. 唤醒亲和（WAKE_SYNC）要谨慎
+   cake（游戏态）和 flash 直接清除 SYNC，lavd 只在唤醒者 CPU 空闲且同域时才用，
+   p2dq 默认不跟到唤醒者所在 LLC。经验是：同步唤醒不一定带来数据共享，
+   盲目跟随唤醒者会制造迁移和缓存失效。
+
+8. 防饿死是 pull 模型的必要补丁
+   pull 模型下，空闲 CPU 睡着时不会自己去偷，受限亲和的任务可能没人消费：
+   - cake 的 tick 主动踢空 LLC 的 CPU；
+   - rusty 的 KICK_GREEDY / REPATRIATE；
+   - layered 的 antistall（3s 等待阈值）和 per-node fallback CPU；
+   - lavd 在 dispatch 中为绑核任务扩展 overflow 集合并踢对应 CPU。
+
+
+================================================================================
+七、阅读代码时发现的存疑点
+================================================================================
+
+以下两点基于当前工作副本（git log 中有一条名为 "rusty" 的提交），
+建议与上游比对后再下结论：
+
+1) scx_rusty BPF 落实用户态迁移的参数（src/bpf/main.bpf.c:1165）
+     domc = task_domain(taskc);            // 任务当前 home 域
+     if (domc->id != taskc->target_dom &&  // 用户态已把 target_dom 改成目标域
+         task_set_domain(p, domc->id, false)) {
+   而 task_set_domain(p, new_dom_id, ...)（main.bpf.c:790）内部把
+   taskc->target_dom 当作"旧域"，最后执行 taskc->target_dom = new_dom_id。
+   这里传入的 new_dom_id 是当前 home 域，结果相当于把用户态写入的
+   target_dom 改回原域，用户态的迁移决定可能并未生效。
+   从注释 "Migrate @p to a new domain if requested by userland by setting
+   target_dom" 看，原意应是迁到 target_dom。
+
+2) scx_rusty 跨 NUMA greedy 偷取条件（src/bpf/main.bpf.c:1390）
+     if (dom_node_id(dom) == my_node || dom == curr_dom ||
+         scx_bpf_dsq_nr_queued(dom) >= greedy_threshold_x_numa)
+         continue;
+   这会跳过排队数"大于等于阈值"的远端域，即只从队列短的远端域偷，
+   与"远端队列足够长才值得跨 NUMA"的直觉相反。该功能默认关闭
+   （greedy_threshold_x_numa 默认 0），影响有限。
+
+
+================================================================================
+八、成熟度说明（个人判断，供参考）
+================================================================================
+
+  - 生产使用/相对成熟：scx_lavd（Valve/Steam Deck，游戏与通用）、
+    scx_layered（Meta 生产）、scx_rusty、scx_bpfland、scx_cosmos、scx_flash、
+    scx_p2dq；
+  - 较新、迭代快：scx_cake（游戏向）、scx_beerland、scx_forge、scx_pandemonium；
+  - 实验/特殊用途：scx_mitosis（cgroup 隔离实验）、scx_tickless（减少 tick）、
+    scx_chaos（故障注入测试）、scx_rustland（用户态调度示范）。
+
+  对于"负载均衡设计"的参考价值：
+  - 想看完整的分层负载计算：scx_rusty（用户态）；
+  - 想看纯 BPF 内的规划+执行与防乒乓：scx_lavd（最精细）；
+  - 想看大规模多 LLC 的低开销方案：scx_p2dq（pick-2）；
+  - 想看"搬 CPU"思路与跨 NUMA 限速：scx_layered；
+  - 想看极简方案：scx_cake / scx_beerland。
+
+================================================================================

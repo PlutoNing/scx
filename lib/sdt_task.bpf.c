@@ -10,6 +10,7 @@
 #include <lib/sdt_task.h>
 
 /*
+每个进程记录自己arena内存的东西
  * Task BPF map entry recording the task's assigned ID and pointing to the data
  * area allocated in arena.
  */
@@ -19,6 +20,7 @@ struct scx_task_map_val {
 	struct sdt_data __arena	*data;
 };
 
+/* 记录每个进程的arena内存 */
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
@@ -60,6 +62,9 @@ int scx_task_init(__u64 data_size)
 	return scx_alloc_init(&scx_task_allocator, data_size);
 }
 
+/* 获取p的task data
+是一块arena内存
+进程的arena内存指针存在map里面, 每个p对应一个map的记录 */
 __hidden
 void __arena *scx_task_data(struct task_struct *p)
 {
@@ -68,12 +73,14 @@ void __arena *scx_task_data(struct task_struct *p)
 
 	scx_arena_subprog_init();
 
+	/* 获取每个进程的arena内存记录 */
 	mval = bpf_task_storage_get(&scx_task_map, p, 0, 0);
 	if (!mval) {
 		scx_err_loc("bpf_task_storage_get failed");
 		return NULL;
 	}
 
+	/* 进程的arena内存指针 */
 	data = mval->data;
 
 	return (void __arena *)data->payload;

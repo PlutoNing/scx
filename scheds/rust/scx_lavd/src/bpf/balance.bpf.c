@@ -17,10 +17,25 @@
 #include <lib/cgroup.h>
 
 
+/* 这个文件解决的是跨域负载均衡
+sys_stat timer (每~10ms)
+   └─ plan_x_cpdom_migration()
+        ├─ 计算每个域 load_invr
+        ├─ classify_cpdom() ×N → 设置 is_stealer / is_stealee / budget
+        └─ 无需均衡则重置所有标记
+
+CPU dispatch
+   └─ consume_task()
+        ├─ 本域是 stealer? → try_to_steal_task()   (受预算约束)
+        ├─ 本域 DSQ 消费 (vtime 最小优先)
+        └─ 仍没任务 → force_to_steal_task()        (保持 work-conserving)
+		 */
 extern const volatile u8	mig_delta_pct;
 extern const volatile u8	no_fast_lb;
 extern const volatile u64	lb_low_util_wall;
 
+/* 计算迁移容忍带 x_mig_delta,作用是给"公平份额"加上滞回区间,避免负载稍有偏差就
+来回迁移(ping-pong)。 */
 u64 __attribute__ ((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
 					      u64 mig_delta_factor)
 {
@@ -29,6 +44,8 @@ u64 __attribute__ ((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
 	 * When mig_delta_factor > 0, the user specified a fixed
 	 * migration delta percentage; otherwise use the dynamic
 	 * shift-based heuristic.
+	 nz_qlen = 有排队负载的域个数。越多域在排队(系统越忙),容忍带越窄,
+	 均衡越积极;没人排队时带宽很宽,几乎不迁移。noinline 是为了让 verifier 分开分析。
 	 */
 	if (mig_delta_factor > 0)
 		return avg_load_invr * mig_delta_factor / LAVD_SCALE;
@@ -40,6 +57,7 @@ u64 __attribute__ ((noinline)) calc_mig_delta(u64 avg_load_invr, int nz_qlen,
 }
 
 /*
+给单个域定角色。返回 1 表示它成为 stealee。
  * Classify a single compute domain as stealer, stealee, or neutral.
  * Returns 1 if the domain became a stealee, 0 otherwise.
  * Marked noinline so the verifier analyses it separately from the
@@ -57,12 +75,18 @@ classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
 	if (!cpdomc)
 		return 0;
 
+		/* 第一步:算阈值 */
 	if (no_fast_lb && sys_stat.nr_active_cpdoms) {
+		/* no_fast_lb:简单平均 avg = total_load / nr_active_cpdoms,上下加减 delta。 */
 		u64 avg = total_load_invr / sys_stat.nr_active_cpdoms;
 		x_mig_delta = calc_mig_delta(avg, nz_qlen, mig_delta_factor);
 		stealer_threshold = avg - x_mig_delta;
 		stealee_threshold = avg + x_mig_delta;
 	} else if (cpdomc->nr_active_cpus && total_cap_sum > 0) {
+		/* fast LB(默认):按算力比例的公平份额 fair_share_invr = 
+		total_load_invr × cap_sum_active_cpus / total_cap_sum 然后
+		 stealer_threshold = fair_share − delta,stealee_threshold = fair_share + delta。 
+		这对大小核异构很重要:大核域应该承担更多负载。 */
 		fair_share_invr = total_load_invr *
 			     cpdomc->cap_sum_active_cpus /
 			     total_cap_sum;
@@ -75,12 +99,15 @@ classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
 		stealee_threshold = fair_share_invr + x_mig_delta;
 	}
 
+	/* 第二步:判 stealer 条件:域活跃且 load_invr <= stealer_threshold。 */
 	/*
 	 * Under-loaded active domains become a stealer.
 	 * Ingress budget = half the deficit below fair share.
 	 */
 	if (cpdomc->nr_active_cpus &&
 	    cpdomc->load_invr <= stealer_threshold) {
+			/* stealer_budget = (fair_share − load_invr) / 2:只填补一半缺口,防止过冲。
+设置 is_stealer = true、is_stealee = false,返回 0。 */
 		u64 stealer_budget = 0;
 
 		if (fair_share_invr > cpdomc->load_invr)
@@ -95,6 +122,7 @@ classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
 	}
 
 	/*
+	第三步:判 stealee 条件:域非活跃,或 load_invr >= stealee_threshold。
 	 * Over-loaded or non-active domains become a stealee.
 	 * Egress budget = half the excess above fair share. Halving
 	 * (rather than draining the full excess) avoids two failure
@@ -114,9 +142,14 @@ classify_cpdom(struct cpdom_ctx *cpdomc, u64 total_load_invr,
 	    cpdomc->load_invr >= stealee_threshold) {
 		u64 stealee_budget_invr = 0;
 
+		/* 若 qload_invr == 0 → 没有排队任务可偷,重置角色
+		(注释:可能因为"正在运行"的负载大而看起来过载,但 DSQ 是空的,硬偷只会浪费、引起震荡)。 */
 		if (cpdomc->qload_invr == 0)
 			goto reset_role;
 
+			/* stealee_budget = (load_invr − fair_share) / 2,同样取一半,避免:
+ping-pong:一次迁太多导致反向失衡
+惊群:多个 stealer 同时看到该域,在一轮里把它抽干 */
 		if (cpdomc->load_invr > fair_share_invr)
 			stealee_budget_invr = (cpdomc->load_invr -
 					       fair_share_invr) / 2;
@@ -139,6 +172,35 @@ reset_role:
 	return 0;
 }
 
+/* 跨域负载均衡,
+它是 pull 模型:空闲/低负载的域主动去偷,不是高负载域往外推。分两个阶段:
+计划阶段：plan_x_cpdom_migration()全局统计各域负载,把域标记为 stealer(偷取方)/ stealee(被偷方),并计算预算
+执行(Execute)阶段：每个 CPU 在 dispatch 时,需要拿任务
+调用consume_task() → try_to_steal_task() / force_to_steal_task()
+按规划结果实际从别的域拉任务
+*/
+/* . plan_x_cpdom_migration()(142–246 行)
+规划阶段入口,标 __weak 以便链接。流程:
+
+统计每个活跃域的负载(158–193 行)
+
+跳过 nr_active_cpus == 0 的域,但若其 cur_util_wall_sum > 0,说明休眠域上仍有任务在跑 → overflow_running = true(需要触发均衡把它们迁走)。
+计算 per-CPU 平均利用率 util = avg_util_wall_sum / nr_active_cpus,记录最大值 max_avg_util_wall。
+域负载:
+fast LB:load_invr = avg_util_invr_sum + qload_invr(运行负载 + 排队负载),qload_invr != 0 则 nz_qlen++。
+no_fast_lb:util + qlen_invr,其中 qlen_invr 按任务数除以算力。
+累加 total_load_invr、total_cap_sum。
+低利用率短路(200–201 行) max_avg_util_wall < lb_low_util_wall → 系统整体很闲,不值得均衡,跳到 reset。
+
+准备 mig_delta_factor(209–211 行):把百分比转定点数。
+
+逐域分类(213–222 行):调用 classify_cpdom(),累计 nr_stealee。
+
+无需均衡:nr_stealee == 0 && !overflow_running → reset。否则写入 sys_stat.nr_stealee 返回。
+
+reset_and_skip_lb(231–245 行):仅在上一轮有 stealee 时(sys_stat.nr_stealee > 0)才遍历清理所有域的标志和预算,并把 nr_stealee 置 0——避免每轮无谓写 cacheline。
+
+这个函数每个周期会"从头重算"所有预算,所以消费端对预算的过度扣减会在下一轮自我纠正。 */
 __weak
 int plan_x_cpdom_migration(void)
 {
@@ -153,6 +215,7 @@ int plan_x_cpdom_migration(void)
 	int nz_qlen = 0;
 
 	/*
+	统计每个活跃域的负载
 	 * Calculate load for each active compute domain.
 	 */
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
@@ -246,6 +309,9 @@ reset_and_skip_lb:
 }
 
 /*
+对 scx_bpf_dsq_move_to_local(dsq_id, 0) 的封装:把指定 DSQ 的队首任务移入当前
+ CPU 的本地 DSQ。is_monitored 打开时,
+记录耗时写入 cpdomc->dsq_consume_lat。参数 dsq_id 可以是 per-cpdom DSQ 或 per-CPU DSQ。
  * dsq_id: candidate DSQ to consume from, can be per-cpdom or per-cpu.
  */
 static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
@@ -266,6 +332,9 @@ static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 	return ret;
 }
 
+/* 用 __COMPAT_scx_bpf_dsq_peek() 窥视 DSQ 队首任务(不取出),取其 task_ctx,返回
+ task_load_metric。
+用于预算扣减量。窥不到返回 0。 */
 u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
 {
 	struct task_struct *peek_p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
@@ -278,6 +347,14 @@ u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
 	return 0;
 }
 
+/* 在 stealee 域内挑选负载最重的 DSQ:
+
+域级 DSQ(use_cpdom_dsq()):候选 = cpdom_to_dsq(id),负载 = qload_invr(no_fast_lb 时为 DSQ 队列长度)。
+per-CPU DSQ(is_per_cpu_dsq_migratable()):遍历域内所有 CPU(用 __cpumask 逐 64 位、cpumask_next_set_bit 找置位),负载为 cpuc->qload_invr(no_fast_lb 时为 per-CPU DSQ + SCX_DSQ_LOCAL_ON 队列长度),取最大者。
+返回 DSQ id,没有任何排队负载则保持 -ENOENT。
+注释提到:当 pinned_slice_ns 开启但 per_cpu_dsq 关闭时,per-CPU DSQ 里只有被绑定的任务,不可迁移,所以不检查。
+
+(highest_load 初值是域 DSQ 的负载,所以 per-CPU DSQ 必须"严格更重"才会替换。) */
 u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 {
 	u64 pick_dsq_id = -ENOENT;
@@ -341,6 +418,25 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	return pick_dsq_id;
 }
 
+/* try_to_steal_task()(344–452 行)
+受控偷取(依赖规划阶段的标志与预算),调用者是 stealer 域的 CPU。
+
+非活跃域不偷。
+no_fast_lb 时按概率 1 / (nr_active_cpus × MIG_PROB_FT) 尝试,让整个域平均每个周期
+只尝试少数几次,避免所有 CPU 同时去偷。
+按距离由近到远遍历邻居(外层 i 是距离层级,内层 j 是同距离内的环形序):
+跳过非 is_stealee、非 is_valid、或 stealee_budget_invr <= 0 的域。
+pick_most_loaded_dsq() 选 DSQ;(s64)dsq_id < 0 则 continue(否则后面传 -ENOENT
+ 会让调度器报错退出)。
+dsq_peek_task_load() 获取预估任务大小(no_fast_lb 时跳过)。注释说明有 TOCTOU:peek
+ 的任务不一定是最终被 consume 的那个,
+但预算只是提示,下一轮会重算,可接受。
+consume_dsq() 成功后:
+no_fast_lb:直接清掉双方的 is_stealee / is_stealer,即"一次一个"。
+fast LB:decrement_stealee_budget / decrement_stealer_budget,原子扣减,预算 ≤ 0 时
+自动清标志。stealer 在整轮里可持续偷,直到预算耗尽。
+同一距离层级偷不到,则以 1 / LAVD_CPDOM_MIG_PROB_FT 的概率才去更远一层,否则 break。跨
+更远(如跨 NUMA)迁移代价更大,所以概率随距离指数衰减,更倾向近邻。 */
 static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
@@ -451,6 +547,16 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 	return false;
 }
 
+/* force_to_steal_task()(454–520 行)
+强制偷取,保证 work-conserving:本域没任务时,哪怕不满足 stealer/stealee 条件,
+也从任一有效邻居域偷。
+
+与 try_to_steal_task 的区别:
+
+不检查 is_stealee、预算、概率。
+不做距离衰减概率,按距离顺序全部遍历。
+仍然会 peek 并 decrement 预算以保持账目一致(!no_fast_lb),成功则直接返回 true。
+ */
 static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
@@ -519,6 +625,30 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 	return false;
 }
 
+/* 9. consume_task()(522–604 行)
+dispatch 路径的入口,取任务的完整策略:
+
+
+
+判断本 CPU 是否"湍流":cpuc->lat_headroom < LAVD_LC_LATENCY_SENSITIVE_THRESH
+(受 IRQ/steal 影响大,不适合跑延迟敏感任务)。
+
+优先跨域偷:nr_cpdoms > 1 && is_stealer && try_to_steal_task() 成功则
+ goto x_domain_migration_out,直接返回 true。
+
+本域内多队列合并:构造 3 个候选 DSQ(dsqs[0..2]):
+
+[0] per-CPU DSQ(use_per_cpu_dsq() 时有效)
+[1] cpdom DSQ。非湍流 CPU 总是可消费;湍流 CPU 仅当该 DSQ 排队数 > 湍流 DSQ 排队数
+(防饿死),或域内没有 steady CPU(没人能清它)时才可消费
+[2] cpdom 的 turbulent DSQ(存放非延迟关键任务,所有 CPU 都可消费)
+对每个 eligible 的 DSQ 用 peek_dsq_vtime() 取队首 vtime,sort_dsqs() 按 vtime 升序
+,然后依次尝试 consume_dsq,vtime 最小者优先,保证跨队列的公平性。
+
+兜底:本域都没任务,且 nr_cpdoms > 1 && mig_delta_pct == 0 时,调用 force_to_steal_task()。
+若用户设置了 mig_delta_pct,意图是"只依靠阈值迁移",所以禁用 force steal。
+
+都没拿到任务返回 false(CPU 将 idle)。 */
 __hidden
 bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 {
@@ -534,6 +664,7 @@ bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id)
 		return false;
 	}
 
+	/* 取本 CPU 所在 cpdom 的 cpdomc,算出 turbulent DSQ id。 */
 	cpdom_turb_dsq_id = cpdom_to_turb_dsq(dsq_to_cpdom(cpdom_dsq_id));
 
 	/*

@@ -156,6 +156,7 @@ struct Opts {
     /// （默认 0，实验性） 负载迁移的阈值百分比。默认关闭时，LAVD 用动态阈值 + 概率性抢占（force task stealing）
     /// 做负载均衡。开启后改为固定比例阈值，同时关闭 force stealing，换来更可预测的迁移行为，
     /// 适合需要稳定调度的场景调试。
+    /// /* 用户指定的迁移容忍带百分比(0 表示用动态启发式)。同时 > 0 时禁用 force steal */
     #[clap(long = "mig-delta-pct", default_value = "0", value_parser=Opts::mig_delta_pct_range)]
     mig_delta_pct: u8,
 

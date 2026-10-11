@@ -701,6 +701,8 @@ static __always_inline void account_queued_load(task_ctx *taskc,
 	 */
 	u32 load = task_load_metric(taskc);
 	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	/* account_queued_load():入队时 qload_invr += task_load_metric(),并在 task 里保存
+	 snapshot(queued_load_snapshot)和 queued_in_cpdom_id。 */
 	if (cpdomc)
 		__sync_fetch_and_add(&cpdomc->qload_invr, load);
 	taskc->queued_load_snapshot = load;
@@ -716,6 +718,8 @@ static __always_inline void unaccount_queued_load(task_ctx *taskc)
 		return;
 
 	cpdomc = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	/* unaccount_queued_load():出队/开始运行时减去当初的 snapshot(而不是当前
+	 util_est),避免 util_est 变化导致计数漂移。 */
 	if (cpdomc)
 		__sync_fetch_and_sub(&cpdomc->qload_invr,
 				     taskc->queued_load_snapshot);
@@ -883,6 +887,7 @@ out:
 	return cpu_id;
 }
 
+/* 入队ops */
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc, *cpuc_cur;
@@ -891,6 +896,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	task_ctx *taskc;
 	u64 dsq_id;
 
+	/* 获取当前cpu的cpu_ctx */
 	cpuc_cur = get_cpu_ctx();
 	taskc = get_task_ctx_curcpu(p, cpuc_cur);
 	if (!taskc || !cpuc_cur) {
@@ -1942,6 +1948,7 @@ void BPF_STRUCT_OPS(lavd_update_idle, s32 cpu, bool idle)
 	}
 }
 
+/* 更新任务的cpumask亲和性 */
 void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 		    const struct cpumask *cpumask)
 {
@@ -1956,6 +1963,7 @@ void BPF_STRUCT_OPS(lavd_set_cpumask, struct task_struct *p,
 	set_affinity_flags(taskc, cpumask);
 }
 
+/* scx准备在这个cpu执行 */
 void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
 		    struct scx_cpu_acquire_args *args)
 {
@@ -1975,6 +1983,7 @@ void BPF_STRUCT_OPS(lavd_cpu_acquire, s32 cpu,
 	cpuc->cpuperf_cur = scx_bpf_cpuperf_cur(cpu);
 }
 
+/* 这个cpu要执行其他调度类了 */
 void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 		    struct scx_cpu_release_args *args)
 {
@@ -1995,6 +2004,7 @@ void BPF_STRUCT_OPS(lavd_cpu_release, s32 cpu,
 
 	/*
 	 * Requeue the tasks in a local DSQ to the global enqueue.
+	 把local dsq的任务重新派发到scx
 	 */
 	scx_bpf_reenqueue_local();
 
