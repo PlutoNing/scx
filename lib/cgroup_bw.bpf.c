@@ -2970,7 +2970,7 @@ cbw_unthrottle_cgroup_for_exit()
 将 cgroup 的 nquota_ub 和 period_budget 设为无限，并清除 is_throttled，用于 cgroup 退出前解除节流
 运行时记账
 函数	作用
-scx_cgroup_bw_consume()
+函数scx_cgroup_bw_consume()
 任务运行后调用：原子地将 consumed_ns 加到当前 LLC 的 runtime_total；利用任务上下文缓存 cgx_raw 和 llcx_raw 加速查找；无限配额 cgroup 走快速路径直接返回
 cbw_sum_rumtime_total_llcx()
 汇总一个 cgroup 所有 LLC 上下文的 runtime_total

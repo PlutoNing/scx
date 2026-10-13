@@ -37,6 +37,8 @@ RB_DUPLICATE：允许重复键（FIFO 模式下 seq 单调递增不会重复，v
 相同 vtime）。
 atq = (scx_atq_t *)data->payload：scx_alloc 返回的是 sdt_data（SDT = Slab Data
 Task），它的 payload 才是实际数据区。这是分配器的内部约定，调用者需要自己转型。 */
+
+/* 主要是为了实现 cgroup bw 引入的 */
 __weak
 u64 scx_atq_create_internal(bool fifo, size_t capacity)
 {
