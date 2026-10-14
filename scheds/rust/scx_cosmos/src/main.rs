@@ -67,14 +67,18 @@ const SCHEDULER_NAME: &str = "scx_cosmos";
 )]
 struct Opts {
     /// Exit debug dump buffer length. 0 indicates default.
+    /// /* BPF 退出时调试信息转储缓冲区的长度，0 表示使用默认值。 */
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
 
     /// Maximum scheduling slice duration in microseconds.
+    /// 任务最大调度时间片（微秒）。时间片越小响应性越好，但上下文切换开销越大。
     #[clap(short = 's', long, default_value = "1000")]
     slice_us: u64,
 
     /// Maximum runtime (since last sleep) that can be charged to a task in microseconds.
+    /// 自上次睡眠以来，一个任务最多能被"计入"的运行时长（微秒），
+    /// 用于限制长时间运行任务对公平性/延迟计算的影响。
     #[clap(short = 'l', long, default_value = "20000")]
     slice_lag_us: u64,
 
@@ -95,6 +99,9 @@ struct Opts {
     ///
     /// A higher value is recommended for server-type workloads, while a lower value is recommended
     /// for interactive-type workloads.
+    /// CPU 繁忙阈值（0-100%）。当平均 CPU 利用率达到此阈值时，调度器从"多个 per-CPU 轮询队列"
+    /// （利于局部性、减少锁竞争）切换为"全局基于 deadline 的调度队列"
+    /// （利于负载均衡，但增加迁移）。值越低越偏向交互式负载，越高越偏向服务器类吞吐负载。
     #[clap(short = 'c', long, default_value = "0")]
     cpu_busy_thresh: u64,
 
@@ -108,6 +115,8 @@ struct Opts {
     /// Value is clamped to the range [10 .. 1000].
     ///
     /// 0 = disabled.
+    /// 刷新 CPU 利用率的轮询周期（毫秒），用于驱动上面 cpu_busy_thresh 的判断。
+    /// 会被 clamp 到 [10, 1000]，0 表示禁用该功能。
     #[clap(short = 'p', long, default_value = "0")]
     polling_ms: u64,
 
@@ -122,11 +131,15 @@ struct Opts {
     /// "all" = all CPUs assigned to the primary domain.
     ///
     /// By default "all" CPUs are used.
+    /// 指定优先使用的 CPU 列表。支持显式列表/区间（如 0-3,12-15），也支持关键字 turbo（最高频率）、
+    /// performance（最快）、powersave（最慢）、all（默认，全部 CPU）。
     #[clap(short = 'm', long)]
     primary_domain: Option<String>,
 
     /// Hardware perf event to monitor (0x0 = disabled). Accepts hex (0xN) or symbolic names
     /// (e.g. cache-misses, LLC-load-misses, page-faults, branch-misses).
+    /// 监控的硬件性能事件（如 cache-misses），以及事件速率阈值（每毫秒），超过该阈值的任务被视为
+    /// "事件密集型"并触发迁移。perf_threshold=0 表示启用动态阈值算法（见下文 DynamicThresholdState）。
     #[clap(short = 'e', long, default_value = "0x0", value_parser = parse_perf_event)]
     perf_config: PerfEventSpec,
 
@@ -136,6 +149,7 @@ struct Opts {
 
     /// Sticky perf event (0x0 = disabled). When a task exceeds -Y for this event, keep it on the same CPU.
     /// Accepts hex (0xN) or symbolic names (e.g. cache-misses, LLC-load-misses).
+    /// 另一组独立的"粘性"性能事件和阈值——当任务该事件计数超过阈值时，倾向于把它保持在同一 CPU 上（而非迁移）。
     #[clap(short = 'y', long, default_value = "0x0", value_parser = parse_perf_event)]
     perf_sticky: PerfEventSpec,
 
@@ -144,6 +158,7 @@ struct Opts {
     perf_sticky_threshold: u64,
 
     /// Enable GPU-aware scheduling.
+    /// 启用 GPU 感知调度（通过 NVML 同步 GPU 使用进程的 PID 到 NUMA 节点映射）
     #[clap(short = 'g', long, action = clap::ArgAction::SetTrue)]
     gpu: bool,
 
@@ -151,10 +166,12 @@ struct Opts {
     ///
     /// Uses NVML process utilization (SM + memory). 0 = no filter (all processes on the GPU are
     /// considered GPU-bound). Requires driver support (Maxwell or newer).
+    /// 只有 GPU 利用率（SM 或显存，取较大值）达到该百分比的进程才被视为"GPU 绑定"，0 表示不过滤。
     #[clap(long, default_value = "0", value_parser = clap::value_parser!(u32).range(0..=100))]
     gpu_util_threshold: u32,
 
     /// Disable NUMA optimizations.
+    /// 禁用 NUMA 优化 / CPU 调频控制。
     #[clap(short = 'n', long, action = clap::ArgAction::SetTrue)]
     disable_numa: bool,
 
@@ -166,6 +183,7 @@ struct Opts {
     ///
     /// This option can help reducing some overhead when trying to allocate idle CPUs and it can be
     /// quite effective with simple CPU topologies.
+    /// 启用"扁平化"空闲 CPU 扫描，拓扑简单时能降低扫描开销。
     #[arg(short = 'i', long, action = clap::ArgAction::SetTrue)]
     flat_idle_scan: bool,
 
@@ -173,6 +191,7 @@ struct Opts {
     ///
     /// With this option enabled, the scheduler will prioritize assigning tasks to higher-ranked
     /// cores before considering lower-ranked ones.
+    /// 优先把任务分配到"排名更高"（容量更大）的核心上。
     #[clap(short = 'P', long, action = clap::ArgAction::SetTrue)]
     preferred_idle_scan: bool,
 
@@ -180,6 +199,7 @@ struct Opts {
     ///
     /// This option can only be used together with --flat-idle-scan or --preferred-idle-scan,
     /// otherwise it is ignored.
+    /// 禁用 SMT（仅在配合 flat_idle_scan 或 preferred_idle_scan 时生效）。
     #[clap(long, action = clap::ArgAction::SetTrue)]
     disable_smt: bool,
 
@@ -192,6 +212,7 @@ struct Opts {
     /// When enabled, multiple concurrent wakeups can select the same idle CPU
     /// before it fully wakes up. This can improve performance in highly communicative
     /// workloads by aggressively stacking tasks on the same cache.
+    /// 禁用"提前清除空闲 CPU 状态"，允许多个并发唤醒抢同一个空闲 CPU，利于强通信型负载的 cache 堆叠。
     #[clap(short = 'N', long, action = clap::ArgAction::SetTrue)]
     no_early_clear: bool,
 
@@ -201,6 +222,7 @@ struct Opts {
     /// potentially improving performance in certain scenarios. However, it may come at the cost of
     /// reduced efficiency for pipe-intensive workloads that benefit from tighter producer-consumer
     /// coupling.
+    /// 禁用同步唤醒时的直接派发（direct dispatch），利于负载更均匀分布，但可能降低管道型负载的生产者-消费者耦合效率。
     #[clap(short = 'w', long, action = clap::ArgAction::SetTrue)]
     no_wake_sync: bool,
 
@@ -213,6 +235,7 @@ struct Opts {
     /// By default, the scheduler preempts tasks that exceed their time slice, measuring the time
     /// slice via the tick handler. Add an option to enforce preemption based on the high-precision
     /// timer and CPU occupancy. Enable this option to improve latency-sensitive workloads.
+    /// 启用基于高精度定时器的抢占（而非仅靠 tick），改善延迟敏感型负载。
     #[clap(long, action = clap::ArgAction::SetTrue)]
     time_preemption: bool,
 
@@ -222,15 +245,18 @@ struct Opts {
     /// same process) on the same CPU across wakeups.
     ///
     /// This can improve locality and performance in certain cache-sensitive workloads.
+    /// 地址空间亲和性，让共享同一地址空间的线程倾向停留在同一 CPU，提升缓存局部性。
     #[clap(short = 'a', long, action = clap::ArgAction::SetTrue)]
     mm_affinity: bool,
 
     /// Enable stats monitoring with the specified interval.
+    /// 以指定间隔启用统计监控（monitor 模式下不启动调度器本体，仅监控）。
     #[clap(long)]
     stats: Option<f64>,
 
     /// Run in stats monitoring mode with the specified interval. Scheduler
     /// is not launched.
+    /// 以指定间隔启用统计监控（monitor 模式下不启动调度器本体，仅监控）。
     #[clap(long)]
     monitor: Option<f64>,
 
@@ -255,6 +281,9 @@ pub fn parse_cpu_list(optarg: &str) -> Result<Vec<usize>, String> {
     let mut seen = HashSet::new();
 
     // Handle special keywords
+    /* 如果输入恰好是 powersave/performance/turbo/all 这四个关键字之一，
+    直接调用 get_primary_cpus(mode)（基于硬件拓扑的频率/容量信息自动挑选
+     CPU 集合）并返回，不走后续解析逻辑。 */
     if let Some(mode) = match optarg {
         "powersave" => Some(Powermode::Powersave),
         "performance" => Some(Powermode::Performance),
@@ -266,6 +295,8 @@ pub fn parse_cpu_list(optarg: &str) -> Result<Vec<usize>, String> {
     }
 
     // Validate input characters
+    /* 对于非关键字输入，先检查字符串只能包含数字、-、,、空白字符，否则直接返回
+     "Invalid character in CPU list" 错误。然后把空格替换为 tab（主要用于后续 trim）。 */
     if optarg
         .chars()
         .any(|c| !c.is_ascii_digit() && c != '-' && c != ',' && !c.is_whitespace())
@@ -321,41 +352,55 @@ pub fn parse_cpu_list(optarg: &str) -> Result<Vec<usize>, String> {
     Ok(cpus)
 }
 
+/* 这组常量服务于基于 EMA（指数移动平均）+ 滞后区间（hysteresis）的自适应阈值调节算法，
+用于当用户没有手动指定 perf_threshold/perf_sticky_threshold（即传 0）时，
+由用户态程序动态调整 BPF 侧使用的阈值： */
 /// Initial value for the dynamic threshold (in BPF units).
+/// 阈值的初始值（BPF 单位）
 const DYNAMIC_THRESHOLD_INIT_VALUE: u64 = 1000;
 
 /// Minimum value for the dynamic threshold (in BPF units).
+/// 阈值下限，避免被压到 0 或负数
 const DYNAMIC_THRESHOLD_MIN_VALUE: u64 = 10;
 
 /// Target event rate (per second) above which we consider migrations/sticky dispatches too high.
+/// 事件速率（次/秒）上限：超过此值认为"迁移/粘性派发过多"，需要提高阈值使其更难触发
 const DYNAMIC_THRESHOLD_RATE_HIGH: f64 = 4000.0;
 
 /// Target event rate (per second) below which we consider migrations/sticky dispatches too low.
+/// 事件速率下限：低于此值认为触发太少，需要降低阈值使其更容易触发
 const DYNAMIC_THRESHOLD_RATE_LOW: f64 = 2000.0;
 
 /// Hysteresis band: rate must move by this fraction beyond the target bounds before we act.
 /// This prevents oscillation when the rate hovers near the threshold boundaries.
+/// 滞后带宽度（10%），防止速率在边界附近抖动导致阈值反复调整(振荡)
 const DYNAMIC_THRESHOLD_HYSTERESIS: f64 = 0.1;
 
 /// EMA smoothing factor (alpha). Higher values give more weight to recent samples.
 /// 0.3 provides good balance between responsiveness and stability.
+/// EMA 平滑系数，新采样权重 30%，历史权重 70%
 const DYNAMIC_THRESHOLD_EMA_ALPHA: f64 = 0.3;
 
 /// Minimum scale factor when just outside the target band (slow convergence near optimal).
+/// 刚越过目标区间边界时的最小调整步幅（缓慢收敛）
 const DYNAMIC_THRESHOLD_SCALE_MIN: f64 = 0.0001;
 
 /// Maximum scale factor when far from target (fast convergence when initial threshold is way off).
+/// 远离目标区间时的最大调整步幅（快速收敛）
 const DYNAMIC_THRESHOLD_SCALE_MAX: f64 = 1000.0;
 
 /// Slope for "too high" case: scale grows with (rate/HIGH - 1) so we step much harder when rate is
 /// many times over target.
+/// "速率过高"情形下，调整幅度随超出比例增长的斜率
 const DYNAMIC_THRESHOLD_SLOPE_HIGH: f64 = 0.35;
 
 /// Slope for "too low" case: scale grows with deficit so we step harder when rate is near zero.
+/// "速率过低"情形下，调整幅度随不足程度增长的斜率（更激进，因为要快速逼近 0 附近时的极端情况）
 const DYNAMIC_THRESHOLD_SLOPE_LOW: f64 = 0.58;
 
 /// Minimum interval between NVML GPU PID syncs. Kept separate from CPU polling so that fast
 /// polling (e.g. 100 ms) does not trigger expensive NVML calls every tick.
+/// NVML GPU PID 同步的最小间隔，避免轮询周期很短（如 100ms）时每个 tick 都触发昂贵的 NVML 调用
 const GPU_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// State for EMA-based dynamic threshold adjustment with hysteresis.
@@ -366,16 +411,23 @@ const GPU_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone)]
 struct DynamicThresholdState {
     /// Current threshold value.
+    /// 当前实际生效的阈值（即将写回 BPF bss 的 perf_threshold / perf_sticky_threshold）。
     threshold: u64,
     /// EMA-smoothed rate estimate.
+    /// 事件速率的 EMA 平滑值，用于过滤瞬时抖动。
     smoothed_rate: f64,
     /// Previous raw counter value for delta calculation.
+    /// BPF 侧累计计数器（如 nr_event_dispatches）的上一次采样值，用来算 delta。
     prev_counter: u64,
     /// Whether the EMA has been initialized with a valid sample.
+    /// 标记 EMA 是否已经有过第一次采样（首次采样时直接赋值而非做加权平均）。
     initialized: bool,
     /// Current adjustment direction: None (stable), Some(true) = raising, Some(false) = lowering.
     /// Used for hysteresis: once we start adjusting in a direction, we continue until
     /// the rate crosses back into the stable band with hysteresis margin.
+    /// 当前调整方向的状态机标志：None=稳定、Some(true)=正在升高阈值、Some(false)=正在降低阈值。这是
+    /// 实现滞后（hysteresis）的关键——一旦进入某个调整方向，必须等速率"反向越过"更宽的边界才会停止调整，
+    /// 防止来回震荡。
     adjustment_direction: Option<bool>,
 }
 
@@ -405,11 +457,14 @@ impl DynamicThresholdState {
         }
 
         // Calculate instantaneous rate.
+        
+        /* 根据 elapsed_secs 内计数器增量算出瞬时速率 raw_rate。 */
         let delta = counter.saturating_sub(self.prev_counter);
         self.prev_counter = counter;
         let raw_rate = delta as f64 / elapsed_secs;
 
         // Update EMA.
+        /* 用 EMA 公式平滑速率：smoothed = α·raw + (1-α)·smoothed_prev（首次采样直接赋值）。 */
         if self.initialized {
             self.smoothed_rate = DYNAMIC_THRESHOLD_EMA_ALPHA * raw_rate
                 + (1.0 - DYNAMIC_THRESHOLD_EMA_ALPHA) * self.smoothed_rate;
@@ -424,8 +479,10 @@ impl DynamicThresholdState {
         let old_threshold = self.threshold;
 
         // Calculate hysteresis-adjusted bounds based on current state.
+        /* 根据当前 adjustment_direction 状态选择不同的"有效边界"（effective_high/effective_low） */
         let (effective_high, effective_low) = match self.adjustment_direction {
             Some(true) => {
+                /* 若正在升高：维持升高直到速率跌破 LOW×(1-滞后)。 */
                 // Currently raising threshold: need rate to drop below LOW - hysteresis to stop.
                 (
                     DYNAMIC_THRESHOLD_RATE_HIGH,
@@ -433,6 +490,7 @@ impl DynamicThresholdState {
                 )
             }
             Some(false) => {
+                /* 若正在降低：维持降低直到速率升破 HIGH×(1+滞后)。 */
                 // Currently lowering threshold: need rate to rise above HIGH + hysteresis to stop.
                 (
                     DYNAMIC_THRESHOLD_RATE_HIGH * (1.0 + DYNAMIC_THRESHOLD_HYSTERESIS),
@@ -440,6 +498,7 @@ impl DynamicThresholdState {
                 )
             }
             None => {
+                /* 若稳定：只有速率越过 HIGH×(1+滞后) 或跌破 LOW×(1-滞后) 才开始调整。 */
                 // Stable state: need rate to exceed bounds + hysteresis to start adjusting.
                 (
                     DYNAMIC_THRESHOLD_RATE_HIGH * (1.0 + DYNAMIC_THRESHOLD_HYSTERESIS),
@@ -449,6 +508,7 @@ impl DynamicThresholdState {
         };
 
         // Determine new adjustment direction.
+        /* 据此决定新方向 new_direction， */
         let new_direction = if rate > effective_high {
             Some(true) // Rate too high, raise threshold.
         } else if rate < effective_low && rate >= 0.0 {
@@ -468,6 +528,8 @@ impl DynamicThresholdState {
         };
 
         // Apply adjustment if we have a direction.
+        /* 若有方向则调用 compute_scale 计算调整幅度 scale，
+        按 factor = 1±scale 对阈值做乘法调整，并 clamp 到 [MIN_VALUE, u64::MAX]。 */
         if let Some(raising) = new_direction {
             let scale = Self::compute_scale(rate, raising);
             let factor = if raising { 1.0 + scale } else { 1.0 - scale };
@@ -478,6 +540,8 @@ impl DynamicThresholdState {
         self.adjustment_direction = new_direction;
 
         // Return new threshold only if it changed.
+        /* 若阈值发生变化，verbose 模式下打印日志，并返回 Some(新阈值)；
+        否则返回 None（调用方据此判断要不要写回 BPF map）。 */
         if self.threshold != old_threshold {
             if verbose {
                 info!(
@@ -498,13 +562,19 @@ impl DynamicThresholdState {
 
     /// Compute the scale factor for threshold adjustment based on how far the rate
     /// is from the target band.
+    /// 这是一个带滞后区间的自适应 PID 式控制器，让 BPF 侧的"事件密集/粘性"派发阈值自动收敛到让触发速率落在
+    ///  [2000, 4000] 次/秒区间内，既不会频繁触发也不会几乎不触发。
     fn compute_scale(rate: f64, too_high: bool) -> f64 {
         if too_high {
+            /* 速率过高：excess = rate/HIGH - 1（越超标调整越猛，上限封顶 4 倍），
+            scale = MIN + SLOPE_HIGH × min(excess, 4)。 */
             let excess = ((rate / DYNAMIC_THRESHOLD_RATE_HIGH) - 1.0).max(0.0);
             let scale =
                 DYNAMIC_THRESHOLD_SCALE_MIN + DYNAMIC_THRESHOLD_SLOPE_HIGH * excess.min(4.0);
             scale.min(DYNAMIC_THRESHOLD_SCALE_MAX)
         } else {
+            /* 速率过低：若速率 ≤ 0，直接用最大步幅 SCALE_MAX（极端情况快速拉低阈值）；
+            否则 deficit = (LOW - rate)/LOW，scale = MIN + SLOPE_LOW × deficit。 */
             if rate <= 0.0 {
                 return DYNAMIC_THRESHOLD_SCALE_MAX;
             }
@@ -526,14 +596,19 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     opts: &'a Opts,
     struct_ops: Option<libbpf_rs::Link>,
+    /* 统计信息的 RPC 服务端，用于响应 scx_cosmos --stats / --monitor 等外部查询。 */
     stats_server: StatsServer<(), Metrics>,
     /// GPU device index -> NUMA node (for NVML PID sync). Only set when --gpu and NUMA enabled.
+    /// GPU 索引（NVML id）→ NUMA 节点号的映射，仅在 --gpu 且 NUMA 启用时为 Some。
     gpu_index_to_node: Option<HashMap<u32, u32>>,
     /// Previous (pid, node) set so we can remove PIDs that stopped using the GPU.
+    /// 上一轮同步时的 PID→节点 映射，用于计算哪些 PID 不再使用 GPU 需要从 BPF map 中删除。
     previous_gpu_pids: Option<HashMap<u32, u32>>,
     /// Reused NVML handle to avoid re-initializing on every sync (expensive).
+    /// 复用的 NVML 句柄，避免每次同步都重新初始化（代价很高）
     nvml: Option<Nvml>,
     /// Dynamic threshold state for perf event migrations (when --perf-threshold is 0/dynamic).
+    /// 对应上一节的动态阈值状态机，仅在用户未显式指定静态阈值（即传 0）时为 Some。
     perf_threshold_state: Option<DynamicThresholdState>,
     /// Dynamic threshold state for sticky perf events (when --perf-sticky-threshold is 0/dynamic).
     perf_sticky_threshold_state: Option<DynamicThresholdState>,
@@ -541,15 +616,18 @@ struct Scheduler<'a> {
 
 impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+        /* 解除 RLIMIT_MEMLOCK 限制，为加载 BPF 程序/map 做准备。 */
         try_set_rlimit_infinity();
 
         // Initialize CPU topology.
+        /* 构建 Topology，判断 SMT 是否启用（smt_enabled，取决于硬件支持且用户未 --disable-smt） */
         let topo = Topology::new().unwrap();
 
         // Check host topology to determine if we need to enable SMT capabilities.
         let smt_enabled = !opts.disable_smt && topo.smt_enabled;
 
         // Determine the amount of non-empty NUMA nodes in the system.
+        /* 统计非空 NUMA 节点数 nr_nodes，决定 numa_enabled（非 NUMA 系统或 --disable-numa 时自动关闭）。 */
         let nr_nodes = topo
             .nodes
             .values()
@@ -585,6 +663,8 @@ impl<'a> Scheduler<'a> {
         skel.struct_ops.cosmos_ops_mut().exit_dump_len = opts.exit_dump_len;
 
         // Override default BPF scheduling parameters.
+        /* 把命令行参数写入 BPF 的 rodata（只读数据段，加载前生效）：时间片、slice_lag、cpufreq 开关、
+        flat_idle_scan、smt/numa 开关、node 数、各类禁用标志、perf 事件 ID 等。 */
         let rodata = skel.maps.rodata_data.as_mut().unwrap();
         rodata.slice_ns = opts.slice_us * 1000;
         rodata.slice_lag = opts.slice_lag_us * 1000;
@@ -603,9 +683,15 @@ impl<'a> Scheduler<'a> {
         rodata.perf_sticky = opts.perf_sticky.event_id;
 
         // Normalize CPU busy threshold in the range [0 .. 1024].
+        /* 归一化 CPU 繁忙阈值：busy_threshold = cpu_busy_thresh * 1024 / 100，
+        把百分比换算成 BPF 侧用的 [0,1024] 定点数。 */
         rodata.busy_threshold = opts.cpu_busy_thresh * 1024 / 100;
 
         // Generate the list of available CPUs sorted by capacity in descending order.
+        /* 按 CPU 容量排序并归一化：把所有 CPU 按 cpu_capacity 降序排列，归一化到 [1, 1024]
+        （最大容量恒为 1024），写入 rodata.cpu_capacity[] 和按容量排序的 rodata.preferred_cpus[]
+        （供 preferred_idle_scan 使用）。
+        */
         let mut cpus: Vec<_> = topo.all_cpus.values().collect();
         cpus.sort_by_key(|cpu| std::cmp::Reverse(cpu.cpu_capacity));
         // Normalize CPU capacities to 1..1024 so the highest capacity is always 1024.
@@ -615,6 +701,7 @@ impl<'a> Scheduler<'a> {
             rodata.cpu_capacity[cpu.id] = normalized as c_ulong;
             rodata.preferred_cpus[i] = cpu.id as u64;
         }
+        /* 同时记录 all_cpus_same_capacity 标志（同构系统可以走更快路径）。  */
         rodata.all_cpus_same_capacity = cpus.iter().all(|cpu| cpu.cpu_capacity == max_cap);
         if opts.preferred_idle_scan {
             info!(
@@ -625,6 +712,8 @@ impl<'a> Scheduler<'a> {
         rodata.preferred_idle_scan = opts.preferred_idle_scan;
 
         // Define the primary scheduling domain.
+        /* 解析 primary_domain（调用前面讲的 parse_cpu_list），得到主调度域 CPU 列表；
+        若覆盖全部 CPU 则 primary_all = true。 */
         let primary_cpus = if let Some(ref domain) = opts.primary_domain {
             match parse_cpu_list(domain) {
                 Ok(cpus) => cpus,
@@ -642,6 +731,9 @@ impl<'a> Scheduler<'a> {
 
         // Enable GPU support and build GPU index -> node for NVML PID sync. Init NVML once here
         // so we reuse the handle in the run loop (re-initing every sync is very expensive).
+        /* 初始化 GPU 支持：若 --gpu 且 NUMA 启用，尝试 Nvml::init_with_flags；成功则构建 gpu_index_to_node
+        （遍历 topo.gpus()），
+        previous_gpu_pids 置空 map；失败则告警并禁用 GPU 调度。 */
         let (gpu_index_to_node, previous_gpu_pids, nvml) = if opts.gpu && numa_enabled {
             match Nvml::init_with_flags(InitFlags::NO_GPUS) {
                 Ok(nvml) => {
