@@ -740,7 +740,9 @@ impl<'a> Scheduler<'a> {
                     info!("NVIDIA GPU-aware scheduling enabled (NVML PID sync)");
                     rodata.gpu_enabled = true;
                     let mut idx_to_node = HashMap::new();
+                    /*  */
                     for (id, gpu) in topo.gpus() {
+                        /*  */
                         let GpuIndex::Nvidia { nvml_id } = id;
                         idx_to_node.insert(nvml_id, gpu.node_id as u32);
                     }
@@ -917,10 +919,17 @@ impl<'a> Scheduler<'a> {
         })
     }
 
+    /* 这部分代码负责用户态的持续维护：把 GPU、CPU 的状态同步给 BPF，
+    响应统计请求，并管理调度器的退出和重启。 
+    真正选择 CPU、入队、派发任务的逻辑在 BPF 文件中。 */
     /// Sync PID -> GPU (node) map from NVML. When gpu_util_threshold > 0, only PIDs with
     /// GPU utilization (SM or memory) >= threshold are added. Map is keyed by task pid.
     /// Only processes using a single GPU are added; multi-GPU processes are excluded.
+    
+    /* 更新“线程 ID → GPU 所在 NUMA 节点”的映射
+    让 BPF 知道哪些线程属于 GPU 相关进程，以及它们应该优先靠近哪个 NUMA 节点运行。 */
     fn sync_gpu_pids(&mut self) -> Result<()> {
+        /* 检查 GPU 支持是否已初始化。 */
         let gpu_index_to_node = match &self.gpu_index_to_node {
             Some(m) => m,
             None => return Ok(()),
@@ -935,6 +944,7 @@ impl<'a> Scheduler<'a> {
         let mut pid_to_nodes: HashMap<u32, HashSet<u32>> = HashMap::new();
 
         let count = nvml.device_count().context("NVML device count")?;
+        /* 遍历 GPU，收集进程及其对应的节点。 */
         for i in 0..count {
             let node = match gpu_index_to_node.get(&i) {
                 Some(&n) => n,
@@ -942,9 +952,17 @@ impl<'a> Scheduler<'a> {
             };
             let device = nvml.device_by_index(i).context("NVML device_by_index")?;
 
+            /* 进程 100 → {节点 0}
+进程 200 → {节点 0, 节点 1} */
             if threshold > 0 {
+                /* 根据 GPU 利用率阈值决定收集哪些进程。 */
                 // Use process utilization; only add PIDs above threshold.
                 match device.process_utilization_stats(None::<u64>) {
+                    /* 取 SM 利用率和内存利用率中的较大值，达到阈值才记录该进程。这里的 mem_util
+                     是利用率指标，不是进程占用了多少显存容量。
+如果查询利用率失败，就退回到收集所有正在使用该 GPU 的计算、图形进程。也就是说，查询失败时，
+本轮不会继续执行利用率过滤。
+当阈值为 0 时，也直接收集所有相关进程。 */
                     Ok(samples) => {
                         for sample in samples {
                             let util = sample.sm_util.max(sample.mem_util);
@@ -963,8 +981,16 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        /* 只保留节点集合大小为 1 的进程，并展开其线程。 */
         // Only add PIDs that use exactly one GPU to the map.
         let mut current: HashMap<u32, u32> = HashMap::new();
+        /* Linux 中，一个进程包含多个可被独立调度的线程。NVML 提供的是
+        进程 ID，而 BPF 这里按线程 ID 查询，因此还需要把进程下的所有线程加入映射。 */
+        /* NVML 发现进程 100 使用节点 0 上的 GPU
+                  ↓
+/proc/100/task 中找到线程 100、101、102
+                  ↓
+current = {100→0, 101→0, 102→0} */
         for (tgid, nodes) in pid_to_nodes {
             if nodes.len() == 1 {
                 let node = nodes.into_iter().next().unwrap();
@@ -975,6 +1001,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        /* 把本轮结果同步到 BPF map。 */
         let map = &self.skel.maps.gpu_pid_map;
         for (pid, node) in &current {
             map.update(&pid.to_ne_bytes(), &node.to_ne_bytes(), MapFlags::ANY)
@@ -990,22 +1017,31 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Record running compute/graphics process PIDs and the GPU node in pid_to_nodes.
+    /// /* 收集使用某张 GPU 的进程 */
     fn add_running_gpu_processes_to_set(
         device: &nvml_wrapper::Device<'_>,
         node: u32,
         pid_to_nodes: &mut HashMap<u32, HashSet<u32>>,
     ) {
+        /* 分别获取：
+- 计算进程列表；
+- 图形进程列表。
+chain() 把两个列表串起来遍历，然后执行：pid_to_nodes.
+entry(proc.pid).or_default().insert(node); */
         for proc in device
             .running_compute_processes()
             .unwrap_or_default()
             .into_iter()
             .chain(device.running_graphics_processes().unwrap_or_default())
         {
+            /* 如果该 PID 还没有记录，先创建一个空节点集合；
+再把当前 GPU 所在的节点加入集合。 */
             pid_to_nodes.entry(proc.pid).or_default().insert(node);
         }
     }
 
     /// Return all thread IDs (tids) of the process with the given pid (tgid).
+    /// 列出一个进程的所有线程 ID
     fn task_tids(pid: u32) -> Vec<u32> {
         let task_dir = format!("/proc/{}/task", pid);
         let Ok(entries) = fs::read_dir(Path::new(&task_dir)) else {
@@ -1017,6 +1053,7 @@ impl<'a> Scheduler<'a> {
             .collect()
     }
 
+    /* 把一个 CPU 加入 BPF 的主调度域 */
     fn enable_primary_cpu(skel: &mut BpfSkel<'_>, cpu: i32) -> Result<(), u32> {
         let prog = &mut skel.progs.enable_primary_cpu;
         let mut args = cpu_arg {
@@ -1338,3 +1375,528 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+/* 从你已有的中文注释来看，后面主要从 [`sync_gpu_pids()`](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:925) 开始还没有详细说明。
+
+**这部分代码负责用户态的持续维护：把 GPU、CPU 的状态同步给 BPF，响应统计请求，并管理调度器的退出和重启。** 真正选择 CPU、入队、派发任务的逻辑在 BPF 文件中。
+
+下面按函数解释。
+
+1. **`sync_gpu_pids()`：更新“线程 ID → GPU 所在 NUMA 节点”的映射**
+
+   目的：让 BPF 知道哪些线程属于 GPU 相关进程，以及它们应该优先靠近哪个 NUMA 节点运行。
+
+   执行过程如下：
+
+   **① 检查 GPU 支持是否已初始化。**
+
+   ```rust
+   let gpu_index_to_node = match &self.gpu_index_to_node {
+       Some(m) => m,
+       None => return Ok(()),
+   };
+   ```
+
+   如果没有 GPU 到节点的映射，或者没有 NVML 句柄，直接正常返回。本次不做同步。
+
+   **② 遍历 GPU，收集进程及其对应的节点。**
+
+   中间结果的类型是：
+
+   ```rust
+   HashMap<u32, HashSet<u32>>
+   //      PID          NUMA 节点集合
+   ```
+
+   比如：
+
+   ```text
+   进程 100 → {节点 0}
+   进程 200 → {节点 0, 节点 1}
+   ```
+
+   `HashSet` 用于去重，同一个进程被多次发现时，不会重复记录同一个节点。
+
+   **③ 根据 GPU 利用率阈值决定收集哪些进程。**
+
+   当 `gpu_util_threshold > 0` 时：
+
+   ```rust
+   let util = sample.sm_util.max(sample.mem_util);
+   if util >= threshold {
+       ...
+   }
+   ```
+
+   取 SM 利用率和内存利用率中的较大值，达到阈值才记录该进程。这里的 `mem_util` 是利用率指标，不是进程占用了多少显存容量。
+
+   如果查询利用率失败，就退回到收集所有正在使用该 GPU 的计算、图形进程。也就是说，**查询失败时，本轮不会继续执行利用率过滤。**
+
+   当阈值为 `0` 时，也直接收集所有相关进程。
+
+   **④ 只保留节点集合大小为 1 的进程，并展开其线程。**
+
+   ```rust
+   if nodes.len() == 1 {
+       current.insert(tgid, node);
+       for tid in Self::task_tids(tgid) {
+           current.insert(tid, node);
+       }
+   }
+   ```
+
+   Linux 中，一个进程包含多个可被独立调度的线程。NVML 提供的是进程 ID，而 BPF 这里按线程 ID 查询，因此还需要把进程下的所有线程加入映射。
+
+   例如：
+
+   ```text
+   NVML 发现进程 100 使用节点 0 上的 GPU
+                     ↓
+   /proc/100/task 中找到线程 100、101、102
+                     ↓
+   current = {100→0, 101→0, 102→0}
+   ```
+
+   **注意原注释的一个偏差：实际判断的是“只对应一个 NUMA 节点”，不是“只使用一张 GPU”。** 如果两张 GPU 都在节点 0，该进程仍然可能被保留。
+
+   **⑤ 把本轮结果同步到 BPF map。**
+
+   ```rust
+   map.update(&pid.to_ne_bytes(), &node.to_ne_bytes(), MapFlags::ANY)
+   ```
+
+   - `to_ne_bytes()`：把整数转换为本机字节序的字节数组，作为 BPF map 的键和值。
+   - `MapFlags::ANY`：键不存在就插入，已存在就覆盖。
+
+   随后删除“上一轮存在、本轮不存在”的 PID，最后保存本轮结果，供下一轮比较。
+
+   因此，GPU 关联会随周期更新，也会清理失效记录。
+
+2. **`add_running_gpu_processes_to_set()`：收集使用某张 GPU 的进程**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:995)
+
+   核心逻辑：
+
+   ```rust
+   device
+       .running_compute_processes()
+       .unwrap_or_default()
+       .into_iter()
+       .chain(device.running_graphics_processes().unwrap_or_default())
+   ```
+
+   分别获取：
+
+   - 计算进程列表；
+   - 图形进程列表。
+
+   `chain()` 把两个列表串起来遍历，然后执行：
+
+   ```rust
+   pid_to_nodes.entry(proc.pid).or_default().insert(node);
+   ```
+
+   可以理解为：
+
+   ```text
+   如果该 PID 还没有记录，先创建一个空节点集合；
+   再把当前 GPU 所在的节点加入集合。
+   ```
+
+   因为集合会去重，同一个进程同时出现在计算和图形列表里也没有影响。
+
+   `unwrap_or_default()` 表示查询失败时使用空列表，这个辅助函数本身不会向上传递查询错误。
+
+3. **`task_tids()`：列出一个进程的所有线程 ID**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1011)
+
+   它读取：
+
+   ```text
+   /proc/<进程 PID>/task/
+   ```
+
+   该目录下的子目录名就是各线程的 TID。例如：
+
+   ```text
+   /proc/100/task/100
+   /proc/100/task/101
+   /proc/100/task/102
+   ```
+
+   返回：
+
+   ```rust
+   vec![100, 101, 102]
+   ```
+
+   两次 `filter_map()` 分别负责：
+
+   ```rust
+   .filter_map(|e| e.ok())
+   ```
+
+   跳过读取失败的目录项。
+
+   ```rust
+   .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+   ```
+
+   把目录名转成数字，转换失败则跳过。
+
+   如果整个目录无法读取，例如进程已经退出，就返回空向量。
+
+4. **`enable_primary_cpu()`：把一个 CPU 加入 BPF 的主调度域**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1022)
+
+   它的逻辑是：
+
+   ```text
+   构造包含 CPU 编号的参数
+          ↓
+   调用 BPF 的 enable_primary_cpu 程序
+          ↓
+   BPF 将该 CPU 加入 primary_cpumask
+          ↓
+   根据 BPF 返回值判断成功或失败
+   ```
+
+   这里值得理解的是：
+
+   ```rust
+   std::slice::from_raw_parts_mut(
+       &mut args as *mut _ as *mut u8,
+       std::mem::size_of_val(&args),
+   )
+   ```
+
+   这段把参数结构体的内存表示为一段可变字节切片，放进 `ProgramInput.context_in`，交给 BPF 读取。它没有另行序列化或复制结构体。
+
+   ```rust
+   let out = prog.test_run(input).unwrap();
+   ```
+
+   虽然 API 名叫 `test_run`，**这里确实执行了 BPF 程序，并修改内核中的状态**，并非只做一次无副作用的检查。
+
+   错误有两层：
+
+   - `test_run()` 调用本身失败：`unwrap()` 导致 panic。
+   - 调用成功，但 BPF 返回非零：返回 `Err(out.return_value)`。
+
+5. **`enable_sibling_cpu()` 和 `init_smt_domains()`：把 SMT 兄弟关系传给 BPF**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1044)
+
+   `enable_sibling_cpu()` 的调用方式与上一函数基本相同，只是参数中有两个 CPU 编号：
+
+   ```rust
+   domain_arg {
+       cpu_id: cpu as c_int,
+       sibling_cpu_id: sibling_cpu as c_int,
+   }
+   ```
+
+   BPF 据此把兄弟 CPU 加入当前 CPU 的 SMT 掩码，使调度器能够识别共享同一个物理核心的逻辑 CPU。
+
+   `init_smt_domains()` 负责批量调用：
+
+   ```rust
+   let smt_siblings = topo.sibling_cpus();
+
+   for (cpu, sibling_cpu) in smt_siblings.iter().enumerate() {
+       Self::enable_sibling_cpu(skel, cpu, *sibling_cpu as usize).unwrap();
+   }
+   ```
+
+   这里向量的**下标是 CPU 编号，值是其兄弟 CPU 编号**。例如：
+
+   ```text
+   smt_siblings[0] = 4
+   smt_siblings[4] = 0
+   ```
+
+   表示 CPU 0 和 CPU 4 共享一个物理核心。
+
+   注意，`init_smt_domains()` 虽然返回 `Result`，内部却使用了 `unwrap()`；配置失败时会直接 panic，并不会通过这个返回值逐层传递错误。
+
+6. **`get_metrics()` 和 `exited()`：读取统计及退出状态**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1082)
+
+   `get_metrics()` 从 BPF 的可变全局数据段 `.bss` 中复制三个累计计数：
+
+   | 字段 | 含义 |
+   |---|---|
+   | `nr_event_dispatches` | 事件密集任务迁移到其他 CPU 并直接派发的次数 |
+   | `nr_ev_sticky_dispatches` | 因 sticky 事件条件而在原 CPU 直接派发的次数 |
+   | `nr_gpu_dispatches` | 因 GPU 亲和性直接派发的次数 |
+
+   它只读取快照，不清零计数器。`stats.rs` 会对前后快照求差，得到监控间隔内的增量。
+
+   `exited()` 则检查 BPF 写出的用户退出信息：
+
+   ```rust
+   uei_exited!(&self.skel, uei)
+   ```
+
+   宏内部以退出类型 `kind != 0` 判断调度器是否已经退出。这个状态和用户按 Ctrl-C 设置的 `shutdown` 是两个独立的停止来源。
+
+7. **`compute_user_cpu_pct()`：用两次采样计算单个 CPU 的用户态利用率**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1095)
+
+   `/proc/stat` 中的时间是累计值，因此先计算两次采样之间的差：
+
+   ```rust
+   user_diff = Δ(user + nice)
+   total_diff = Δtotal
+   ```
+
+   再计算：
+
+   ```text
+   利用率 = user_diff / total_diff × 1024
+   ```
+
+   例如：
+
+   ```text
+   用户态累计时间增加 30
+   总累计时间增加 100
+   返回 round(0.3 × 1024) = 307
+   ```
+
+   所以函数名虽然带 `pct`，返回值实际采用 **1024 表示 100%** 的尺度，并不是返回 `30`。
+
+   另外，这里只把 `user + nice` 算入分子，**不包含内核态 `system` 时间**。因此这里的“繁忙程度”具体指用户态利用率。
+
+   `saturating_sub()` 防止计数回退时无符号减法下溢；如果总时间没有增加，返回 `None`，表示本次无法计算。
+
+8. **`parse_per_cpu_cpu_times()` 和 `read_per_cpu_cpu_times()`：获取每个 CPU 的累计时间**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1110)
+
+   解析函数逐行读取类似下面的内容：
+
+   ```text
+   cpu  ...
+   cpu0 100 5 40 800 10 0 5 0 ...
+   cpu1 ...
+   ```
+
+   处理步骤：
+
+   - 跳过不以 `cpu` 开头的行。
+   - 跳过汇总行 `cpu ...`。
+   - 从 `cpu0`、`cpu1` 提取 CPU 编号。
+   - 保存 `user`、`nice`。
+   - 把前八个时间字段相加，作为 `total`。
+
+   返回类型：
+
+   ```rust
+   Option<Vec<Option<CpuTimes>>>
+   ```
+
+   两层 `Option` 的用途不同：
+
+   ```text
+   外层 None：读取或解析失败，或没有找到任何有效 CPU 数据。
+   内层 None：这个 CPU 没有对应数据，例如该 CPU 离线。
+   ```
+
+   因为结果按 CPU 编号索引，所以不能只把存在的 CPU 压缩成一个连续列表。
+
+   `read_per_cpu_cpu_times()` 是一个包装函数：打开 `/proc/stat`，用 `BufReader` 包装后交给上述解析函数。
+
+9. **`run()`：持续维护调度器的主循环**
+
+   [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1155)
+
+   这个函数是后半部分的核心。调度器在 `init()` 中已经挂载；`run()` 负责运行期间的用户态工作。
+
+   **① 准备初始采样和计时器。**
+
+   ```rust
+   let polling_time =
+       Duration::from_millis(self.opts.polling_ms).min(Duration::from_secs(1));
+   ```
+
+   轮询间隔最多为 1 秒。注意：**这里没有实现前面参数注释所说的最小 10ms 限制**，例如传入 `1` 就是 1ms。
+
+   接着读取初始 CPU 时间，记录 CPU 更新和 GPU 同步的起始时刻。
+
+   **② 检查是否需要退出。**
+
+   ```rust
+   while !shutdown.load(Ordering::Relaxed) && !self.exited()
+   ```
+
+   用户请求停止，或者 BPF 调度器已经退出，都会结束循环。
+
+   **③ 到达轮询时间后，更新各 CPU 的利用率。**
+
+   ```text
+   读取本轮 /proc/stat
+          ↓
+   与上一轮逐 CPU 比较
+          ↓
+   计算用户态利用率
+          ↓
+   写入 cpu_util_map
+          ↓
+   保存本轮数据，供下次比较
+   ```
+
+   如果某 CPU 缺少前后任一次数据，就写入 `0`。如果总时间差为零，则跳过本次写入。
+
+   BPF 的 `is_cpu_busy(cpu)` 会读取这个 map，与 `busy_threshold` 比较，辅助决定使用本地队列还是共享 deadline 队列。
+
+   **④ 更新动态 perf 阈值。**
+
+   分别读取：
+
+   ```rust
+   nr_event_dispatches
+   nr_ev_sticky_dispatches
+   ```
+
+   然后调用前面定义的 `DynamicThresholdState::update()`。
+
+   如果返回 `Some(new_thresh)`，就把新阈值写回 BPF 的 `.bss`，后续调度随之使用新阈值。
+
+   这里反馈给控制器的是**相关派发行为发生的次数**，不是直接把硬件 perf 事件原始计数拿来计算反馈速率。
+
+   **⑤ 同步 GPU PID，但限制频率。**
+
+   只有距离上次同步至少 1 秒时，才调用：
+
+   ```rust
+   self.sync_gpu_pids()
+   ```
+
+   因此，即使 CPU 每 100ms 更新一次，也不会每次都查询 NVML。
+
+   **这里有一个关键的嵌套关系：GPU 同步和动态阈值更新，都放在 CPU 轮询的条件块里面。** 所以 `polling_ms = 0` 时，这三项周期工作都会停止：
+
+   ```text
+   CPU 利用率更新
+   动态 perf 阈值调整
+   GPU PID 同步
+   ```
+
+   统计请求仍然可以处理。
+
+   **⑥ 等待统计请求，同时避免空转。**
+
+   ```rust
+   match req_ch.recv_timeout(timeout) {
+       Ok(()) => res_ch.send(self.get_metrics())?,
+       Err(RecvTimeoutError::Timeout) => {}
+       Err(e) => Err(e)?,
+   }
+   ```
+
+   - 收到请求：读取统计快照并回复。
+   - 等待超时：继续下一轮，检查更新和退出条件。
+   - 通道发生其他错误：返回错误。
+
+   因此，这个等待既服务统计查询，也让主线程在没有工作时阻塞，避免一直占用 CPU。`timeout` 是等待上限，不是每轮都必须睡满的时间。
+
+   **⑦ 退出时解除挂载并报告原因。**
+
+   ```rust
+   let _ = self.struct_ops.take();
+   uei_report!(&self.skel, uei)
+   ```
+
+   `take()` 把 `Link` 从 `Option` 中取出，原字段变为 `None`。取出的 `Link` 随即被释放，解除调度器挂载。
+
+   随后读取、报告退出信息，并把 `UserExitInfo` 返回给 `main()`，供它判断是否重启。
+
+10. **`Drop::drop()`：对象销毁时打印日志**
+
+    [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1266)
+
+    ```rust
+    fn drop(&mut self) {
+        info!("Unregister {SCHEDULER_NAME} scheduler");
+    }
+    ```
+
+    `Scheduler` 离开作用域时自动执行这个函数。
+
+    **函数体本身只打印日志。** 资源释放依靠字段各自的析构逻辑；正常的 `run()` 退出路径已经提前释放了挂载用的 `Link`。如果运行中通过 `?` 提前返回错误，对象销毁时，仍持有的字段也会被自动释放。
+
+11. **`main()`：解析参数，选择监控模式或启动调度器**
+
+    [代码位置](/home/paulning/study/scx/scheds/rust/scx_cosmos/src/main.rs:1272)
+
+    可以按下面的顺序理解：
+
+    **① 解析参数，处理只需输出信息的选项。**
+
+    ```rust
+    let opts = Opts::parse();
+    ```
+
+    如果指定 `--version`，打印版本并退出；如果指定 `--help-stats`，打印统计字段说明并退出。
+
+    **② 初始化日志。**
+
+    设置日志输出到标准错误，最低输出级别为 `Info`，并隐藏代码位置、线程信息等。
+
+    因此，这里的 `debug!()` 默认不会显示。`--verbose` 在其他位置控制额外日志和 libbpf 调试，但这里没有用它把全局日志级别改成 `Debug`。
+
+    **③ 建立共享退出标志，注册 Ctrl-C 回调。**
+
+    ```rust
+    let shutdown = Arc::new(AtomicBool::new(false));
+    ```
+
+    - `Arc`：让主线程、监控线程和信号回调共享同一个标志。
+    - `AtomicBool`：允许它们安全地读写这个布尔值。
+    - `clone()`：增加共享引用，不会创建独立的布尔变量。
+
+    按 Ctrl-C 后，回调把标志设置成 `true`，各运行循环看到后退出。这里 `Relaxed` 只用于传递停止标志，不承担其他数据的同步。
+
+    **④ 按参数启动统计监控线程。**
+
+    ```rust
+    if let Some(intv) = opts.monitor.or(opts.stats)
+    ```
+
+    如果两者都指定，优先采用 `monitor` 的间隔。
+
+    两个选项的区别是：
+
+    | 选项 | 执行行为 |
+    |---|---|
+    | `--monitor` | 只监控已有调度器；等待监控线程结束后退出 |
+    | `--stats` | 启动监控线程，同时继续启动本进程的调度器 |
+
+    因而，你前面给 `stats` 写的中文注释需要区分：**只有 `--monitor` 不启动调度器，`--stats` 仍会启动。**
+
+    **⑤ 初始化、运行，并根据退出信息决定是否重启。**
+
+    ```rust
+    loop {
+        let mut sched = Scheduler::init(&opts, &mut open_object)?;
+        if !sched.run(shutdown.clone())?.should_restart() {
+            break;
+        }
+    }
+    ```
+
+    `MaybeUninit` 为打开 BPF 对象准备尚未初始化的存储空间，由初始化流程填充。
+
+    每轮先创建并挂载调度器，再进入维护循环。`run()` 正常返回后：
+
+    - 退出信息要求重启：销毁本轮对象，再重新初始化。
+    - 不要求重启：结束程序。
+    - `init()` 或 `run()` 返回错误：`?` 将错误向上传递，退出 `main()`。
+
+    所以这里的重启由退出信息中的重启标志控制，并不是遇到任何错误都会自动重试。 */
