@@ -1207,8 +1207,15 @@ void consume_prev(struct task_struct *prev, task_ctx *taskc_prev, struct cpu_ctx
 	cpuc->flags = taskc_prev->flags;
 }
 
+/* 当某个 CPU 需要任务时，判断它应该继续工作还是保持空闲；如果需要工作，
+就从 per-CPU／计算域 DSQ 中取任务，取不到则尝试继续运行 prev。 */
 void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 {
+	/* 最重要的设计是“核心压缩”：
+active_cpumask：正常参与调度的 CPU。
+ovrflw_cpumask：本来想停用，但因为绑核任务、CPU 本地队列等原因不得不继续工作的 CPU。
+两个集合都不属于的 CPU：尽量保持空闲，以降低功耗。
+cpdom：compute domain，通常代表一个具有相近拓扑和性能属性的 CPU 域。 */
 	struct bpf_cpumask *active, *ovrflw;
 	u64 cpu_dsq_id, cpdom_dsq_id;
 	task_ctx *taskc_prev = NULL;
@@ -1217,12 +1224,16 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 	struct cpu_ctx *cpuc;
 	int ret;
 
+	/* LAVD 为这个 CPU 保存的运行状态，例如：
+所属 compute domain；当前任务标志；延迟余量；
+pinned task 数量；临时 cpumask 等。 */
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
 		return;
 	}
 
+	/* cpu_dsq_id：当前 CPU 对应的 per-CPU DSQ。 */
 	cpu_dsq_id = cpu_to_dsq(cpu);
 	cpdom_dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
 
