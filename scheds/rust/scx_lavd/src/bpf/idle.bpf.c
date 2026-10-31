@@ -632,6 +632,9 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 	return cpu;
 }
 
+/* 不是每次选核都寻找全局最短队列。
+很重视 previous CPU、同步唤醒、同域局部性，以及完整空闲物理核；
+没有合适空闲核时，往往留在 sticky CPU/domain，依靠后续均衡修复。 */
 __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 {

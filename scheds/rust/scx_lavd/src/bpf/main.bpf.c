@@ -1235,12 +1235,18 @@ pinned task 数量；临时 cpumask 等。 */
 
 	/* cpu_dsq_id：当前 CPU 对应的 per-CPU DSQ。 */
 	cpu_dsq_id = cpu_to_dsq(cpu);
+	/* 当前 CPU 所属 compute domain 的共享 DSQ。 */
 	cpdom_dsq_id = cpdom_to_dsq(cpuc->cpdom_id);
 
 	/*
 	 * When the CPU bandwidth control is enabled, check if there are
 	 * tasks backlogged when their cgroups are throttled, and requeue
 	 * those tasks to the proper DSQs.
+	 enable_cpu_bw
+只有启用了 cgroup CPU bandwidth 控制才执行。
+ret = scx_cgroup_bw_reenqueue()
+检查以前因为 cgroup cpu.max 限流而积压的任务。
+如果对应 cgroup 已恢复额度，就把任务重新放回正确的 DSQ。
 	 */
 	if (enable_cpu_bw && (ret = scx_cgroup_bw_reenqueue())) {
 		scx_bpf_error("Failed to reenqueue backlogged tasks: %d", ret);

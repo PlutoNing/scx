@@ -18,13 +18,98 @@
  * To be included to the main.bpf.c
  */
 
+ /* 核心思路是：
+
+长期策略状态放在预分配的全局 cpumask。
+每个 CPU 预分配一组 scratch cpumask。
+选核时只做 cpumask AND/OR/XOR，不动态分配。
+动态全局 mask 原地逐 bit 更新，不使用双缓冲或每轮 xchg。
+RCU只保护 kptr 生命周期，不提供整代快照一致性。 */
 /*
  * Sched related globals
+ 只在初始化时 bpf_cpumask_create()，通过 bpf_kptr_xchg() 安装
+ 之后不再替换指针，只原地修改内容。
+ */
+
+ /* turbo_cpumask
+静态硬件属性集合：
+
+初始化时根据 userspace 提供的 cpu_turbo[] 设置。
+之后不更新。
+不单独决定 CPU 是否可用，只用来在 idle active CPU 中进一步优先 turbo CPU。
+最终选择顺序大致是：
+
+
+同域 idle turbo active
+→ 同域 idle active
+→ 同域 idle overflow
  */
 private(LAVD) struct bpf_cpumask __kptr *turbo_cpumask; /* CPU mask for turbo CPUs */
+
+/* big_cpumask
+初始化时根据 cpu_big[] 填充。
+
+但在当前代码中，除了分配和初始化，没有实际消费者。大小核策略目前主要使用：
+
+cpu_ctx.big_core
+cpdom_ctx.is_big
+PCO CPU顺序
+task的 ON_BIG/ON_LITTLE 标志
+所以 big_cpumask 目前相当于遗留或为后续策略预留。 */
 private(LAVD) struct bpf_cpumask __kptr *big_cpumask; /* CPU mask for big CPUs */
+/* 表示正常参与调度的 CPU，是 core compaction 的主工作集。
+
+初始化：
+
+复制内核 online_cpumask。
+因此调度器启动后的最初状态是所有在线 CPU 都 active。
+每10ms由系统统计 timer 调用 do_core_compaction() 更新：
+
+计算当前负载需要多少 CPU。
+根据 PCO（performance CPU order）排序选择前 nr_active 个 CPU。
+active CPU：设置 active bit，清除 overflow bit。
+其余 CPU：清除 active bit，通常保持休眠。
+==========================
+选核优先从 active CPU 中选择。
+dispatch 时，active CPU可以正常取任务。
+不在 active/overflow 中的 CPU 尽量保持空闲，达到核心压缩和省电目的。 */
 private(LAVD) struct bpf_cpumask __kptr *active_cpumask; /* CPU mask for active CPUs */
+
+/* 表示本来想关闭，但由于现实约束必须继续工作的 CPU。
+
+典型进入 overflow 的原因：
+
+有永久绑核任务。
+per-CPU DSQ 或 local DSQ 有任务。
+任务亲和性与 active 集合完全不相交。
+异构系统的 performance mode 中，小核作为 overflow。
+inactive CPU上还有无法迁移的 prev。
+热路径发现某个远端 CPU 必须被唤醒。
+因此 overflow 不只是“active 满了之后备用”，更准确地说是“active 之外的必要例外集合”。
+
+它有两类维护者：
+
+10ms core-compaction timer：整体重新评估和清理。
+pick_idle_cpu()、lavd_dispatch() 热路径：按需立即扩展。 */
 private(LAVD) struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs */
+
+/* steady_cpumask
+表示“非湍流 CPU”，即 IRQ、steal、RT/DL 干扰较低、延迟余量较大的 CPU。
+
+每10ms统计周期根据：
+
+
+lat_headroom = 1024 - irq/steal RAVG
+它不是所有任务的硬限制，只用于“容易被抢占伤害”的任务。
+
+对于这种任务，LAVD重新解释 active/overflow：
+
+
+eligible = active ∪ overflow
+新的 active = eligible ∩ steady
+新的 overflow = eligible - steady
+于是延迟敏感任务优先进入 steady CPU，turbulent CPU变成后备。
+ */
 private(LAVD) struct bpf_cpumask __kptr *steady_cpumask; /* CPU mask for non-turbulent (steady) CPUs */
 
 const volatile u64	nr_llcs;	/* number of LLC domains */

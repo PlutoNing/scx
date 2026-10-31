@@ -357,6 +357,7 @@ int do_core_compaction(void)
 
 	/*
 	 * Assign active and overflow cores.
+	 更新active_cpumask
 	 */
 	bpf_for(i, 0, nr_cpu_ids) {
 		struct cpu_ctx *cpuc;
