@@ -87,7 +87,16 @@ Ctrl-C 退出前台调度器后，可用以下命令恢复 systemd 服务：
 Layered 的服务参数为：
 
   SCX_SCHEDULER=/usr/local/bin/scx_layered
-  SCX_FLAGS='f:/etc/scx/scx-layered-7900x.json'
+  SCX_FLAGS='--log-level debug --stats 1 f:/etc/scx/scx-layered-7900x.json'
+
+COSMOS 的服务参数为：
+
+  SCX_SCHEDULER=/usr/local/bin/scx_cosmos
+  SCX_FLAGS='--verbose --stats 1'
+
+Layered 的 -v/--verbose 已废弃且是空操作，所以使用 --log-level debug。
+两个服务模板都用 --stats 1 每秒把运行统计写入 scx.log；COSMOS 另外使用
+--verbose 输出 libbpf、CPU/NUMA 映射等诊断信息。
 
 
 五、Layered 配置是否必需
@@ -133,6 +142,10 @@ TPS 对比。JSON 是配置的唯一源文件；部署脚本会复制它，不�
 停止和失败信息仍可通过 journalctl 查看。logrotate 在文件达到 1 GiB 时
 轮转，保留 scx.log.1 到 scx.log.7；超过 7 份时删除最旧的一份。配置使用
 copytruncate，因此轮转日志不需要重启正在运行的调度器。
+
+当前服务默认开启详细日志和每秒统计。如果临时不需要大量运行统计，可从
+services/scx-layered 或 services/scx 的 SCX_FLAGS 中删除 --stats 1，再运行
+对应的 scx-redeploy 命令。
 
 
 七、当前机器上的实际运行结果

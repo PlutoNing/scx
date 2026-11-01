@@ -1,3 +1,5 @@
 # scx_layered requires at least one JSON layer specification.
 SCX_SCHEDULER=/usr/local/bin/scx_layered
-SCX_FLAGS='f:/etc/scx/scx-layered-7900x.json'
+# Keep debug events and one-second scheduler statistics in /var/log/scx/scx.log.
+# scx_layered -v is deprecated and does not enable verbose logging.
+SCX_FLAGS='--log-level info --stats 1 f:/etc/scx/scx-layered-7900x.json'
