@@ -1,0 +1,69 @@
+[
+  {
+    "name": "latency",
+    "comment": "Negative-nice latency-sensitive tasks; may preempt other layers.",
+    "matches": [
+      [
+        {
+          "NiceBelow": 0
+        }
+      ]
+    ],
+    "kind": {
+      "Open": {
+        "min_exec_us": 100,
+        "slice_us": 1000,
+        "preempt": true,
+        "preempt_first": true,
+        "weight": 200,
+        "xllc_mig_min_us": 500.0,
+        "llcs": [0, 1],
+        "perf": 0
+      }
+    }
+  },
+  {
+    "name": "background_ccd1",
+    "comment": "Positive-nice background work, confined to the second 7900X CCD/LLC.",
+    "matches": [
+      [
+        {
+          "NiceAbove": 0
+        }
+      ]
+    ],
+    "kind": {
+      "Confined": {
+        "util_range": [0.55, 0.85],
+        "cpus_range": [2, 12],
+        "min_exec_us": 1000,
+        "slice_us": 10000,
+        "weight": 50,
+        "growth_algo": "Sticky",
+        "llcs": [1],
+        "perf": 0
+      }
+    }
+  },
+  {
+    "name": "normal",
+    "comment": "Catch-all layer; grows across both CCD/LLC domains as load increases.",
+    "matches": [
+      []
+    ],
+    "kind": {
+      "Grouped": {
+        "util_range": [0.35, 0.80],
+        "cpus_range": [2, 24],
+        "idle_confined": false,
+        "min_exec_us": 200,
+        "slice_us": 4000,
+        "weight": 100,
+        "growth_algo": "Sticky",
+        "xllc_mig_min_us": 500.0,
+        "llcs": [0, 1],
+        "perf": 0
+      }
+    }
+  }
+]

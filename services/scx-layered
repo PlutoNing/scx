@@ -1,0 +1,3 @@
+# scx_layered requires at least one JSON layer specification.
+SCX_SCHEDULER=/usr/local/bin/scx_layered
+SCX_FLAGS='f:/etc/scx/scx-layered-7900x.json'

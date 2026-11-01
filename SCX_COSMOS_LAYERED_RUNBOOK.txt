@@ -1,0 +1,250 @@
+SCX COSMOS / LAYERED 编译、部署与验证记录
+==========================================
+
+记录日期：2026-11-01
+仓库：/home/paulning/work/scx
+内核源码：/home/paulning/study/linuxsource
+运行内核：6.17.0-amddev
+CPU：AMD Ryzen 9 7900X，12 核 / 24 线程，1 个 NUMA 节点，2 个 L3/LLC（两个 CCD）
+
+
+一、已经安装的文件
+------------------
+
+systemd unit：             /etc/systemd/system/scx.service
+当前服务环境文件：          /etc/default/scx
+COSMOS 二进制：             /usr/local/bin/scx_cosmos
+Layered 二进制：            /usr/local/bin/scx_layered
+统一重部署命令：            /usr/local/bin/scx-redeploy
+兼容旧命令：                /usr/local/bin/scx-cosmos-redeploy
+Layered 已安装配置：         /etc/scx/scx-layered-7900x.json
+
+仓库中的可修改源文件：
+
+  scripts/scx-cosmos-redeploy
+  services/scx
+  services/scx-layered
+  configs/scx-layered-7900x.json
+
+脚本会先编译并检查产物；只有成功后才停止当前调度器。因此编译错误不会
+中断正在运行的服务。脚本会自动 cd 到仓库，调用地点不受限制。
+
+
+二、最常用的命令
+----------------
+
+修改源码或 JSON 后，构建 release、切换并验证 Layered：
+
+  scx-redeploy layered
+
+切回 COSMOS：
+
+  scx-redeploy cosmos
+
+构建 debug 版本再部署：
+
+  scx-redeploy layered debug
+  scx-redeploy cosmos debug
+
+可用 profile 是 debug、release、release-fast；默认是 release。旧用法
+"scx-cosmos-redeploy debug" 仍表示部署 COSMOS 的 debug 版本。
+
+
+三、手工编译和前台运行 Layered
+------------------------------
+
+  cd /home/paulning/work/scx
+  cargo build --release --locked -p scx_layered
+  ./target/release/scx_layered --print-and-exit \
+      f:configs/scx-layered-7900x.json
+  sudo systemctl stop scx.service
+  sudo ./target/release/scx_layered \
+      f:configs/scx-layered-7900x.json
+
+注意：文件参数必须写成 f:文件名 或 file:文件名，不能只传裸路径。
+Ctrl-C 退出前台调度器后，可用以下命令恢复 systemd 服务：
+
+  sudo systemctl start scx.service
+
+
+四、systemd 部署过程（脚本自动完成）
+----------------------------------
+
+1. 进入 /home/paulning/work/scx。
+2. cargo build --locked -p scx_layered --release。
+3. 用 --print-and-exit 解析并校验 JSON；校验失败就停止，不动当前服务。
+4. 停止 scx.service。
+5. 将旧目标二进制保存成 /usr/local/bin/scx_layered.previous（若存在）。
+6. 安装新二进制到 /usr/local/bin/scx_layered。
+7. 安装 JSON 到 /etc/scx/scx-layered-7900x.json。
+8. 用 services/scx-layered 更新 /etc/default/scx。
+9. 重启 scx.service。
+10. 同时检查 systemd、/sys/kernel/sched_ext/state 和 root/ops；只有三者都
+    正常才打印 SUCCESS。
+
+Layered 的服务参数为：
+
+  SCX_SCHEDULER=/usr/local/bin/scx_layered
+  SCX_FLAGS='f:/etc/scx/scx-layered-7900x.json'
+
+
+五、Layered 配置是否必需
+-----------------------
+
+是。scx_layered 至少需要一个 JSON layer spec；最后一层必须是 catch-all，
+即 "matches": [[]]，否则启动失败。当前机器的源配置是：
+
+  /home/paulning/work/scx/configs/scx-layered-7900x.json
+
+它定义了三层：
+
+1. latency：nice < 0；1 ms slice，可抢占，覆盖两个 LLC。
+2. background_ccd1：nice > 0；10 ms slice，只允许 LLC 1，用于后台吞吐任务。
+3. normal：catch-all；4 ms slice，随负载跨两个 LLC 扩展。
+
+虽然机器只有一个 NUMA 节点，但有两个 32 MiB L3/CCD，所以配置按 LLC/CCD
+做亲和性仍然有意义。各层 perf=0，调度器不主动改 CPU 频率，避免影响前后
+TPS 对比。JSON 是配置的唯一源文件；部署脚本会复制它，不要直接长期修改
+/etc/scx 下的副本。
+
+
+六、运行状态、日志与实时统计
+----------------------------
+
+  systemctl status scx.service --no-pager -l
+  journalctl -u scx.service -n 100 --no-pager
+  cat /sys/kernel/sched_ext/state
+  cat /sys/kernel/sched_ext/root/ops
+  cat /sys/kernel/sched_ext/nr_rejected
+  sudo timeout --foreground --signal=INT 10s \
+      /usr/local/bin/scx_layered --monitor 1
+
+成功状态应包含：
+
+  systemctl: active
+  sched_ext/state: enabled
+  root/ops: layered_...
+  nr_rejected: 0
+
+
+七、当前机器上的实际运行结果
+----------------------------
+
+本次用 release profile 编译成功：
+
+  scx_layered 1.1.1 x86_64-unknown-linux-gnu
+
+服务实际附着成功：
+
+  systemd: active
+  sched_ext: enabled
+  ops: layered_1.1.1_x86_64_unknown_linux_gnu
+  nr_rejected: 0
+
+验证负载：
+
+  stress-ng --cpu 4 --timeout 5s --metrics-brief
+  nice -n 10 stress-ng --cpu 2 --timeout 5s --metrics-brief
+
+结果：4 线程普通负载进入 normal；正 nice 的 2 线程负载进入
+background_ccd1，Layered 监控显示该层 LLC [01] 调度占比达到 100%。两次
+stress-ng 均通过，负载结束后服务仍为 active，没有 BPF verifier 或 struct_ops
+附着错误。统一脚本还完成了 COSMOS -> Layered 往返切换，两次都打印 SUCCESS；
+最终保留 Layered 运行。
+
+
+八、如何测每次修改对 TPS 的效果
+------------------------------
+
+不要只比较单次 stress-ng bogo-ops；TPS 应使用真实工作负载，例如数据库或
+服务自己的压测工具。固定以下变量：调度器 build profile、CPU governor、
+SMT、线程数、CPU 亲和性、输入数据、预热时间和测试时长。每个版本交替测试
+多轮，至少记录中位数和 p95/p99 延迟。
+
+推荐流程：
+
+1. scx-redeploy layered
+2. 预热业务 30--60 秒。
+3. 在另一个终端运行 scx_layered --monitor 1，确认任务落入预期 layer/LLC。
+4. 运行同一 TPS 测试 5--10 轮并保存 TPS、p95、p99、CPU 利用率。
+5. scx-redeploy cosmos，使用完全相同的测试参数重复。
+6. 修改 Layered 后重新部署，先检查 nr_rejected 和 journal，再重复测试。
+
+可先用下面的 CPU 负载做冒烟测试，但它不能代替业务 TPS：
+
+  stress-ng --cpu 12 --timeout 30s --metrics-brief
+  nice -n 10 stress-ng --cpu 4 --timeout 30s --metrics-brief
+
+本机没有跨 NUMA 访存代价，无法有效评估 COSMOS 的 NUMA 亲和路径；可以
+评估两个 LLC/CCD 之间的迁移、缓存局部性、普通任务与后台任务隔离。可观察
+Layered monitor 的 xllc、LLC sched%、迁移量，以及业务 TPS 和尾延迟。
+
+
+九、两个调度器依赖的 BPF / sched_ext 能力
+-------------------------------------------
+
+共同的硬基础（Linux 6.12 已具备）：
+
+* sched_ext BPF struct_ops 注册和回调（select_cpu/enqueue/dispatch/running 等）。
+* 自定义 DSQ、local DSQ、DSQ insert/move 和 DSQ iterator。
+* BTF 与 CO-RE、BPF task storage、BPF cpumask/kptr/RCU kfunc。
+* sched_ext task slice/vtime、CPU idle 选择、CPU performance 控制 kfunc。
+
+Layered 另外大量使用 BPF timer、per-CPU map、task PID 查询、cpumask、DSQ
+iterator、任务重新入队和 scx_bpf_now。COSMOS 更依赖按节点的 idle mask、
+NUMA/LLC 拓扑选择，以及 select_cpu_and 的交集式空闲 CPU 查找。
+
+从 6.12 到本机 6.17 的相关变化：
+
+Linux 6.13
+  * DSQ API 改名：dispatch/consume/from_dsq 更名为
+    dsq_insert/dsq_move_to_local/dsq_move。当前仓库 compat.bpf.h 同时兼容
+    6.12 旧名和新名；这是 API 迁移，不是算法新增的硬要求。
+  * 内核默认空闲 CPU 选择增加 LLC 和 NUMA 感知。这改善 fallback 路径。
+
+Linux 6.14
+  * 新增 scx_bpf_now()。Layered 高频使用它；兼容层在旧内核回退到
+    bpf_ktime_get_ns()，因此对当前源码不是硬最低版本要求。
+
+Linux 6.15
+  * SCX_OPS_ALLOW_QUEUED_WAKEUP：COSMOS 和 Layered 都会在内核支持时启用，
+    减少 wakeup 路径开销；旧内核上动态兼容。
+  * SCX_OPS_ENQ_MIGRATION_DISABLED 相关处理：两者都处理禁止迁移任务。
+  * SCX_OPS_BUILTIN_IDLE_PER_NODE、按 NUMA node 的 idle cpumask、node-aware
+    idle CPU helper 和 scx_bpf_nr_node_ids。COSMOS 的 NUMA 路径使用这些；
+    旧内核回退成单节点/全局 idle mask。本机只有 1 个 NUMA node，所以
+    COSMOS 日志会显示 Disabling NUMA optimizations。
+  * sched_ext event counters 可用于诊断，但不是两个算法运行的硬要求。
+
+Linux 6.16
+  * scx_bpf_select_cpu_and()：COSMOS 用它在允许 cpumask 与 idle cpumask 的
+    交集中选 CPU；没有时回退到 scx_bpf_select_cpu_dfl()。
+
+Linux 6.17
+  * 删除 6.13 改名后保留的旧 dispatch/consume kfunc 名。当前代码通过
+    compat wrapper 使用新名字；这也是为什么不应绕过仓库的兼容头。
+  * 修正 scx_bpf_reenqueue_local() 引用处理；Layered 会使用本地重新入队。
+  * sched_ext cgroup bandwidth 在这一版加入，但当前两个配置没有依赖它。
+
+结论：两个调度器的“硬基础”是 6.12 的 sched_ext/BPF 能力；6.13--6.17
+中用到的新接口大多有 weak ksym 或 compat fallback，属于性能、NUMA/LLC
+行为和新内核 API 的增强，并非把最低内核强制抬到 6.17。本记录实际验证的
+是当前 6.17.0-amddev；6.12 兼容性结论来自源码兼容路径分析，并未在这台
+机器上启动 6.12 内核做实测。
+
+
+十、恢复与切换
+--------------
+
+切回 COSMOS：
+
+  scx-redeploy cosmos
+
+停止自定义调度器（内核回退到普通调度类）：
+
+  sudo systemctl stop scx.service
+
+重新启用当前 /etc/default/scx 选择的调度器：
+
+  sudo systemctl start scx.service
+
