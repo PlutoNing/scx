@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly REPO_DIR=/home/paulning/work/scx
+readonly PACKAGE=scx_cosmos
+readonly SERVICE=scx.service
+readonly INSTALL_PATH=/usr/local/bin/scx_cosmos
+
+profile="${1:-release}"
+case "$profile" in
+    debug)
+        cargo_profile_args=()
+        binary_path="$REPO_DIR/target/debug/$PACKAGE"
+        ;;
+    release)
+        cargo_profile_args=(--release)
+        binary_path="$REPO_DIR/target/release/$PACKAGE"
+        ;;
+    release-fast)
+        cargo_profile_args=(--profile release-fast)
+        binary_path="$REPO_DIR/target/release-fast/$PACKAGE"
+        ;;
+    *)
+        echo "Usage: $(basename "$0") [debug|release|release-fast]" >&2
+        exit 2
+        ;;
+esac
+
+echo "==> Repository: $REPO_DIR"
+echo "==> Build profile: $profile"
+cd "$REPO_DIR"
+
+# Build first so a compiler error does not interrupt the currently running
+# scheduler. release is the default because debug builds distort benchmarks.
+cargo build --locked -p "$PACKAGE" "${cargo_profile_args[@]}"
+test -x "$binary_path"
+"$binary_path" --version
+
+echo "==> Stopping $SERVICE"
+sudo -n systemctl stop "$SERVICE"
+
+if sudo -n test -x "$INSTALL_PATH"; then
+    echo "==> Saving the previous binary as ${INSTALL_PATH}.previous"
+    sudo -n install -m 0755 "$INSTALL_PATH" "${INSTALL_PATH}.previous"
+fi
+
+echo "==> Installing $binary_path -> $INSTALL_PATH"
+sudo -n install -m 0755 "$binary_path" "$INSTALL_PATH"
+
+echo "==> Restarting $SERVICE"
+sudo -n systemctl reset-failed "$SERVICE"
+sudo -n systemctl restart "$SERVICE"
+
+# systemd may report the process as active slightly before the BPF struct_ops
+# link has finished attaching, so verify both states for up to five seconds.
+for _ in {1..20}; do
+    service_state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    scx_state="$(cat /sys/kernel/sched_ext/state 2>/dev/null || true)"
+    ops="$(cat /sys/kernel/sched_ext/root/ops 2>/dev/null || true)"
+    if [[ "$service_state" == active && "$scx_state" == enabled && "$ops" == cosmos* ]]; then
+        echo "==> SUCCESS"
+        echo "    service: $service_state"
+        echo "    sched_ext: $scx_state"
+        echo "    scheduler: $ops"
+        echo "    binary: $INSTALL_PATH"
+        exit 0
+    fi
+    sleep 0.25
+done
+
+echo "==> FAILED: $SERVICE did not attach COSMOS" >&2
+echo "    service: ${service_state:-unknown}" >&2
+echo "    sched_ext: ${scx_state:-unknown}" >&2
+echo "    scheduler: ${ops:-none}" >&2
+sudo -n systemctl status "$SERVICE" --no-pager -l || true
+sudo -n journalctl -u "$SERVICE" -n 80 --no-pager || true
+exit 1

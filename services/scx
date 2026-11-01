@@ -1,5 +1,7 @@
 # List of scx_schedulers: scx_beerland scx_bpfland scx_chaos scx_cosmos scx_flash scx_lavd scx_p2dq scx_rustland scx_rusty scx_tickless
-SCX_SCHEDULER=scx_cosmos
+# Use an absolute path so that the service does not depend on systemd's PATH.
+SCX_SCHEDULER=/usr/local/bin/scx_cosmos
+SCX_FLAGS=''
 
 # Set custom flags for each scheduler, below is an example of how to use
 #SCX_FLAGS='-s 700 -S'
