@@ -13,6 +13,8 @@ CPU：AMD Ryzen 9 7900X，12 核 / 24 线程，1 个 NUMA 节点，2 个 L3/LLC�
 
 systemd unit：             /etc/systemd/system/scx.service
 当前服务环境文件：          /etc/default/scx
+运行日志：                   /var/log/scx/scx.log
+logrotate 配置：             /etc/logrotate.d/scx
 COSMOS 二进制：             /usr/local/bin/scx_cosmos
 Layered 二进制：            /usr/local/bin/scx_layered
 统一重部署命令：            /usr/local/bin/scx-redeploy
@@ -112,6 +114,7 @@ TPS 对比。JSON 是配置的唯一源文件；部署脚本会复制它，不�
 ----------------------------
 
   systemctl status scx.service --no-pager -l
+  tail -F /var/log/scx/scx.log
   journalctl -u scx.service -n 100 --no-pager
   cat /sys/kernel/sched_ext/state
   cat /sys/kernel/sched_ext/root/ops
@@ -125,6 +128,11 @@ TPS 对比。JSON 是配置的唯一源文件；部署脚本会复制它，不�
   sched_ext/state: enabled
   root/ops: layered_...
   nr_rejected: 0
+
+调度器 stdout/stderr 合并写入 /var/log/scx/scx.log。systemd 自身的启动、
+停止和失败信息仍可通过 journalctl 查看。logrotate 在文件达到 1 GiB 时
+轮转，保留 scx.log.1 到 scx.log.7；超过 7 份时删除最旧的一份。配置使用
+copytruncate，因此轮转日志不需要重启正在运行的调度器。
 
 
 七、当前机器上的实际运行结果

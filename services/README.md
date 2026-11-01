@@ -62,10 +62,16 @@ systemctl unset-environment SCX_FLAGS_OVERRIDE
 systemctl restart scx
 ```
 
-## Checking journald Logs
+## Checking Logs
 
+Scheduler stdout and stderr are written to `/var/log/scx/scx.log`:
 
-- To view the logs, use the following command:
+```
+tail -F /var/log/scx/scx.log
+```
+
+The `services/scx.logrotate` policy rotates the file at 1 GiB and keeps seven
+old files. systemd lifecycle messages remain available in the journal:
 
 ```
 journalctl -u scx.service

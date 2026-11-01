@@ -1,0 +1,9 @@
+/var/log/scx/scx.log {
+    size 1G
+    rotate 7
+    missingok
+    notifempty
+    nocompress
+    copytruncate
+    su root root
+}

@@ -4,6 +4,10 @@ set -Eeuo pipefail
 
 readonly REPO_DIR=/home/paulning/work/scx
 readonly SERVICE=scx.service
+readonly SERVICE_UNIT_SOURCE="$REPO_DIR/services/scx.service"
+readonly SERVICE_UNIT_INSTALL=/etc/systemd/system/scx.service
+readonly LOGROTATE_SOURCE="$REPO_DIR/services/scx.logrotate"
+readonly LOGROTATE_INSTALL=/etc/logrotate.d/scx
 
 scheduler=cosmos
 profile=release
@@ -89,6 +93,12 @@ if [[ -n "$config_source" ]]; then
     echo "==> Validated config: $config_source"
 fi
 
+echo "==> Installing systemd and logrotate configuration"
+sudo -n install -d -m 0755 /var/log/scx
+sudo -n install -m 0644 "$SERVICE_UNIT_SOURCE" "$SERVICE_UNIT_INSTALL"
+sudo -n install -m 0644 "$LOGROTATE_SOURCE" "$LOGROTATE_INSTALL"
+sudo -n systemctl daemon-reload
+
 echo "==> Stopping $SERVICE"
 sudo -n systemctl stop "$SERVICE"
 
@@ -125,6 +135,7 @@ for _ in {1..20}; do
         echo "    sched_ext: $scx_state"
         echo "    scheduler: $ops"
         echo "    binary: $install_path"
+        echo "    log: /var/log/scx/scx.log"
         if [[ -n "$config_install_path" ]]; then
             echo "    config: $config_install_path"
         fi

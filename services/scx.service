@@ -9,7 +9,12 @@ Type=simple
 EnvironmentFile=/etc/default/scx
 ExecStart=/bin/bash -c 'exec ${SCX_SCHEDULER_OVERRIDE:-$SCX_SCHEDULER} ${SCX_FLAGS_OVERRIDE:-$SCX_FLAGS} '
 Restart=on-failure
-StandardError=journal
+# systemd creates /var/log/scx before starting the scheduler. Keep stdout and
+# stderr together so messages from the userspace loader stay in time order.
+LogsDirectory=scx
+LogsDirectoryMode=0755
+StandardOutput=append:/var/log/scx/scx.log
+StandardError=append:/var/log/scx/scx.log
 
 [Install]
 WantedBy=multi-user.target
