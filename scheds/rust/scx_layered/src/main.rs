@@ -5242,7 +5242,38 @@ fn main(opts: Opts) -> Result<()> {
             warn!("Layer {} has deprecated flag \"allow_node_aligned\", node-aligned tasks are now always dispatched on layer DSQs", &spec.name);
         }
     }
+/* 
+scx_layered 真正使用哪个事件
+当前代码只在配置了 membw_gb 时启用 PMU 带宽跟踪
+Zen 5 对应：
 
+
+EventCode = 0x44
+UMask     = 0x48
+perf raw config = 0x4844
+它统计来自 DRAM/MMIO 的 cache-line fill，调度器把每次事件近似看作 64 字节：
+
+
+main.bpf.c
+Ln 2250–2260
+
+if (scx_pmu_read(p, membw_event, &bytes, true))
+    bytes = 0;
+bytes *= 64;
+完整链路是：
+
+根据 CPU 型号选择正确的 PMU 事件。
+为每个 CPU 创建 perf_event_open() 计数器。
+在 sched_switch 时记录任务运行期间的计数增量。
+将任务的流量累计到所属 layer。
+使用 resctrl MBM 总流量校准 PMU 估算值。
+如果某个 layer 超过 membw_gb，减少它的目标 CPU 数。
+最终带宽限制参与 CPU 数量计算：
+let membw_target =
+    self.clamp_target_by_membw(layer, membw_limit, membw, target as u64);
+// 内存带宽限制只能减少目标 CPU 数，不能突破其他上下限
+let target = membw_target.clamp(cpus_range.0, target);
+*/
     let membw_required = layer_config.specs.iter().any(|spec| match spec.kind {
         LayerKind::Confined { membw_gb, .. } | LayerKind::Grouped { membw_gb, .. } => {
             membw_gb.is_some()

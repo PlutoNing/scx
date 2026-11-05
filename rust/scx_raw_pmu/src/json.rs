@@ -134,7 +134,44 @@ pub struct PMUManager {
     pub codename: String,
     pub pmus: HashMap<String, PMUSpec>,
 }
+/* 为什么必须区分不同架构
+普通调度逻辑，例如：
 
+任务属于哪个 layer；
+哪些 CPU 可以使用；
+CPU 利用率；
+NUMA/LLC 拓扑；
+idle CPU 选择；
+大部分可以通过统一的内核接口实现。
+
+但是 PMU 原始事件不是统一接口。PMU 可以理解为 CPU 内部的硬件统计器，它统计：
+指令、周期；
+cache miss；
+DRAM 数据填充；
+分支预测失败；
+解码器、执行单元、load/store queue 是否阻塞。
+这些事件的编号和含义由具体 CPU 厂商及微架构定义。即使都运行 x86：
+
+AMD Zen 5 和 Intel Sapphire Rapids 的事件编号不同；
+Zen 3 和 Zen 5 的同类事件也可能换名字、换编码或改变语义；
+某个 CPU 有的事件，另一个 CPU 可能根本没有。
+因此不能写死一个全平台通用编号。例如：
+AMD Zen 5:
+  ls_any_fills_from_sys.dram_io_all
+  EventCode = 0x44
+  UMask     = 0x48
+
+Intel:
+  LONGEST_LAT_CACHE.MISS
+ 它们都是用来近似内存流量的事件，但名字和硬件编码不同。
+
+如果把 Zen 5 编码用在 Intel 上，可能出现：
+
+perf_event_open() 直接失败；
+事件可以打开，但统计的是完全不同的东西；
+数值看似正常，实际语义错误，这是最危险的情况；
+最终导致 layer 内存带宽估算错误，CPU 数量限制失效或误限流。
+  */
 impl PMUManager {
     /// Identify the architecture of the local machine and
     /// retrieve the paths to the relevant JSON files.
@@ -167,7 +204,29 @@ impl PMUManager {
     fn read_file_counters(json_bytes: &[u8]) -> Result<Vec<PMUSpec>> {
         Ok(serde_json::from_slice(json_bytes)?)
     }
+/* 
+程序如何识别 CPU
+PMUManager 首先读取 /proc/cpuinfo，组成：
 
+
+vendor_id-cpu_family-model
+例如 Zen 5 会匹配类似：
+
+
+AuthenticAMD-26-*
+mapfile.csv 把它映射到 amdzen5。然后加载 arch/x86/amdzen5/ 下的所有 JSON：
+最终得到类似：
+
+
+PMUManager {
+    arch: "x86",
+    codename: "amdzen5",
+    pmus: {
+        "de_op_queue_empty" -> ...
+        "ls_any_fills_from_sys.dram_io_all" -> ...
+    }
+}
+*/
     fn arch_code() -> String {
         String::from(match ARCH {
             "x86" => "x86",
