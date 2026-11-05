@@ -1,0 +1,49 @@
+这个配置实际配置了什么
+它按照任务的“平均单次连续运行时间”把任务依次分成四层：
+
+short
+
+AvgRuntime：[0, 100) 微秒
+Confined、protected
+固定目标 5 个 CPU
+100ms 时间片
+Floating 放置
+mid
+
+AvgRuntime：[100, 10000) 微秒，即 100µs～10ms
+Confined、protected
+固定目标 5 个 CPU
+100ms 时间片
+Sticky 放置
+long
+
+AvgRuntime：[10000, 1000000) 微秒，即 10ms～1s
+Confined、protected
+固定目标 5 个 CPU
+100ms 时间片
+Sticky 放置
+rest
+
+[[]] 是恒真兜底匹配
+主要接收平均运行时间大于等于 1 秒的任务
+Grouped
+CPU 数动态伸缩，目标每 CPU 利用率 5%～60%
+必要时可以借用层外未保护的空闲 CPU
+需要注意：前三层合计要求的最低目标是 15 个 CPU。如果机器可用 CPU 不足，分配器无法凭空满足所有层的 5 CPU 下限。
+
+
+matches 的逻辑
+二维数组的逻辑是：
+
+
+外层数组：OR
+内层数组：AND
+本文件前三层都只有一个 OR 分组和一个条件。
+
+rest 的 [[]] 表示：
+
+
+一个 OR 分组
+  └── 零个 AND 条件
+零条件的 AND 结果为真，因此它是 catch-all。调度器也强制要求最后一层必须是这种空匹配：
+

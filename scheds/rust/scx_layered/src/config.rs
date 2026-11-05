@@ -19,7 +19,16 @@ use scx_utils::Cpumask;
 pub struct LayerConfig {
     pub specs: Vec<LayerSpec>,
 }
-
+/*
+ 整个文件              → LayerConfig
+每个层对象            → LayerSpec
+matches 外层数组      → Vec<Vec<LayerMatch>>
+matches 内层数组      → Vec<LayerMatch>
+{"AvgRuntime":[a,b]}  → LayerMatch::AvgRuntime(a, b)
+kind.Confined         → LayerKind::Confined
+kind.Grouped          → LayerKind::Grouped
+placement             → LayerPlacement
+ */
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerSpec {
     pub name: String,
@@ -96,6 +105,7 @@ pub enum LayerMatch {
     IsKthread(bool),
     UsedGpuTid(bool),
     UsedGpuPid(bool),
+/*  */
     AvgRuntime(u64, u64),
     HintEquals(u64),
     SystemCpuUtilBelow(f64),
@@ -167,8 +177,22 @@ fn default_xnuma_threshold_delta() -> (f64, f64) {
     (0.2, 0.3)
 }
 
+/* */
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LayerKind {
+    /* 
+  Confined
+用户态给它分配一组 CPU。
+任务原则上只能在本层 CPU 上运行。
+有 util_range，所以用户态会根据利用率扩缩 CPU。
+可以用 cpus_range 限制 CPU 数上下界。
+适合需要较强局部性和资源限制的任务。
+“原则上”而非绝对，是因为还存在：
+
+affinity 冲突；
+fallback/rescue；
+调度器异常恢复路径。  
+     */
     Confined {
         util_range: (f64, f64),
         #[serde(default)]
@@ -186,6 +210,12 @@ pub enum LayerKind {
         #[serde(flatten)]
         common: LayerCommon,
     },
+/* Grouped
+同样拥有自己的 CPU 集合。
+正常情况下优先本层 CPU。
+本层繁忙时，可以借用其他未保护的空闲 CPU。
+比 Confined 更 work-conserving。
+idle_confined=true 时，未饱和前表现得更像 Confined。 */
     Grouped {
         util_range: (f64, f64),
         #[serde(default)]
@@ -215,6 +245,11 @@ pub enum LayerKind {
         #[serde(flatten)]
         common: LayerCommon,
     },
+/* Open
+不要求独占自己的固定 CPU。
+用户态把 Confined/Grouped 没有使用的剩余 CPU 给 Open 层。
+如果剩余 CPU 不够，也可以在允许条件下使用其他 CPU。
+不参与 calc_target_nr_cpus() 的普通动态 target 计算。 */
     Open {
         #[serde(flatten)]
         common: LayerCommon,

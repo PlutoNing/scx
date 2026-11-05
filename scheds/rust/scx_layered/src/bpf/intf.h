@@ -401,7 +401,14 @@ struct xnuma_bucket {
 	u64			last_refill_ts;
 	u64			rate;		/* duty_cycle units per second, set by userspace */
 };
-
+/* 
+nr_cpus：该层在这个 node 的 CPU 数。
+nr_pinned_tasks：CPU affinity 被限制在该 node 的任务数。
+llcs_to_drain：需要从哪些无 owner CPU 的 LLC DSQ 搬走任务。
+llc_drain_cnt：LLC drain 状态/计数。
+xnuma_is_mig_src：该 node 当前是否允许作为跨 NUMA 迁移源。
+xnuma[]：跨 NUMA 迁移的 token bucket。
+*/
 struct layer_node_ctx {
 	u32			nr_cpus;
 	u64			nr_pinned_tasks;
@@ -412,49 +419,132 @@ struct layer_node_ctx {
 };
 
 struct layer {
+	/* 这个 layer 的匹配条件。
+	第一维是 OR 分组，layer_match_ands 内部是 AND 条件。
+来自 JSON 的 matches。 */
 	struct layer_match_ands	matches[MAX_LAYER_MATCH_ORS];
+/* 实际有效的 OR 分组数量。
+match_layer() 根据它遍历匹配规则。 */
 	unsigned int		nr_match_ors;
+	/* 层编号，也就是 JSON 数组中的顺序索引。
+任务通过 task_ctx.layer_id 引用它。
+层 DSQ ID、统计数组也都使用这个编号。 */
 	unsigned int		id;
+/* 任务一次运行即使很短，也至少按这个时间计入虚拟运行时间。
+防止频繁睡眠/唤醒的任务因为每次运行太短而获得不公平优势。 */
 	u64			min_exec_ns;
+/* struct layer 中存在，但当前代码没有实际读写它。
+当前连续运行限制使用的是全局 const volatile u64 max_exec_ns，不是该成员。
+因此它目前更像遗留或预留字段。 */
 	u64			max_exec_ns;
+/* 任务调用 yield() 时，从剩余时间片中扣除多少。
+由 yield_ignore 和 slice_ns 计算。 */
 	u64			yield_step_ns;
+/* 本层任务的调度时间片，单位纳秒。
+JSON slice_us 乘 1000 后写入。
+插入 DSQ 时作为 slice 参数使用。 */
 	u64			slice_ns;
+/* false：默认按虚拟时间 dsq_vtime 排序。
+true：按 FIFO 顺序入队。 */
 	bool			fifo;
+/* 层配置权重的 BPF 镜像。
+当前 BPF 调度路径没有直接读取 layer->weight。
+真正的层权重主要在用户态 CPU 分配阶段使用。
+任务自身公平性使用的是 p->scx.weight。 */
 	u32			weight;
+/* CPU 连续繁忙超过该时间后，阻止普通 Open/Grouped 工作借用该 CPU。 */
 	u64			disallow_open_after_ns;
+/* CPU 连续繁忙超过该时间后，进一步阻止其他 preempt layer 抢占。 */
 	u64			disallow_preempt_after_ns;
+/* 跨 LLC 迁移阈值。
+当前 LLC 中排队工作不够多时，不值得为了寻找空闲 CPU 跨 LLC 迁移。
+用于在缓存局部性和排队延迟之间取舍。 */
 	u64			xllc_mig_min_ns;
-
+/*
+BPF 侧的 LAYER_KIND_CONFINED、GROUPED 或 OPEN。
+决定任务能否使用层外 CPU。 */
 	int			kind;
+/* 本层任务在没有空闲 CPU 时，是否可以主动抢占其他非抢占层任务。 */
 	bool			preempt;
+/* 是否优先尝试抢占任务之前运行的 CPU，然后再搜索空闲 CPU。 */
 	bool			preempt_first;
+/* 是否尝试独占整个物理核心。
+SMT sibling 会尽量保持空闲。
+不是安全隔离保证。 */
 	bool			excl;
+/* 表示 cpuset[] 中是否有显式的 layer cpuset。
+通常由模板展开生成的 spec.cpuset 设置。 */
 	bool			has_cpuset;
+/* dispatch 时是否跳过远端 NUMA 节点上的队列。 */
 	bool			skip_remote_node;
+/* SMT 系统中，即使存在完整 idle core，也优先继续使用 previous CPU。 */
 	bool			prev_over_idle_core;
+/* 仅适用于 Grouped。
+未饱和时像 Confined 一样只在本层 CPU 中找 idle CPU。
+饱和或系统已全部分配后，再允许使用外部 unprotected CPU。 */
 	bool			idle_confined;
+/* 用户态告知 BPF：系统所有 CPU 是否已分配完。
+若已分完，idle_confined 的 Grouped 层继续等待已经没有意义，可以向外借 CPU。 */
 	bool			fully_allocated;
+/* 层 CPU 集合增长/拓扑顺序算法。
+与 placement 不同：
+growth_algo 决定给 layer 分配哪些 CPU。
+task_place 决定 layer 内具体任务如何选 CPU。
+大多数增长逻辑在用户态；BPF 也会用它处理 big/little 选核偏好。 */
 	int			growth_algo;
-
+/* 当前归属于该层的任务数。
+switch_to_layer() 在旧层减一、新层加一。 */
 	u64			nr_tasks;
-
+/* 层 CPU mask 的版本号。
+用户态改变层 CPU 集合后，BPF 增加它。
+任务缓存的 CPU mask 版本落后时重新计算。 */
 	u64			cpus_seq;
+/* 表示最近一次搜索发现该层没有可用 idle CPU。
+用于快速跳过重复且昂贵的分层选核搜索。
+找到 idle CPU 时清零，找不到时置位。 */
 	bool			check_no_idle;
+/* 层的 CPU performance target。
+非零时在任务运行阶段调用 scx_bpf_cpuperf_set()。 */
 	u32			perf;
+/* refresh_cpus
+
+用户态写为 1，通知 BPF cpus[] 已更新。
+BPF 通过 compare-and-swap 消费后清零。
+cpus
+
+用户态序列化后的 layer CPU bitmap。
+nr_cpus
+
+当前分配给该层的 CPU 总数。
+nr_llc_cpus
+
+每个 LLC 中，该层拥有的 CPU 数。
+如果某个 LLC 已没有该层 CPU，但 DSQ 仍有任务，需要启动 drain。 */
 	u64			refresh_cpus;
 	u8			cpus[MAX_CPUS_U8];
 
 	u32			nr_cpus;
 	u32			nr_llc_cpus[MAX_LLCS];
-
+/* node[]
+每个 NUMA 节点对应一个 layer_node_ctx。 */
 	struct layer_node_ctx	node[MAX_NUMA_NODES];
+/* task_place
 
+JSON placement 转换后的 BPF 枚举。
+Standard、Sticky、Floating。 */
 	enum layer_task_place   task_place;
 
 	char			name[MAX_LAYER_NAME];
+	/* 本层 CPU 是否从普通可借用 CPU 集合中排除。
+protected CPU 的 dispatch 也不会主动拉取其他层工作。 */
 	bool			is_protected;
+	/* 只要层中存在 MATCH_AVG_RUNTIME，初始化时就置为 true。
+表示任务需要周期性重新检查 AvgRuntime 区间。 */
 	bool			periodically_refresh;
+	/* 层的静态允许 CPU bitmap，主要用于模板展开/显式 cpuset。 */
 	u8			cpuset[MAX_CPUS_U8];
+	/* GPU 使用等动态成员资格的过期时间。
+到期后设置 refresh_layer，重新判断归属。 */
 	u64			member_expire_ms;
 };
 

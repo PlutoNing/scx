@@ -23,7 +23,31 @@
 #include "intf.h"
 #include "timer.bpf.h"
 #include "util.bpf.h"
+/* 以 avgtime.json 为例。
+avgruntime.json
+  ↓ serde_json
+LayerSpec / LayerKind / LayerMatch
+  ↓ Scheduler::init_layers()
+BPF layers[] 配置
+  ↓
+任务 runnable 时匹配并得到 task_ctx.layer_id
+  ↓
+select_cpu / enqueue 根据 layer 策略选核、入队
+  ↓
+dispatch 从相应 DSQ 取任务
+  ↓
+stopping 更新 runtime_avg
+  ↓
+周期性重新匹配 AvgRuntime layer
 
+同时：
+用户态定期统计各 layer 利用率
+  ↓
+计算目标 CPU 数
+  ↓
+重新分配 layer CPU mask
+  ↓
+BPF 应用新的 CPU 所有权 */
 char _license[] SEC("license") = "GPL";
 
 extern unsigned CONFIG_HZ __kconfig;
@@ -702,8 +726,10 @@ struct cached_cpus {
 struct task_ctx {
 	int			pid;
 	int			last_cpu;
+	/* 当前任务所属的layer_id */
 	u32			layer_id;
 	pid_t			last_waker;
+	/* 是否需要刷新layer */
 	bool			refresh_layer;
 	struct cached_cpus	layered_cpus;
 	/*
@@ -722,6 +748,7 @@ struct task_ctx {
 	u32			pinned_node;
 	u64			runnable_at;
 	u64			running_at;
+	/* runtime_avg 是“每个任务最近若干次连续运行片段长度”的指数移动平均值，不是进程总运行时间，也不是 CPU 利用率。 */
 	u64			runtime_avg;
 	u64			duty_cycle;	/* EWMA, 1.0 = 1 << DUTY_CYCLE_SHIFT */
 	/* 上次 update duty_cycle 的时间 */
@@ -734,6 +761,7 @@ struct task_ctx {
 	u32			qrt_llc_id;
 
 	char 			join_layer[SCXCMD_COMLEN];
+	/* 用于记录layer的刷新序列 */
 	u64			layer_refresh_seq;
 
 	u64			recheck_layer_membership;
@@ -1378,7 +1406,22 @@ s32 pick_idle_big_little(struct layer *layer, struct task_ctx *taskc,
 		return cpu;
 	}
 }
+/* pick_idle_cpu() 负责：
 
+检查 AvgRuntime 周期刷新序号；
+任务 affinity 与 layer mask 取交集；
+preempt-first；
+Confined/Grouped/Open 区分；
+protected/unprotected CPU；
+SMT idle core；
+big/little；
+previous LLC；
+跨 LLC 成本；
+本地 NUMA node；
+远端 NUMA node；
+xNUMA token 限制；
+层外 idle CPU；
+更新 check_no_idle。 */
 static __always_inline
 s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		  struct cpu_ctx *cpuc, struct task_ctx *taskc, struct layer *layer,
@@ -1699,6 +1742,15 @@ bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 ne
 	return true;
 }
 
+/* 
+它的职责只有：
+
+应用最新的 layer CPU mask。
+检查 task hint 是否要求快速切层。
+获取任务当前 layer。
+Sticky 直接选择 previous CPU。
+其他策略调用 pick_idle_cpu()。
+找到 CPU 后直接插入该 CPU 的 local DSQ。 */
 s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct cpu_ctx *cpuc;
@@ -2190,7 +2242,10 @@ preempt_xnuma_done: ;
 	 * contribution.
 	 */
 	task_uncharge_qrt(taskc);
-
+/* runtime_avg 还用于估算 LLC DSQ 的排队工作量：
+因此它既服务于：
+AvgRuntime 层分类；
+LLC 排队时长和跨 LLC 迁移判断。 */
 	taskc->qrt_layer_id = layer_id;
 	taskc->qrt_llc_id = llc_id;
 	queued_runtime = __sync_fetch_and_add(&llcc->queued_runtime[layer_id],
@@ -3119,6 +3174,7 @@ static __noinline bool match_one(struct layer *layer, struct layer_match *match,
 			return recently_used == must_be_used;
 	}
 	case MATCH_AVG_RUNTIME: {
+
 			struct task_ctx *taskc = lookup_task_ctx_may_fail(p);
 			if (!taskc) {
 				scx_bpf_error("could not find task");
@@ -3336,7 +3392,72 @@ static void switch_to_layer(struct task_struct *p, struct task_ctx *taskc, u64 l
 	p->scx.dsq_vtime = llcc->vtime_now[layer_id];
 }
 
-/* 可能刷新layer */
+/* maybe_refresh_layer() 为什么需要 refresh
+因为 task 的 layer 归属依赖动态属性，不能在创建任务时永久确定。
+可能变化的属性包括：
+cgroup；
+task comm；
+nice/weight；
+AvgRuntime；
+GPU 使用状态；
+task hint；
+动态成员资格过期状态。
+taskc->layer_id 本质上是一个缓存。如果相关属性变化，需要将 refresh_layer
+ 置为 true，然后重新跑全部 layer 匹配。
+ =============
+ 设置 refresh_layer 的场景
+新任务创建：
+
+main.bpf.c
+Ln 4032–4036
+
+taskc->layer_id = MAX_LAYERS;
+taskc->refresh_layer = true;
+cgroup attach：
+
+leader 和线程组成员都需要重匹配。
+task_rename：
+
+因为 CommPrefix、CmdJoin 等规则依赖名称。
+nice/weight 改变：
+
+因为存在 NiceAbove、NiceBelow、NiceEquals。
+新的 GPU 使用或 GPU 成员资格过期。
+
+member_expire_ms 到期。
+
+task hint 门控条件变化。
+
+AvgRuntime 周期刷新：
+
+
+main.bpf.c
+Ln 1401–1403
+
+if (layer->periodically_refresh &&
+    taskc->layer_refresh_seq < layer_refresh_seq_avgruntime)
+	taskc->refresh_layer = true;
+用户态默认每两秒增加全局刷新序号：
+if (enable_layer_refresh && now >= next_layer_refresh_at) {
+	self.skel
+	    .maps
+	    .bss_data
+	    .as_mut()
+	    .unwrap()
+	    .layer_refresh_seq_avgruntime += 1;
+	next_layer_refresh_at += self.layer_refresh_intv;
+}
+一个重要实现细节
+用户态增加序号后，不会主动遍历所有任务。
+
+任务只有进入 pick_idle_cpu() 时才发现自己的序号过期并设置 refresh_layer，之后在 layered_runnable() 中真正重新匹配。
+
+因此：
+
+长时间持续运行、没有重新进入选核/runnable 路径的任务不会立刻切层。
+Sticky 在普通 select_cpu() 中直接选择 previous CPU，不调用 pick_idle_cpu()，所以它发现周期序号变化的时机可能更晚。
+若 enqueue 因未走 selected CPU 路径、抢占失败等原因调用 pick_idle_cpu()，仍然可以触发刷新。
+其他 cgroup、rename、weight 等事件也能触发刷新。 */
 static void maybe_refresh_layer(struct task_struct *p __arg_trusted, struct task_ctx *taskc, u64 now)
 {
 	const char *cgrp_path;
@@ -3709,6 +3830,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	cpuc->protect_owned_preempt = false;
 	cpuc->is_protected = false;
 
+	/* 在 stopping 阶段设置 CPU 的保护状态： */
 	if (cpuc->in_open_layers) {
 		if (task_layer->kind == LAYER_KIND_OPEN && !task_layer->preempt) {
 			cpuc->protect_owned = usage_since_idle > min_open_layer_disallow_open_after_ns;

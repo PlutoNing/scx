@@ -1,7 +1,12 @@
 [
   {
+    "_comment_file": "本文件按任务单次连续运行时间的指数移动平均值（AvgRuntime）把任务分为 short、mid、long 和兜底 rest 四层；数组顺序也是匹配优先级，任务归入第一个匹配成功的层。",
+    "_comment_name": "层名称，写入调度器内部 layer.name，并用于日志和统计展示。",
     "name": "short",
-    "comment": "Layers running for up to 100us",
+    "_comment_comment": "供人阅读的可选说明字段，不参与匹配、CPU 分配或 BPF 调度决策。",
+    "comment": "平均单次连续运行时间小于 100 微秒的短任务层",
+    "_comment_matches": "任务匹配规则。外层数组各项之间是 OR，内层数组各条件之间是 AND；本层只有一个 AvgRuntime 条件。",
+    "_comment_AvgRuntime": "AvgRuntime 使用微秒，区间为左闭右开 [min, max)。[0, 100) 表示平均单次连续运行时间小于 100 微秒。",
     "matches": [
       [
         {
@@ -9,20 +14,31 @@
         }
       ]
     ],
+    "_comment_kind": "层策略类型；Confined 表示任务原则上只能在分配给本层的 CPU 上运行。",
     "kind": {
       "Confined": {
-	"protected": true,
-	"slice_us": 100000,
-	"util_range": [0.01, 0.99],
+        "_comment_Confined": "Confined 层拥有专属 CPU 集合；用户态会计算目标 CPU 数，BPF 选核和 dispatch 会限制任务使用这些 CPU。",
+        "_comment_protected": "true 表示本层获分配的 CPU 受到保护：其他层不会把这些 CPU 当作普通可借用 CPU，dispatch 也不会主动从其他层拉取任务。",
+        "protected": true,
+        "_comment_slice_us": "本层调度时间片，单位微秒。100000 微秒等于 100 毫秒；任务入 DSQ 时使用该时间片。",
+        "slice_us": 100000,
+        "_comment_util_range": "期望的本层平均每 CPU 利用率范围 [低水位, 高水位]。低于 1% 倾向缩容，高于 99% 倾向扩容；但本层 cpus_range 固定为 5，最终不会改变 CPU 数。",
+        "util_range": [0.01, 0.99],
+        "_comment_cpus_range": "本层可分配 CPU 数量的闭区间 [最小值, 最大值]。[5, 5] 将本层固定为 5 个 CPU。",
         "cpus_range": [5, 5],
-	"placement": "Floating"
+        "_comment_placement": "Floating 表示选取空闲 CPU 时不强调上一 CPU、LLC 或 NUMA 局部性，而是在本层允许的 CPU 范围内更自由地寻找空闲 CPU。",
+        "placement": "Floating"
       }
     }
   },
 
   {
+    "_comment_name": "层名称；该层在 short 之后匹配。",
     "name": "mid",
-    "comment": "Layers running for up to 10ms",
+    "_comment_comment": "仅用于说明，不参与调度。",
+    "comment": "平均单次连续运行时间为 100 微秒到 10 毫秒的任务层",
+    "_comment_matches": "外层 OR、内层 AND；此处只有一个 AvgRuntime 匹配条件。",
+    "_comment_AvgRuntime": "[100, 10000) 微秒，即大于等于 100 微秒且小于 10 毫秒。",
     "matches": [
       [
         {
@@ -30,20 +46,31 @@
         }
       ]
     ],
+    "_comment_kind": "Confined 策略把任务限制在本层获分配的 CPU 集合中。",
     "kind": {
       "Confined": {
-	"protected": true,
-	"slice_us": 100000,
-	"util_range": [0.01, 0.99],
+        "_comment_Confined": "本层拥有由用户态 CPU 分配器管理的专属 CPU 集合。",
+        "_comment_protected": "保护本层 CPU，避免其他普通层借用并避免 protected CPU 主动拉取其他层任务。",
+        "protected": true,
+        "_comment_slice_us": "本层时间片为 100000 微秒，即 100 毫秒。",
+        "slice_us": 100000,
+        "_comment_util_range": "目标平均每 CPU 利用率为 1% 到 99%；由于 cpus_range 固定为 5，利用率计算不会改变最终 CPU 数。",
+        "util_range": [0.01, 0.99],
+        "_comment_cpus_range": "最少和最多都为 5，因此该层固定分配 5 个 CPU。",
         "cpus_range": [5, 5],
-	"placement": "Sticky"
+        "_comment_placement": "Sticky 优先继续使用任务上一次运行的 CPU，以减少迁移和缓存失效；若该 CPU 不可用，后续 enqueue/dispatch 路径仍可选择其他合适 CPU。",
+        "placement": "Sticky"
       }
     }
   },
 
   {
+    "_comment_name": "层名称；该层在 short、mid 之后匹配。",
     "name": "long",
-    "comment": "Layers running from 10ms to 1s",
+    "_comment_comment": "仅用于说明，不参与调度。",
+    "comment": "平均单次连续运行时间为 10 毫秒到 1 秒的长任务层",
+    "_comment_matches": "外层 OR、内层 AND；此处只有一个 AvgRuntime 匹配条件。",
+    "_comment_AvgRuntime": "[10000, 1000000) 微秒，即大于等于 10 毫秒且小于 1 秒。",
     "matches": [
       [
         {
@@ -51,23 +78,36 @@
         }
       ]
     ],
+    "_comment_kind": "Confined 策略把任务限制在本层获分配的 CPU 集合中。",
     "kind": {
       "Confined": {
-	"protected": true,
-	"slice_us": 100000,
-	"util_range": [0.01, 0.99],
+        "_comment_Confined": "本层拥有由用户态 CPU 分配器管理的专属 CPU 集合。",
+        "_comment_protected": "保护本层 CPU，避免其他普通层借用并避免 protected CPU 主动拉取其他层任务。",
+        "protected": true,
+        "_comment_slice_us": "本层时间片为 100000 微秒，即 100 毫秒。",
+        "slice_us": 100000,
+        "_comment_util_range": "目标平均每 CPU 利用率为 1% 到 99%；由于 cpus_range 固定为 5，利用率计算不会改变最终 CPU 数。",
+        "util_range": [0.01, 0.99],
+        "_comment_cpus_range": "最少和最多都为 5，因此该层固定分配 5 个 CPU。",
         "cpus_range": [5, 5],
-	"placement": "Sticky"
+        "_comment_placement": "Sticky 优先继续使用任务上一次运行的 CPU，以保持 CPU/缓存局部性；它不是永久 CPU 绑定。",
+        "placement": "Sticky"
       }
     }
   },
 
   {
+    "_comment_name": "兜底层名称；必须放在最后。",
     "name": "rest",
-    "comment": "the rest",
-    "matches":[[]],
+    "_comment_comment": "仅用于说明，不参与调度。",
+    "comment": "未命中 short、mid、long 的所有其余任务",
+    "_comment_matches": "[[]] 表示一个不包含任何 AND 条件的 OR 分组，因此恒为真，是调度器要求的终止兜底匹配；例如 AvgRuntime 大于等于 1 秒的任务会进入本层。",
+    "matches": [[]],
+    "_comment_kind": "Grouped 层优先使用分配给自己的 CPU，但本层繁忙且外部存在未受保护的空闲 CPU 时可以向外溢出。",
     "kind": {
       "Grouped": {
+        "_comment_Grouped": "Grouped 在缓存局部性与整机利用率之间折中：平时聚集在本层 CPU，必要时可借用外部空闲 CPU。",
+        "_comment_util_range": "期望平均每 CPU 利用率保持在 5% 到 60%。低于低水位时倾向减少 CPU，高于高水位时倾向增加 CPU；未设置 cpus_range，范围默认为 0 到机器全部 CPU。",
         "util_range": [
           0.05,
           0.60

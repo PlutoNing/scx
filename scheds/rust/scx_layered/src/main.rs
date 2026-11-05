@@ -1451,6 +1451,51 @@ impl Stats {
     }
 }
 
+/* 这个结构不是任务调度热路径数据，而是用户态 CPU 资源分配器的状态。
+
+name
+
+层名称。
+用于日志、统计和调试。
+kind
+
+完整的 LayerKind 配置。
+用户态用它读取 util_range、cpus_range、membw_gb、公共配置等。
+growth_algo
+
+给 layer 增加或释放 CPU 时的拓扑顺序算法。
+与任务 placement 不同。
+core_order
+
+按 NUMA node 保存 core ID 分配顺序。
+外层索引是 node，内层是该 node 的 core 优先级。
+扩容按正向分配，缩容通常按反向释放。
+assigned_llcs
+
+每个 node 中已经完整分配给该层的 LLC。
+主要服务 StickyDynamic 等以 LLC 为单位的动态策略。
+nr_cpus
+
+当前层实际拥有的 CPU 总数。
+nr_llc_cpus
+
+每个 LLC 中，本层拥有多少 CPU。
+nr_node_cpus
+
+每个 NUMA node 中，本层拥有多少 CPU。
+cpus
+
+当前实际分配 CPU bitmap。
+最终同步到 BPF layer.cpus[]。
+allowed_cpus
+
+该层允许被分配的 CPU 范围。
+由配置中的 nodes、llcs、模板 cpuset 等限制得到。
+cpus 必须是它的子集。
+nr_pinned_cpus
+
+每个 node 中为 affinity/pinned 任务需求保留的 CPU 数。
+资源竞争时，先满足不能跨 node 移动的需求。*/
 #[derive(Debug)]
 struct Layer {
     name: String,
@@ -2123,6 +2168,44 @@ impl<'a> Scheduler<'a> {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_USED_GPU_PID as i32;
                             mt.used_gpu_pid.write(*polarity);
                         }
+                        /* 
+     这里不是在计算 AvgRuntime，而是在把 Rust 配置转换成 BPF 能读取的固定结构。
+例如 JSON：
+
+
+{"AvgRuntime": [100, 10000]}
+先反序列化为：
+
+
+LayerMatch::AvgRuntime(100, 10000)
+再写入：
+
+
+mt.kind               = MATCH_AVG_RUNTIME
+mt.min_avg_runtime_us = 100
+mt.max_avg_runtime_us = 10000
+同时外层代码还写入：
+
+
+main.rs
+Ln 2158–2163
+
+layer.matches[or_i].nr_match_ands = or.len() as i32;
+layer.nr_match_ors = spec.matches.len() as u32;
+layer.kind = spec.kind.as_bpf_enum();
+因为 BPF 不能直接解析 JSON，也不能使用 Rust enum，所以必须转换为固定大小的 C 数组和 kind/value 形式。
+
+BPF 初始化层时发现 MATCH_AVG_RUNTIME，还会设置：
+
+
+main.bpf.c
+Ln 4492–4497
+
+case MATCH_AVG_RUNTIME:
+	layer->periodically_refresh = true;
+	dbg("%s AVG_RUNTIME [%lluus, %lluus)", header,
+	    match->min_avg_runtime_us,
+ */
                         LayerMatch::AvgRuntime(min, max) => {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_AVG_RUNTIME as i32;
                             mt.min_avg_runtime_us = *min;
@@ -3369,6 +3452,112 @@ impl<'a> Scheduler<'a> {
                         )
                     };
                     self.layer_peak_utils[idx] = peak_util;
+/* AvgRuntime 决定的是：
+
+
+任务属于哪个 layer
+calc_target_nr_cpus() 决定的是：
+
+
+这个 layer 应该拥有多少 CPU
+这是两个不同维度。
+
+为什么动态计算
+假设一个 Confined 层当前有 8 个 CPU，但只消耗 1 个 CPU 的工作量：
+
+继续占有 8 个 CPU 会浪费资源；
+应缩容，把 CPU 归还给其他层。
+反过来，如果只有 2 个 CPU，但有 6 个 CPU 的工作量：
+
+每 CPU 利用率过高；
+应扩容。
+公式：
+
+
+main.rs
+Ln 1517–1524
+
+fn calc_peak_aware_target_range(
+    util: f64,
+    peak_util: f64,
+    util_range: (f64, f64),
+) -> (usize, usize) {
+    let low = (util / util_range.1).ceil() as usize;
+    let high =
+        ((util.max(peak_util) / util_range.0).floor() as usize).max(low);
+    (low, high)
+}
+例如：
+
+
+util = 4.5 个 CPU 的工作量
+util_range = [0.8, 0.9]
+最低 CPU 数：
+
+
+low = ceil(4.5 / 0.9) = 5
+至少要 5 个 CPU，才能让平均每 CPU 利用率不超过 90%。
+
+最高 CPU 数：
+
+
+high = floor(4.5 / 0.8) = 5
+超过 5 个 CPU，平均利用率就会低于 80%。
+
+所以目标是 5。
+
+为什么得到的是 [low, high] 而不是一个值
+这是为了形成滞回区间，避免 CPU 数在边界附近不断抖动。
+
+
+main.rs
+Ln 3378–3405
+
+let (low, high) =
+    calc_peak_aware_target_range(util, peak_util, *util_range);
+let target = layer.cpus.weight().clamp(low, high);
+let target = target.clamp(cpus_range.0, cpus_range.1);
+let membw_target =
+    self.clamp_target_by_membw(layer, membw_limit, membw, target as u64);
+逻辑是：
+
+根据利用率得到允许范围 [low, high]。
+当前 CPU 数如果已经在范围内，保持不变。
+如果低于 low，扩到 low。
+如果高于 high，缩到 high。
+再应用配置的 cpus_range。
+再应用内存带宽限制。
+最后由统一分配器在 layer 之间分配实际 CPU。
+之后 refresh_cpumasks()：
+
+
+main.rs
+Ln 3775–3800
+
+let raw_targets = self.calc_target_nr_cpus();
+let targets: Vec<(usize, usize)> = raw_targets
+    .iter()
+    .enumerate()
+    .map(|(idx, &(target, min))| {
+        let cur = self.layers[idx].nr_cpus;
+        if target < cur {
+            let dampened = cur - (cur - target).div_ceil(2);
+            (dampened.max(min), min)
+        } else {
+            (target, min)
+        }
+    })
+    .collect();
+缩容还会每次只释放一部分 CPU，进一步减少抖动。
+
+对于当前 avgruntime.json：
+
+
+short/mid/long:
+    cpus_range = [5,5]
+所以无论利用率公式算出什么，最终目标都被夹到 5。这里 util_range 的动态伸缩作用实际上被固定 CPU 范围覆盖了。
+
+而 rest 没有 cpus_range，所以它会真正根据 [0.05, 0.60] 动态扩缩。 */
                     let (low, high) = calc_peak_aware_target_range(util, peak_util, *util_range);
 
                     let membw_limit = match membw_gb {
