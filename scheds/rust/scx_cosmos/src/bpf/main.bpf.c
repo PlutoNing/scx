@@ -6,7 +6,13 @@
 #include <scx/percpu.bpf.h>
 #include <lib/pmu.h>
 #include "intf.h"
-
+/* 用户态 (main.rs)                         BPF (main.bpf.c)
+─────────────────                        ────────────────
+Topology / 主域 / SMT 兄弟               cosmos_select_cpu
+NVML: PID → GPU NUMA                     cosmos_enqueue
+/proc/stat → cpu_util_map                cosmos_dispatch
+动态 PMU 阈值                            cosmos_tick / running / stopping
+stats 监控                               本地 DSQ / 共享(或 per-node) DSQ */
 char _license[] SEC("license") = "GPL";
 
 /*
@@ -541,7 +547,16 @@ static inline bool is_pcpu_task(const struct task_struct *p)
  *
  * This determines when the scheduler needs to switch to deadline-mode
  * (using a shared DSQ) vs round-robin mode (using per-CPU local DSQs).
- */
+ 忙闲由 用户态写入的每 CPU 利用率 决定，不是内核瞬时 runqueue：
+
+用户态按 -p 轮询 /proc/stat 的 user+nice，归一化到 [0, 1024]，写入 cpu_util_map
+BPF 里 is_cpu_busy(cpu)：util >= busy_threshold（-c 转成 thresh * 1024 / 100）
+
+状态	队列	                   策略	           目的
+不忙    SCX_DSQ_LOCAL / LOCAL_ON  尽量留在原 CPU   缓存局部性、少抢共享队列锁
+忙      全局 SHARED_DSQ=0，或 每 NUMA node 一个 DSQ dsq_insert_vtime   跨 CPU 迁移、交互任务更容易插队
+默认 -c 0、-p 0：map 全 0，0 >= 0 恒为真，默认按“忙”走 deadline 共享队列。
+更低阈值 = 更早切 deadline = 更偏交互；更高阈值 = 更 sticky，偏服务器。*/
 static inline bool is_cpu_busy(s32 cpu)
 {
 	u64 *util;
@@ -827,6 +842,25 @@ static inline bool is_wakeup(u64 wake_flags)
  * @prev_cpu).
  *
  * Return the CPU id or a negative value if an idle CPU can't be found.
+  ================================
+ ENQ 的时候需要选核：
+ 并非每次 enqueue 前都执行过 select_cpu。
+常见情况包括：
+任务从睡眠中唤醒：通常先 select_cpu。
+任务时间片耗尽，但仍然 runnable。
+任务被抢占后重新入队。
+CPU 被更高调度类占用后重新入队。
+迁移、亲和性变化及其他 re-enqueue 路径。
+某些路径内核跳过了 select_cpu。
+===================
+所以 enqueue 中重新选核至少覆盖：
+
+queued-wakeup 跳过 select_cpu；
+migration-disabled/per-CPU 任务；
+时间片耗尽或抢占后的重新入队；
+任务重新入队、CPU ownership 变化等非唤醒路径；
+select_cpu 执行过，但当时没有完成 direct dispatch；
+从 select 到 enqueue 之间 CPU idle/SMT 状态发生变化。
  */
 static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, s32 this_cpu,
 			 u64 wake_flags, bool from_enqueue)
@@ -937,7 +971,34 @@ static u64 task_slice(const struct task_struct *p)
  * frequency: tasks that sleep often have a bigger slice lag, allowing them
  * to accumulate more time-slice credit than tasks with infrequent, long
  * sleeps.
- */
+
+
+ deadline = vruntime + weight_inverse(exec_runtime)
+ vruntime：累计运行时间按 weight 反比缩放（公平）
+exec_runtime：上次睡眠以来的运行量，上限 slice_lag（默认 20ms），压低长跑任务
+睡眠攒的 vruntime 信用有上限：weight(slice_lag * wakeup_freq)，wakeup_freq
+ 用 EWMA，上限 1024
+高频短睡任务 wakeup_freq 大、exec_runtime 小 → deadline 更靠前，这是交互优先的核心。
+stopping 里实际 slice 还会按 CPU capacity 缩放：慢核上同样墙钟时间少记账，避免
+ big.LITTLE 上慢核任务被当成“跑得少”。
+默认 slice：-s 1000 → 1ms（README 写的 10µs 已过时）。
+
+在经过睡眠信用上限裁剪的历史 vruntime 上，加上“本轮唤醒以来执行时间”的权重反比惩罚，得到 shared DSQ 排序键。
+综合效果：
+
+因素	对 deadline 的影响
+高频唤醒
+减小，提升优先级
+睡醒后只跑很短时间
+惩罚小
+睡醒后持续占 CPU
+增大，降低优先级
+高权重任务
+睡眠信用更大、运行惩罚更小
+低权重任务
+睡眠信用更小、运行惩罚更大
+
+*/
 static u64 task_dl(struct task_struct *p, struct task_ctx *tctx)
 {
 	u64 lag_scale = MAX(tctx->wakeup_freq, 1);
@@ -1036,13 +1097,26 @@ static bool task_should_migrate(struct task_struct *p, u64 enq_flags)
  * Return true if a task is waking up another task that share the same
  * address space, false otherwise.
  */
-static inline bool
-is_wake_affine(const struct task_struct *waker, const struct task_struct *wakee)
+static inline bool is_wake_affine(const struct task_struct *waker, const struct task_struct *wakee)
 {
 	return mm_affinity &&
 		!(waker->flags & PF_EXITING) && wakee->mm && (wakee->mm == waker->mm);
 }
 
+/* 
+任务 p 被唤醒
+  → cosmos_select_cpu(p)
+      → 返回目标 CPU
+      → 若调用 dsq_insert(... LOCAL)，直接派发，跳过 enqueue
+      → 若未调用 dsq_insert，继续进入 enqueue
+  → 内核把返回 CPU 记录为 p 当前关联的 CPU
+  → cosmos_enqueue(p)
+      → scx_bpf_task_cpu(p) 读到 select_cpu 返回的 CPU
+      → 放入该 CPU 的 local DSQ，或放入 shared DSQ
+  → CPU 优先消费自己的 local DSQ
+  → local 没活时调用 cosmos_dispatch()
+      → 从 shared DSQ 搬一个任务到 local DSQ
+ */
 s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	const struct task_struct *current = (void *)bpf_get_current_task_btf();
@@ -1059,6 +1133,7 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	 * Make sure @prev_cpu is usable, otherwise try to move close to
 	 * the waker's CPU. If the waker's CPU is also not usable, then
 	 * pick the first usable CPU.
+	 prev_cpu 不在 cpus_ptr 里时，改成 waker CPU 或第一个可用 CPU
 	 */
 	if (!bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		prev_cpu = is_this_cpu_allowed ? this_cpu : bpf_cpumask_first(p->cpus_ptr);
@@ -1070,9 +1145,16 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	 *
 	 * This optimization is applied only when the system is not saturated,
 	 * to avoid introducing too much unfairness.
+current：当前正在执行唤醒操作的任务，通常是 waker。
+p：被唤醒的任务，即 wakee。
+this_cpu：当前执行 select_cpu 回调的 CPU，通常是 waker 所在 CPU。
+prev_cpu：p 上次运行或此前关联的 CPU；若已不在 p->cpus_ptr，会被代码修正。
+
 	 */
 	if (is_wake_affine(current, p) && !is_busy) {
 		if (this_cpu == prev_cpu) {
+			/* 是在“waker 当前 CPU 正好也是 wakee 上次 CPU”时，利用可能仍然
+			热的缓存直接留在该 CPU。*/
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
 			return this_cpu;
 		}
@@ -1083,6 +1165,7 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	 * but not on the GPU's node, try to pick a CPU on the GPU node.
 	 */
 	if (gpu_enabled && numa_enabled) {
+		/* 尝试在 GPU 节点上选择一个 CPU。 */
 		cpu = pick_cpu_on_gpu_node(p, cpu_node(prev_cpu), tctx);
 		if (cpu >= 0) {
 			__sync_fetch_and_add(&nr_gpu_dispatches, 1);
@@ -1102,8 +1185,55 @@ s32 BPF_STRUCT_OPS(cosmos_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	cpu = pick_idle_cpu(p, prev_cpu, is_this_cpu_allowed ? this_cpu : -1,
 			    wake_flags, false);
 	if (cpu >= 0 || !is_busy)
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(p), 0);/* 这里过会儿直接
+	把这个进程插入到 select CPU 返回的 CPU 的 local dsq 里面。 */
 
+	/* 
+情况一：找到 idle CPU, 	效果：
+
+记录 direct-dispatch；
+返回目标 CPU；
+内核将任务关联到该 CPU；
+插入该 CPU 的 local DSQ；
+跳过 cosmos_enqueue()。
+
+情况二：没找到 idle CPU，但 prev_cpu 不忙
+
+cpu < 0
+!is_busy == true
+仍执行 direct-dispatch：
+
+
+scx_bpf_dsq_insert(... SCX_DSQ_LOCAL ...);
+return prev_cpu;
+效果是留在 prev_cpu，强调局部性，同样跳过 enqueue。
+
+情况三：没找到 idle CPU，且 prev_cpu 忙
+
+cpu < 0
+is_busy == true
+这时不调用 scx_bpf_dsq_insert()，只执行：
+
+
+return prev_cpu;
+prev_cpu 不是“不合适的无效 CPU”。
+它仍然是一个合法、实际生效的初始 CPU/RQ 归属。
+只是 Cosmos 没有在 select 阶段决定最终 DSQ。
+因为没有 direct-dispatch 标记，内核随后调用 cosmos_enqueue()。
+enqueue 可以再找 idle CPU，也可以把任务放进 shared DSQ。
+换句话说：
+
+return prev_cpu 负责给任务一个合法的初始 rq；“没有调用 dsq_insert”才表示把最终排队策略交给 enqueue。
+而且 enqueue 并不知道前面的局部变量 cpu 是负数；它通过：
+
+enq_flags；
+当前 CPU 是否 idle；
+CPU busy 状态；
+SMT、PMU、主域、GPU 条件；
+重新独立决策。
+
+	
+	*/
 	return cpu >= 0 ? cpu : prev_cpu;
 }
 
@@ -1137,6 +1267,17 @@ void BPF_STRUCT_OPS(cosmos_tick, struct task_struct *p)
 	}
 }
 
+/* enqueue 的准确含义：选 DSQ，不是“加入 RQ”
+任务进入 enqueue 前通常已经有关联 CPU，即：scx_bpf_task_cpu(p)
+但还需要决定等待在哪里：
+当前 CPU 的 local DSQ；
+明确指定 CPU 的 local DSQ；
+全局/per-node shared DSQ。
+因此更准确的描述是：
+select_cpu：确定初始 CPU 归属
+enqueue：确定任务放进哪个 sched_ext DSQ
+dispatch：shared DSQ → 当前 CPU local DSQ
+而不是“select 选 DSQ，enqueue 加入 RQ”。 */
 void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	s32 prev_cpu = scx_bpf_task_cpu(p), cpu;
@@ -1155,11 +1296,21 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If the task's pid is in gpu_pid_map (NVML GPU task), prefer the
 	 * GPU NUMA node. If we're on a different node, migrate to the GPU
 	 * node.
+	 第一级：GPU 亲和
+满足 GPU/NUMA、可迁移、目标 node 有 idle CPU：
+→ LOCAL_ON | GPU_CPU
+→ kick GPU_CPU
+→ return
+直接插入这个 GPU CPU 的 DSQ，方便保持它的亲和性。
 	 */
 	if (gpu_enabled && numa_enabled && !is_pcpu_task(p) &&
 	    task_should_migrate(p, enq_flags)) {
+			/* GPU 任务：迁到 GPU node 的 LOCAL_ON，必要时 kick_cpu(IDLE) */
 		cpu = pick_cpu_on_gpu_node(p, node, tctx);
 		if (cpu >= 0) {
+			/* 当前/隐含 CPU：SCX_DSQ_LOCAL
+显式指定 CPU：SCX_DSQ_LOCAL_ON | cpu
+下面这段确实把 GPU 任务插入选中的 CPU*/
 			__sync_fetch_and_add(&nr_gpu_dispatches, 1);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
 					   task_slice(p), enq_flags);
@@ -1172,6 +1323,8 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Attempt to immediately dispatch sticky event-heavy tasks to the
 	 * same CPU.
+	 sticky PMU：事件超过阈值、且在主域/绑核、SMT 不争用 → 钉在原 CPU（若共享队列
+	 队头是 per-CPU 任务则放弃，防饿死）
 	 */
 	if (is_sticky_event_heavy(tctx) &&
 	    (is_primary_cpu(prev_cpu) || is_pcpu_task(p)) &&
@@ -1190,16 +1343,26 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 				scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 			return;
 		}
+
 	}
 
 	/*
 	 * Attempt to dispatch directly to an idle CPU if the task can
 	 * migrate.
+	 需要迁移 / 原 CPU 非空闲 / SMT 争用 / PMU 过重 / 不在主域 → 再找 idle，成功则 LOCAL_ON
 	 */
 	if (task_should_migrate(p, enq_flags) ||
 	    !is_cpu_idle(prev_cpu) ||
 	    is_smt_contended(prev_cpu) ||
 	    (!is_pcpu_task(p) && (is_event_heavy(tctx) || !is_primary_cpu(prev_cpu)))) {
+/* 也就是：
+
+本次没有经过 select_cpu；
+原 CPU 不 idle；
+原 CPU 有 SMT contention；
+PMU migration event 过重；
+原 CPU 不在 primary domain。
+找到 CPU 后直接 LOCAL_ON | cpu。 */
 		if (is_pcpu_task(p))
 			cpu = test_cpu_idle(prev_cpu) ? prev_cpu : -EBUSY;
 		else
@@ -1214,20 +1377,40 @@ void BPF_STRUCT_OPS(cosmos_enqueue, struct task_struct *p, u64 enq_flags)
 			return;
 		}
 	}
-
 	/*
 	 * Keep using the same CPU if that CPU is not busy.
+	 原 CPU 不忙且在主域（或绑核）→ 继续 LOCAL_ON
 	 */
 	if (!is_cpu_busy(prev_cpu) &&
 	    (is_primary_cpu(prev_cpu) || is_pcpu_task(p))) {
+/* 第四级：留在原 CPU
+如果没有成功直接派发，而且：
+原 CPU 不忙；
+原 CPU 在 primary domain，或任务不可迁移；
+则：→ LOCAL_ON | prev_cpu */
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | prev_cpu, task_slice(p), enq_flags);
 		if (task_should_migrate(p, enq_flags))
 			scx_bpf_kick_cpu(prev_cpu, SCX_KICK_IDLE);
 		return;
 	}
-
+/* 第五级：shared deadline DSQ
+剩余任务：
+→ shared/per-node DSQ
+→ 按 virtual deadline 排序
+因此说“走到这里就是前面两个 if 都没进去”不完全准确。还可能是：
+sticky 分支进去了，但发现 q 是单核任务；
+重选 idle 分支进去了，但没找到 idle CPU；
+GPU 分支进去了，但目标 node 没有可用 idle CPU。
+关键条件是：前面都没有成功 direct dispatch 并 return。 */
 	/*
 	 * Dispatch the task to the shared DSQ.
+	 否则 dsq_insert_vtime(shared_dsq, deadline)
+为什么只有 shared DSQ 使用 deadline？
+不是因为 shared DSQ“优先级低”，而是两种模式的目标不同：
+
+local DSQ：低负载模式，强调 CPU locality、低锁竞争和简单 FIFO/RR。
+shared DSQ：高负载模式，多个 CPU/任务竞争，需要跨 CPU 公平性和交互优先，因此用 vtime 排序。
+如果 local 也按 deadline 排序，就增加了 Cosmos 低负载快速路径的复杂度，并削弱其“local round-robin”的设计目标。
 	 */
 	scx_bpf_dsq_insert_vtime(p, shared_dsq(prev_cpu),
 				 task_slice(p), task_dl(p, tctx), enq_flags);
@@ -1275,6 +1458,7 @@ static bool keep_running(const struct task_struct *p, s32 cpu)
 	return true;
 }
 
+/* 这里来消费共享 DSQ 里面的任务。 */
 void BPF_STRUCT_OPS(cosmos_dispatch, s32 cpu, struct task_struct *prev)
 {
 	/*
