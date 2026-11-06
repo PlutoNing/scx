@@ -47,7 +47,7 @@ stopping 更新 runtime_avg
   ↓
 重新分配 layer CPU mask
   ↓
-BPF 应用新的 CPU 所有权 */
+BPF  应用新的 CPU 所有权 */
 char _license[] SEC("license") = "GPL";
 
 extern unsigned CONFIG_HZ __kconfig;
