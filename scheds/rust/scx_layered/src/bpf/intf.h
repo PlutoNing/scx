@@ -91,43 +91,22 @@ static inline void ___consts_sanity_check___(void) {
 }
 
 enum layer_kind {
-	/* 没有自己的地盘，哪里空闲去哪里
-Open 适合：
-
-默认兜底 layer；
-没有特殊隔离要求的普通任务；
-系统线程或通用 workload；
-希望尽可能利用全机空闲算力的任务。 */
+	/*
+	 * Open 不参与用户态 util_range 扩缩。它的 cpus[] 是
+	 * Confined/Grouped 分配后剩余的 CPU；没有剩余 idle CPU 时仍可在
+	 * 其他 unprotected CPU 上运行。常用作最后的 catch-all。
+	 */
 	LAYER_KIND_OPEN,
-	/* 有自己的地盘，但外面空闲时可以借
-	目标不是严格隔离，而是：
-
-平时把同组任务聚在一起；
-尽量保持缓存和拓扑局部性；
-系统有空闲算力时仍然保持 work-conserving；
-避免因为硬限制而让 CPU 闲着、任务却排队。
-
-适合：
-
-希望任务主要集中在部分 LLC/CPU；
-但不能接受任务排队时外部 CPU 闲置；
-前台服务、普通业务层；
-需要在局部性和吞吐量之间折中的任务。
-
-官方定义就是“类似 Confined，但允许在分配 CPU 之外存在空闲 CPU 时溢出”。*/
+	/*
+	 * Grouped 有动态 owned CPU 集合，但允许借用层外 unprotected idle
+	 * CPU。idle_confined 只推迟这种借用，并不把它变成严格隔离。
+	 */
 	LAYER_KIND_GROUPED,
-	/* 有自己的地盘，原则上不许出去
-动态调整：
-平均每 CPU 利用率高于 90%：增加 CPU；
-低于 80%：减少 CPU；
-CPU 数量限制在 1～8。
-
-适合：
-
-后台任务、离线任务；
-希望压缩到少量 CPU 的任务；
-避免任务在整机迁移、污染 LLC；
-需要较强 CPU 隔离的 workload。 */
+	/*
+	 * Confined 有动态 owned CPU 集合；普通选核和 dispatch 不从层外
+	 * CPU 运行任务。affinity 冲突、fallback 和 stranded-task rescue
+	 * 仍是有意保留的例外路径。
+	 */
 	LAYER_KIND_CONFINED,
 };
 
@@ -200,7 +179,12 @@ enum llc_layer_stat_id {
 	NR_LLC_LSTATS,
 };
 
-/* CPU proximity map from closest to farthest, starts with self */
+/*
+ * CPU 拓扑邻近表。cpus[] 从近到远排列，四个 end 是半开区间终点：
+ * [0, core_end) 同一物理 core（含自己），[core_end, llc_end) 同 LLC，
+ * [llc_end, node_end) 同 NUMA node，[node_end, sys_end) 远端 node。
+ * 抢占路径按该顺序扫描，优先保留 cache/NUMA 局部性。
+ */
 struct cpu_prox_map {
 	u16			cpus[MAX_CPUS];
 	u32			core_end;
@@ -209,50 +193,94 @@ struct cpu_prox_map {
 	u32			sys_end;
 };
 
+/*
+ * 每 CPU 的 BPF 私有状态，存放在 percpu array `cpu_ctxs` 中。
+ *
+ * 它同时承担四类职责：
+ * 1. 描述 CPU 的拓扑与非 Open owner；
+ * 2. 记录当前/下一任务的抢占和 SMT-exclusive 状态；
+ * 3. 累计用户态控制循环要读取的利用率、带宽和统计；
+ * 4. 保存该 CPU 的 DSQ 拉取顺序和 fallback 进度。
+ */
 struct cpu_ctx {
+	/* 当前 percpu value 对应的逻辑 CPU ID。 */
 	s32			cpu;
+	/* 当前任务是否属于 preempt 层；其他 preempt 任务不会再抢占它。 */
 	bool			current_preempt;
+	/* 当前运行任务是否请求独占整个 SMT core。 */
 	bool			current_excl;
+	/* 上一个任务的 exclusive 状态，用于退出 exclusive 时唤醒 sibling。 */
 	bool			prev_excl;
+	/* 已为即将直派的 exclusive 任务预留 sibling-idle 状态。 */
 	bool			next_excl;
+	/* 当前任务的 yield 是否耗尽了 slice；enqueue/keep_running 会读取并清除。 */
 	bool			yielding;
+	/* select_cpu 给 enqueue 的一次性信号：先抢占 previous CPU。 */
 	bool			try_preempt_first;
+	/* 用户态拓扑探测写入：异构系统中该 CPU 是否为 big/turbo core。 */
 	bool			is_big;
+	/* 原子声明该 CPU 的待抢占任务，避免多个 wakeup 同时选择同一 CPU。 */
 	struct task_struct	*preempting_task;
+	/* preempting_task 的设置时间；超时后可清理陈旧声明。 */
 	u64			preempting_at;
 
+	/* CPU 连续繁忙后，普通 Open/Grouped 工作是否应让 owner 先运行。 */
 	bool			protect_owned;
+	/* 更强的保护：是否拒绝其他 preempt 层抢占当前 owned 工作。 */
 	bool			protect_owned_preempt;
+	/* 当前任务是否在该 CPU owner layer 上运行，用于 OWNED/OPEN 计费。 */
 	bool			running_owned;
+	/* 当前任务是否来自 Open layer。 */
 	bool			running_open;
+	/* 当前任务是否由 per-node stranded-task fallback 路径拉取。 */
 	bool			running_fallback;
+	/* account_used() 上次结算该 CPU 运行时间的时间戳。 */
 	u64			used_at;
+	/* 当前 CPU owner layer 的 protected 属性缓存。 */
 	bool			is_protected;
 
+	/* 每层 owned/open/protected 等 CPU 时间累计值，用户态周期读取并清算。 */
 	u64			layer_usages[MAX_LAYERS][NR_LAYER_USAGES];
-	/* 这个 layer 的 pin 的 usage */
+	/* 每层 affinity 被固定到本 node 的任务所消耗的 CPU 时间。 */
 	u64			node_pinned_usage[MAX_LAYERS];
+	/* 与 layer_usages 同维度的内存带宽事件累计值。 */
 	u64			layer_membw_agg[MAX_LAYERS][NR_LAYER_USAGES];
+	/* 本 CPU 的全局统计计数器。 */
 	u64			gstats[NR_GSTATS];
+	/* 本 CPU、每层的调度事件统计计数器。 */
 	u64			lstats[MAX_LAYERS][NR_LSTATS];
+	/* 每层 runnable duty 累计；包含排队时间，用于跨 NUMA 失衡判断。 */
 	u64			layer_duty_sum[MAX_LAYERS];
+	/* keep_running() 已连续给当前任务续了多少时间。 */
 	u64			ran_current_for;
 
+	/* 此 CPU 自启动以来的累计忙时间。 */
 	u64			usage;
+	/* 最近一次进入 idle 时的 usage 快照，用于计算连续繁忙时长。 */
 	u64			usage_at_idle;
 
+	/* 本 LLC 的高优先级 fallback DSQ，主要服务关键 per-CPU kthread。 */
 	u64			hi_fb_dsq_id;
+	/* 本 LLC 的低优先级 fallback DSQ，服务 affinity/空层等异常放置。 */
 	u64			lo_fb_dsq_id;
+	/* 此 CPU 是否包含在至少一个 Open layer 的当前 CPU mask 中。 */
 	bool			in_open_layers;
+	/* 非 Open owner 的 layer ID；无 owner/Open CPU 时为 MAX_LAYERS。 */
 	u32			layer_id;
+	/* CPU 所属 LLC 与 NUMA node，初始化后不变。 */
 	u32			llc_id;
 	u32			node_id;
+	/* 最近一次通过 scx_bpf_cpuperf_set() 设置的 target，避免重复调用。 */
 	u32			perf;
 
+	/* low fallback DSQ 从空变非空的代次。 */
 	u64			lo_fb_seq;
+	/* 当前代次开始观测的时间。 */
 	u64			lo_fb_seq_at;
+	/* 当前代次开始时的低优先级 fallback 用量基线。 */
 	u64			lo_fb_usage_base;
 
+	/* 以下数组是 dispatch 的随机化 layer 扫描顺序，按 kind/preempt 分类。 */
 	u32			ogp_layer_order[MAX_LAYERS];	/* open/grouped preempt */
 	u32			ogn_layer_order[MAX_LAYERS];	/* open/grouped non-preempt */
 
@@ -261,48 +289,72 @@ struct cpu_ctx {
 	u32			gp_layer_order[MAX_LAYERS];	/* grouped preempt */
 	u32			gn_layer_order[MAX_LAYERS];	/* grouped non-preempt */
 
+	/* 以本 CPU 为起点的抢占邻近顺序。 */
 	struct cpu_prox_map	prox_map;
 };
 
+/* LLC 从近到远的扫描表；node_end 前与当前 LLC 同 NUMA node。 */
 struct llc_prox_map {
 	u16			llcs[MAX_LLCS];
 	u32			node_end;
 	u32			sys_end;
 };
 
+/* 每 LLC 的共享调度状态。layer DSQ 的公平时钟和排队量都按 LLC 隔离。 */
 struct llc_ctx {
+	/* 连续 LLC ID。 */
 	u32			id;
+	/* 该 LLC 包含的逻辑 CPU bitmap。 */
 	struct bpf_cpumask __kptr *cpumask;
+	/* bitmap 中的 CPU 数。 */
 	u32			nr_cpus;
+	/* 每层在此 LLC 上的 vtime 基准，跨 LLC 时用它平移任务 vtime。 */
 	u64			vtime_now[MAX_LAYERS];
+	/* 每层 DSQ 中任务 runtime_avg 总和，近似“还要跑多久”。 */
 	u64			queued_runtime[MAX_LAYERS];
+	/* low fallback DSQ 从空变非空时递增，通知各 CPU 开始新等待窗口。 */
 	u64			lo_fb_seq;
+	/* 每层在此 LLC 上的延迟/次数统计。 */
 	u64			lstats[MAX_LAYERS][NR_LLC_LSTATS];
+	/* 多份打乱后的 LLC 邻近表，dispatch 随机选一份以减少同距偏置。 */
 	struct llc_prox_map	prox_maps[NUM_PROXIMITY_MAPS];
 };
 
+/* NUMA node 从近到远的顺序；nodes[0] 通常是源 node。 */
 struct node_prox_map {
 	u16			nodes[MAX_NUMA_NODES];
 	u32			sys_end;
 };
 
+/* 每 NUMA node 的共享状态，服务 node-local 选核和 stranded-task rescue。 */
 struct node_ctx {
+	/* 连续 node ID。 */
 	u32			id;
+	/* node 内全部 CPU。 */
 	struct bpf_cpumask __kptr *cpumask;
+	/* node 内未被 protected layer 排除、可被 Grouped/Open 借用的 CPU。 */
 	struct bpf_cpumask __kptr *unprotected_cpumask;
+	/* node 内有效 LLC/CPU 数及 LLC ID 列表。 */
 	u32			nr_llcs;
 	u32			nr_cpus;
 	u32			llcs[MAX_LLCS];
+	/* 此 node 上当前没有 owned CPU 的层；fallback CPU 用它排空遗留 DSQ。 */
 	u32			empty_layer_ids[MAX_LAYERS];
 	u32			nr_empty_layer_ids;
+	/* 跨 node 搜索顺序。 */
 	struct node_prox_map	prox_map;
 };
 
+/* 用户态 test_run(refresh_node_ctx) 传给 BPF 的更新参数。 */
 struct refresh_node_ctx_arg {
+	/* 要更新的 node。 */
 	u32			node_id;
+	/* true 表示首次初始化，同时复制静态 LLC 拓扑。 */
 	u32			init;
+	/* 运行期更新的 empty-layer 集合。 */
 	u32			empty_layer_ids[MAX_LAYERS];
 	u32			nr_empty_layer_ids;
+	/* 仅初始化时复制的 node 内 LLC 列表。 */
 	u32			llcs[MAX_LLCS];
 	u32			nr_llcs;
 };
@@ -338,14 +390,23 @@ enum layer_match_kind {
 	NR_LAYER_MATCH_KINDS,
 };
 
+/*
+ * 一个 AND 条件的固定大小载体。它在逻辑上是 tagged union，但为简化
+ * BPF verifier 使用普通 struct：只有 kind 对应的字段有意义。
+ */
 struct layer_match {
+	/* enum layer_match_kind，决定 match_one() 读取下面哪个成员。 */
 	int		kind;
+	/* cgroup 字符串 matcher 的模式值，路径最长 MAX_PATH。 */
 	char		cgroup_prefix[MAX_PATH];
 	char		cgroup_suffix[MAX_PATH];
 	char		cgroup_substr[MAX_PATH];
+	/* CgroupRegex 由用户态计算 bitmap；这里保存 bitmap bit 编号。 */
 	u32		cgroup_regex_id;
+	/* 线程 comm 与线程组 leader comm 模式。 */
 	char		comm_prefix[MAX_COMM];
 	char		pcomm_prefix[MAX_COMM];
+	/* nice/身份/PID namespace matcher 的比较值。 */
 	int		nice;
 	u32		user_id;
 	u32		group_id;
@@ -353,19 +414,25 @@ struct layer_match {
 	u32		ppid;
 	u32		tgid;
 	u64		nsid;
+	/* 布尔 matcher 的期望极性。 */
 	bool		is_group_leader;
 	bool		is_kthread;
 	bool		used_gpu_tid;
 	bool		used_gpu_pid;
+	/* true 时反转本 matcher 结果，用于 *Exclude 规则。 */
 	bool		exclude;
+	/* AvgRuntime 的半开区间 [min, max)，单位微秒。 */
 	u64		min_avg_runtime_us;
 	u64		max_avg_runtime_us;
+	/* task hint 及两个乘 10000 保存的比例阈值。 */
 	u64		hint;
 	u64		system_cpu_util_below;	/* ratio * 10000 */
 	u64		dsq_insert_below;	/* ratio * 10000 */
+	/* NumaNode matcher 的目标 node。 */
 	u32		numa_node_id;
 };
 
+/* JSON matches 的一个内层数组：matches[0..nr_match_ands) 必须全部命中。 */
 struct layer_match_ands {
 	struct layer_match	matches[NR_LAYER_MATCH_KINDS];
 	int			nr_match_ands;
@@ -397,24 +464,27 @@ enum layer_task_place {
 };
 
 struct xnuma_bucket {
+	/* 当前迁移预算，可暂时为负；单位与 task duty_cycle 相同。 */
 	s64			tokens;
+	/* 上次按 rate 补充预算的 BPF 时钟时间。 */
 	u64			last_refill_ts;
+	/* 每秒补充量；0=禁止，U64_MAX=不限流。 */
 	u64			rate;		/* duty_cycle units per second, set by userspace */
 };
-/* 
-nr_cpus：该层在这个 node 的 CPU 数。
-nr_pinned_tasks：CPU affinity 被限制在该 node 的任务数。
-llcs_to_drain：需要从哪些无 owner CPU 的 LLC DSQ 搬走任务。
-llc_drain_cnt：LLC drain 状态/计数。
-xnuma_is_mig_src：该 node 当前是否允许作为跨 NUMA 迁移源。
-xnuma[]：跨 NUMA 迁移的 token bucket。
-*/
+
+/* 某 layer 在某 NUMA node 上的运行时状态。 */
 struct layer_node_ctx {
+	/* 用户态当前分给本层、本 node 的 owned CPU 数。 */
 	u32			nr_cpus;
+	/* affinity 只能落在此 node 的本层任务数。 */
 	u64			nr_pinned_tasks;
+	/* 位图：哪些已无 owned CPU 的 LLC DSQ 仍需要被其他 LLC 排空。 */
 	u64			llcs_to_drain;
+	/* drain 扫描轮转计数，避免每次都从同一 LLC 开始。 */
 	u32			llc_drain_cnt;
+	/* 此 node 是否过载且无法扩容，允许成为跨 NUMA 迁移源。 */
 	bool			xnuma_is_mig_src;
+	/* 以目标 node ID 索引的迁移 token bucket。 */
 	struct xnuma_bucket xnuma[MAX_NUMA_NODES];
 };
 

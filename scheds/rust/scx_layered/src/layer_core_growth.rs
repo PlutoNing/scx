@@ -46,7 +46,11 @@ use crate::LayerSpec;
 /// each node) since the even-split budget handles cross-node distribution.
 #[derive(Default)]
 pub enum LayerGrowthAlgo {
-    /// Evenly space layers across cores within each node.
+    /// Give each layer a deterministic, rotated core order within each node
+    /// so layers tend to start from different cores. This controls which
+    /// owned cores are added/removed; it does not make individual tasks
+    /// sticky (that is `LayerPlacement::Sticky`). An explicit `llcs` mask is
+    /// still enforced later by `CpuPool::alloc_cpus()`.
     #[default]
     Sticky,
     /// Lowest-numbered CPUs first within each node.

@@ -110,6 +110,7 @@ pub fn round_targets_to_alloc_units(
 /// It manages the mapping and availability of physical and logical cores, including
 /// how resources are allocated for tasks across the available CPUs.
 pub struct CpuPool {
+    /// CPU/core/LLC/NUMA 拓扑，是所有分配顺序和 mask 运算的事实来源。
     pub topo: Arc<Topology>,
 
     /// Per-node free LLC pool: node_id → [(llc_id, consumed_cores)].
@@ -138,6 +139,7 @@ pub struct CpuPool {
     /// algorithms use these indices to define core allocation order.
     core_seq: BTreeMap<(usize, usize, usize), usize>,
 
+    /// false 时分配单位是整个 SMT core；true 时允许只分配一个逻辑 CPU。
     allow_partial: bool,
 }
 
@@ -229,6 +231,11 @@ impl CpuPool {
         Ok(())
     }
 
+    /// 按 `core_alloc_order` 从全局 free mask 中给一层取 CPU。
+    ///
+    /// 每个候选 core 先与该层 `allowed_cpus` 相交，再与全局
+    /// `available_cpus` 相交。默认 whole-core 模式会一次拿走全部 SMT
+    /// siblings；成功后立即从池中清除，防止另一个非 Open 层重复拥有。
     pub fn alloc_cpus(
         &mut self,
         allowed_cpus: &Cpumask,
@@ -280,6 +287,7 @@ impl CpuPool {
         }
     }
 
+    /// 把缩容释放的 CPU 放回全局池，并重新选择每 node fallback CPU。
     pub fn free(&mut self, cpus_to_free: &Cpumask) -> Result<()> {
         // Whether we allow partial CPUs or not does not matter because the cpumask
         // provided is create in next_to_free() below. If we do not allow partial
@@ -297,6 +305,7 @@ impl CpuPool {
         Ok(())
     }
 
+    /// 把一组已由外部算法决定的 CPU 标为占用，主要服务整 LLC 分配路径。
     pub fn mark_allocated(&mut self, cpus_to_alloc: &Cpumask) -> Result<()> {
         if cpus_to_alloc.and(&self.available_cpus.not()).weight() > 0 {
             bail!(
@@ -313,6 +322,8 @@ impl CpuPool {
         Ok(())
     }
 
+    /// 按 growth order 的调用方迭代顺序找一个仍属于该层的 core。
+    /// 普通缩容传反向 order，因此优先释放最后扩入的 core。
     pub fn next_to_free<'a>(
         &'a self,
         cands: &Cpumask,

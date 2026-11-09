@@ -230,11 +230,12 @@ use crate::largest_remainder;
 /// Per-layer allocation result from unified_alloc().
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LayerAlloc {
-    /// Per-node pinned allocation (in alloc units).
+    /// 每 node 为 affinity-pinned 需求保留的配额，单位是 alloc unit。
     pub pinned: Vec<usize>,
-    /// Global unpinned budget from unified_alloc (alloc units).
+    /// 全局可迁移需求预算；它先决定“本层总共能拿多少”，再由后续阶段
+    /// 放入各 node。
     pub unpinned_budget: usize,
-    /// Per-node unpinned distribution (alloc units). Filled by post-step.
+    /// unpinned_budget 的逐 node 放置结果；`sum(unpinned)` 应等于预算。
     pub unpinned: Vec<usize>,
 }
 
@@ -251,7 +252,9 @@ impl LayerAlloc {
 /// Entry for water_fill: a layer competing for a share of a pool.
 #[derive(Clone, Debug)]
 pub struct WaterFillEntry {
+    /// 当前竞争者的相对份额；只在总需求超过 pool 时影响最终结果。
     pub weight: usize,
+    /// 该竞争者最多需要多少单位，分配不会超过它。
     pub demand: usize,
 }
 
@@ -322,16 +325,15 @@ pub fn water_fill(pool: usize, entries: &[WaterFillEntry]) -> Vec<usize> {
 /// Per-layer demand input for unified_alloc().
 #[derive(Clone, Debug)]
 pub struct LayerDemand {
-    /// Per-node raw pinned demand (in alloc units).
+    /// 从每 node pinned utilization / util_range.high 推导的刚性需求。
     pub raw_pinned: Vec<usize>,
-    /// Raw unpinned demand (in alloc units).
+    /// 总 CPU target 扣除 raw_pinned 后，可跨 node 放置的需求。
     pub raw_unpinned: usize,
-    /// Layer weight.
+    /// JSON layer weight. Used only when CPU demand exceeds supply; unrelated
+    /// to the per-task `p->scx.weight` used for vtime accounting in BPF.
     pub weight: usize,
-    /// Spread layer: distribute total budget evenly across nodes,
-    /// ignoring pinned/unpinned distinction. Used by cross-node
-    /// interleaving algos (NodeSpread, RoundRobin) whose core_order
-    /// expects even distribution.
+    /// true 时强制各 node 等量分配，并忽略 pinned/unpinned 区别。
+    /// 当前只用于 NodeSpread*；RoundRobin 通过单个 node tier 做容量比例均衡。
     pub spread: bool,
 }
 

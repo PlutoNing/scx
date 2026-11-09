@@ -23,31 +23,21 @@
 #include "intf.h"
 #include "timer.bpf.h"
 #include "util.bpf.h"
-/* 以 avgtime.json 为例。
-avgruntime.json
-  ↓ serde_json
-LayerSpec / LayerKind / LayerMatch
-  ↓ Scheduler::init_layers()
-BPF layers[] 配置
-  ↓
-任务 runnable 时匹配并得到 task_ctx.layer_id
-  ↓
-select_cpu / enqueue 根据 layer 策略选核、入队
-  ↓
-dispatch 从相应 DSQ 取任务
-  ↓
-stopping 更新 runtime_avg
-  ↓
-周期性重新匹配 AvgRuntime layer
-
-同时：
-用户态定期统计各 layer 利用率
-  ↓
-计算目标 CPU 数
-  ↓
-重新分配 layer CPU mask
-  ↓
-BPF  应用新的 CPU 所有权 */
+/*
+ * 以 scx_layered-vllm.json 为例的两条控制链：
+ *
+ * 配置/任务链：
+ * JSON -> Rust LayerSpec/LayerKind -> Scheduler::init_layers()
+ * -> BPF layers[] -> runnable 时按 CgroupPrefix 首次命中
+ * -> task_ctx.layer_id -> select_cpu/enqueue/dispatch 应用该层策略。
+ *
+ * CPU 所有权链（默认每 100ms）：
+ * BPF layer_usages[] -> Rust 计算 util_range/cpus_range 目标
+ * -> weight 解决层间供给冲突 -> growth_algo 选择具体 core
+ * -> layers[].cpus[]/refresh_cpus -> 本文件刷新 BPF cpumask。
+ *
+ * 第一条在每次任务调度事件的热路径运行；第二条在用户态周期运行。
+ */
 char _license[] SEC("license") = "GPL";
 
 extern unsigned CONFIG_HZ __kconfig;
@@ -548,7 +538,18 @@ static void layer_cpuset_bpfmask(int layer_id)
 }
 
 /*
- * Returns if any cpus were added to the layer.
+ * 消费用户态对一个 layer 的 CPU 所有权更新。
+ *
+ * 1. 用 CAS 把 refresh_cpus 从 1 清为 0，保证每版只处理一次；
+ * 2. 把 layer.cpus[] 字节位图转换为真正的 bpf_cpumask；
+ * 3. 更新每 CPU 的 non-Open owner / in_open_layers / protected 状态；
+ * 4. 重建每 node 的 layer mask，并在保护集合变化时推进 unprotected_seq；
+ * 5. 推进 layer.cpus_seq，让 task_ctx 的派生 mask 延迟失效；
+ * 6. 对已经没有 owner CPU、却仍有排队任务的 LLC 开启 drain；
+ * 7. kick 受影响 CPU，使新所有权尽快生效。
+ *
+ * 用户态先写 bitmap 和 nr_* 计数，最后置 refresh_cpus，因此这里是
+ * Rust 动态分配结果进入 BPF 热路径的提交点。
  */
 __weak s32 refresh_cpumasks(u32 layer_id)
 {
@@ -719,51 +720,83 @@ int refresh_node_ctx(struct refresh_node_ctx_arg *arg)
 }
 
 struct cached_cpus {
+	/* 子拓扑 ID：普通 layer mask 用 0，LLC/node mask 用对应 ID。 */
 	s64			id;
+	/* 生成该缓存时看到的 layer->cpus_seq 或 unprotected_seq。 */
 	u64			seq;
 };
 
+/*
+ * 每任务状态，存放在 BPF task storage `task_ctxs` 中，与 task_struct
+ * 同生命周期。它把“任务属于哪层”“可在哪些 CPU 上运行”“排在哪个
+ * DSQ”“最近运行特征”集中到一起，避免热路径重复做字符串匹配和
+ * cpumask 交集。
+ */
 struct task_ctx {
+	/* 调试用 TID 快照。 */
 	int			pid;
+	/* 上次真正开始运行的 CPU；用于迁移统计和 previous LLC/node。 */
 	int			last_cpu;
-	/* 当前任务所属的layer_id */
+	/* 当前任务所属 layer；MAX_LAYERS 表示尚未完成首次匹配。 */
 	u32			layer_id;
+	/* 上次跨层唤醒本任务的 waker TID，仅用于统计 repeated wakeup。 */
 	pid_t			last_waker;
-	/* 是否需要刷新layer */
+	/* true 时下一次 runnable 重新执行所有 layer 匹配。 */
 	bool			refresh_layer;
+	/* p->cpus_ptr ∩ 当前 layer cpumask 的缓存元数据和结果。 */
 	struct cached_cpus	layered_cpus;
 	/*
 	 * XXX: Old kernels can't track a bpf_cpumask on nested structs
 	 */
 	struct bpf_cpumask __kptr *layered_mask;
+	/* layered_mask ∩ 指定 LLC 的缓存。 */
 	struct cached_cpus	layered_cpus_llc;
 	struct bpf_cpumask __kptr *layered_llc_mask;
+	/* layered_mask ∩ 指定 NUMA node 的缓存。 */
 	struct cached_cpus	layered_cpus_node;
 	struct bpf_cpumask __kptr *layered_node_mask;
+	/* p->cpus_ptr ∩ (layered_mask ∪ unprotected_cpumask) 的缓存。 */
 	struct cached_cpus	layered_cpus_unprotected;
 	struct bpf_cpumask __kptr *layered_unprotected_mask;
+	/* affinity 是否覆盖整机 CPU；为真时可使用更快的全局拓扑 mask。 */
 	bool			all_cpus_allowed;
+	/* affinity 是否覆盖 layer 静态 cpuset；决定任务能否安全放入 layer DSQ。 */
 	bool			all_cpuset_cpus_allowed;
+	/* affinity 是否完整覆盖一个或多个 NUMA node。 */
 	bool			cpus_node_aligned;
+	/* affinity 仅落在单一 node 时的 node ID，否则 MAX_NUMA_NODES。 */
 	u32			pinned_node;
+	/* 最近一次进入 runnable 的时间。 */
 	u64			runnable_at;
+	/* 最近一次 layered_running() 的时间；stopping 用它计算本次 runtime。 */
 	u64			running_at;
-	/* runtime_avg 是“每个任务最近若干次连续运行片段长度”的指数移动平均值，不是进程总运行时间，也不是 CPU 利用率。 */
+	/*
+	 * 最近连续运行片段长度的 EWMA。它不是累计运行时间或利用率；
+	 * 用于 AvgRuntime matcher、LLC queued_runtime 和跨 LLC 门槛。
+	 */
 	u64			runtime_avg;
+	/* runnable/观测周期的 EWMA，1.0 = 1 << DUTY_CYCLE_SHIFT。 */
 	u64			duty_cycle;	/* EWMA, 1.0 = 1 << DUTY_CYCLE_SHIFT */
-	/* 上次 update duty_cycle 的时间 */
+	/* 上次 update_duty_cycle() 结算窗口的时间。 */
 	u64			last_stopped_at;
+	/* 当前/最近一次入队目标；可为 local、layer、hi/lo fallback DSQ。 */
 	u64			dsq_id;
+	/* 任务 vtime 当前所属 LLC；跨 LLC 时要平移到新 llc_ctx 时钟。 */
 	u32			llc_id;
 
-	/* for llcc->queue_runtime */
+	/* 本任务当前向哪个 (layer, LLC) queued_runtime 贡献 runtime_avg。 */
 	u32			qrt_layer_id;
 	u32			qrt_llc_id;
 
+	/* pthread_setname_np 编码的动态 CmdJoin 目标层名。 */
 	char 			join_layer[SCXCMD_COMLEN];
-	/* 用于记录layer的刷新序列 */
+	/* 最近消费的 AvgRuntime 全局刷新序号。 */
 	u64			layer_refresh_seq;
 
+	/*
+	 * 动态成员资格的过期时间或 MEMBER_* sentinel；到期后重新匹配
+	 * UsedGpuPid/UsedGpuTid 等规则。
+	 */
 	u64			recheck_layer_membership;
 };
 
@@ -1406,22 +1439,22 @@ s32 pick_idle_big_little(struct layer *layer, struct task_ctx *taskc,
 		return cpu;
 	}
 }
-/* pick_idle_cpu() 负责：
-
-检查 AvgRuntime 周期刷新序号；
-任务 affinity 与 layer mask 取交集；
-preempt-first；
-Confined/Grouped/Open 区分；
-protected/unprotected CPU；
-SMT idle core；
-big/little；
-previous LLC；
-跨 LLC 成本；
-本地 NUMA node；
-远端 NUMA node；
-xNUMA token 限制；
-层外 idle CPU；
-更新 check_no_idle。 */
+/*
+ * 为任务寻找并原子占用一个 idle CPU，找不到返回 -1。
+ *
+ * 大致顺序：
+ * 1. 刷新 task affinity ∩ layer mask 缓存，处理单 CPU affinity；
+ * 2. preempt_first 只留下“让 enqueue 抢 previous CPU”的一次性信号；
+ * 3. 对 check_no_idle 做廉价全局预检，避免饱和层重复深搜；
+ * 4. 按 placement/growth/SMT 策略依次尝试 big/little 和 previous LLC；
+ * 5. 多 NUMA 时先本 node layer CPU，再本地 unprotected CPU；
+ * 6. 按 node proximity 和 xNUMA token 搜远端 layer/open CPU；
+ * 7. 单 node 或受限 affinity 则使用 task 私有派生 mask；
+ * 8. 成功清 check_no_idle，完整失败且 affinity 不受限时置位。
+ *
+ * Confined 永不进入 open mask；Grouped/Open 是否能借用由
+ * idle_confined、fully_allocated、protected 和 affinity 共同决定。
+ */
 static __always_inline
 s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		  struct cpu_ctx *cpuc, struct task_ctx *taskc, struct layer *layer,
@@ -1556,6 +1589,11 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask, layer)) >= 0)
 			goto out;
 
+		/*
+		 * queued_runtime 是该 layer 在 previous LLC 的 runtime_avg
+		 * 估算总和。低于 xllc_mig_min_ns 时宁可等待本 LLC，也不为一个
+		 * 很短的队列迁移缓存工作集到其他 LLC。
+		 */
 		if (!(prev_llcc = lookup_llc_ctx(prev_cpuc->llc_id)) ||
 		    prev_llcc->queued_runtime[layer_id] < layer->xllc_mig_min_ns) {
 			lstat_inc(LSTAT_XLLC_MIGRATION_SKIP, layer, cpuc);
@@ -1717,6 +1755,11 @@ out:
 	return cpu;
 }
 
+/*
+ * 任务准备在新 CPU/LLC 上运行时，把 dsq_vtime 从旧 LLC 的时钟坐标
+ * 平移到新 LLC：保留任务相对 vtime_now 的差值，避免迁移造成凭空奖励
+ * 或惩罚。只改变 task_ctx.llc_id 和 p->scx.dsq_vtime。
+ */
 static __always_inline
 bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 new_cpu)
 {
@@ -1742,15 +1785,15 @@ bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 ne
 	return true;
 }
 
-/* 
-它的职责只有：
-
-应用最新的 layer CPU mask。
-检查 task hint 是否要求快速切层。
-获取任务当前 layer。
-Sticky 直接选择 previous CPU。
-其他策略调用 pick_idle_cpu()。
-找到 CPU 后直接插入该 CPU 的 local DSQ。 */
+/*
+ * sched_ext 的早期选核回调。
+ *
+ * 它先应用待提交的 layer mask，并处理高频 task hint 切层。首次尚未
+ * match 的任务直接返回 prev_cpu，真正归层在 runnable()。Sticky
+ * placement 保留 previous CPU；其他 placement 调 pick_idle_cpu()。
+ * 找到 idle CPU 时直接插入 local DSQ 并返回该 CPU；失败只返回
+ * prev_cpu，后续 enqueue() 仍会执行抢占或 layer DSQ 排队。
+ */
 s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct cpu_ctx *cpuc;
@@ -1798,6 +1841,14 @@ enum preempt_flags {
  * goes beyond the maximum number of supported arguments and __always_inline
  * causes verification fail with "invalid size of register spill". Lookup cpuc
  * before use and ignore extra enq_flags.
+ */
+/*
+ * 尝试把任务直接放入候选 CPU 的 local DSQ 并请求 SCX_ENQ_PREEMPT。
+ *
+ * 依次检查 affinity、已有 preempt 声明、当前任务是否也是 preempt、
+ * local DSQ 是否已有竞争者、owned protection 和 SMT-exclusive 冲突。
+ * CAS(preempting_task) 是多唤醒者竞争同一 CPU 的轻量仲裁；成功后任务
+ * 已入队，调用方必须立即返回 true。
  */
 static bool try_preempt_cpu(s32 cand, struct task_struct *p, struct task_ctx *taskc,
 			    struct layer *layer, u64 flags)
@@ -1952,6 +2003,18 @@ static void layer_kick_idle_node_cpu(struct layer *layer, u32 node_id)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
+/*
+ * 任务无法在 select_cpu() 完成直派时的主入队路径。
+ *
+ * 优先级顺序：
+ * 1. 消费 preempt_first 信号，尝试 previous CPU；
+ * 2. 若 select_cpu 被跳过或抢占失败，再搜索 idle CPU 直派；
+ * 3. preempt 层按 CPU proximity 扫描可抢占 CPU；
+ * 4. 关键 per-CPU kthread / scheduler 自身进入 high fallback；
+ * 5. 普通任务修正 LLC/vtime；affinity 不安全或空层进入 low fallback；
+ * 6. 其余进入 (layer_id, LLC) DSQ，按 fifo 或 vtime 排序，并给
+ *    llc_ctx.queued_runtime 计入 runtime_avg。
+ */
 void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx *cpuc, *task_cpuc;
@@ -2030,6 +2093,7 @@ do_ddsp:
 
 		lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
 		taskc->dsq_id = SCX_DSQ_LOCAL_ON | cpu;
+		/* slice_ns 是调度量子，不是硬运行上限；keep_running() 可续片。 */
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, 0);
 		return;
 	}
@@ -2302,6 +2366,11 @@ static inline void check_member_expired(struct task_ctx *taskc, u64 now)
 		taskc->refresh_layer = true;
 }
 
+/*
+ * 把 `used_at..now` 的 CPU 时间和可选 PMU 字节数记到任务所属层。
+ * running_owned 决定记 OWNED 还是 OPEN；保护窗口、pinned-node 和
+ * fallback 使用量在同一处累计，用户态下个 step 读取这些单调计数。
+ */
 static void account_used(struct task_struct *p, struct cpu_ctx *cpuc, struct task_ctx *taskc, u64 now)
 {
 	s32 task_lid;
@@ -2362,6 +2431,13 @@ static void account_used(struct task_struct *p, struct cpu_ctx *cpuc, struct tas
 		gstat_add(GSTAT_FB_CPU_USAGE, cpuc, used);
 }
 
+/*
+ * slice 到期后判断是否让同一任务继续占用 CPU。
+ *
+ * affinity/fallback/yield/hi-fallback 冲突会拒绝；连续续片受全局
+ * max_exec_ns 限制。preempt 层只有本层 DSQ 无等待任务时续跑；普通层
+ * 只有仍存在合适 idle CPU 时续跑，避免在系统繁忙时形成长独占。
+ */
 static bool keep_running(struct cpu_ctx *cpuc, struct task_struct *p,
 			 struct task_ctx *taskc, struct layer *layer)
 {
@@ -2625,6 +2701,13 @@ static bool try_drain_layer_node_llcs(struct layer *layer, struct cpu_ctx *cpuc)
 	return false;
 }
 
+/*
+ * 当前 CPU 尝试从指定 layer 的 DSQ 拉一个任务到 local DSQ。
+ *
+ * Confined 只允许 owner CPU 消费，rescue_stranded 是 per-node fallback
+ * 的显式例外。随后从当前 LLC 沿随机 proximity map 向外扫描；跨 LLC
+ * 受 skip_remote_node、xllc_mig_min_ns 和 xNUMA token gate 约束。
+ */
 static __always_inline bool try_consume_layer(u32 layer_id, struct cpu_ctx *cpuc,
 					      struct llc_ctx *llcc,
 					      bool rescue_stranded)
@@ -2678,6 +2761,7 @@ static __always_inline bool try_consume_layer(u32 layer_id, struct cpu_ctx *cpuc
 				continue;
 			}
 
+			/* 远端队列小于阈值时，不为少量工作支付跨 LLC 缓存代价。 */
 			if (remote_llcc->queued_runtime[layer_id] < layer->xllc_mig_min_ns) {
 				xllc_mig_skipped = true;
 				continue;
@@ -2768,6 +2852,23 @@ bool __always_inline sib_keep_idle(s32 cpu, struct task_struct *prev __arg_trust
 	return false;
 }
 
+/*
+ * CPU 需要工作时的 DSQ 拉取总控。
+ *
+ * 顺序大致是：
+ * 1. 应用 CPU mask 更新和 antistall；必要时让 exclusive sibling 保持 idle；
+ * 2. 若 prev 仍 runnable 且满足 keep_running()，给它续 slice；
+ * 3. 优先 high fallback，再由每 node fallback CPU rescue 空层任务；
+ * 4. low fallback 超过等待窗口后保证最低 CPU 份额；
+ * 5. Open CPU 根据 owned protection，在 op→on→gp→gn 或
+ *    op→gp→普通 open/grouped 的顺序拉取；
+ * 6. 有 owner 的 CPU 先考虑 grouped/open preempt，再 owner layer，
+ *    protected owner 会阻止继续拉其他层，最后尝试普通 grouped/open；
+ * 7. 都失败时补充 low fallback 或给 prev 恢复 slice。
+ *
+ * 这里决定“空闲 CPU 从哪个层取任务”；select_cpu/enqueue 则决定
+ * “新 runnable 任务主动去哪个 CPU/DSQ”。
+ */
 void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 {
 	struct task_ctx *prev_taskc = NULL;
@@ -3024,6 +3125,11 @@ void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
 	account_used(p, cpuc, taskc, now);
 }
 
+/*
+ * 执行一个原子 matcher。struct layer_match 是 tagged struct，kind 决定
+ * 读取 cgroup/comm/nice/UID/PID/GPU/runtime/hint/NUMA 中哪一组成员。
+ * exclude 的反转不在这里，而由 match_layer() 统一处理。
+ */
 static __noinline bool match_one(struct layer *layer, struct layer_match *match, struct task_ctx *taskc,
 				 struct task_struct *p, const char *cgrp_path)
 {
@@ -3032,6 +3138,10 @@ static __noinline bool match_one(struct layer *layer, struct layer_match *match,
 
 	switch (match->kind) {
 	case MATCH_CGROUP_PREFIX: {
+		/*
+		 * cgrp_path 由 format_cgrp_path() 生成：无前导 '/'，且总有
+		 * 结尾 '/'。这是字节前缀匹配，不是 cgroup inode/祖先判断。
+		 */
 		return match_str(match->cgroup_prefix, cgrp_path, STR_PREFIX);
 	}
 	case MATCH_CGROUP_SUFFIX: {
@@ -3261,6 +3371,13 @@ static __noinline bool match_one(struct layer *layer, struct layer_match *match,
 }
 
 __hidden
+/*
+ * 判断任务是否命中一个 layer：外层 OR、内层 AND。
+ *
+ * 任一 AND 组全部成功即返回 0；空 AND 组天然成功，因此最后一层
+ * matches=[[]] 是 catch-all。maybe_refresh_layer() 再按 layer ID 从小
+ * 到大调用本函数，所以整个配置是 first-match-wins。
+ */
 int match_layer(u32 layer_id, struct task_ctx *taskc,
 		struct task_struct *p __arg_trusted, const char *cgrp_path)
 {
@@ -3280,6 +3397,11 @@ int match_layer(u32 layer_id, struct task_ctx *taskc,
 
 	bpf_for(or_id, 0, nr_match_ors) {
 		struct layer_match_ands *ands;
+		/*
+		 * 空 AND 不进入下面循环，matched 保持 true；因此配置末层的
+		 * matches=[[]] 恒真。maybe_refresh_layer() 按 layer ID 递增，
+		 * 所以整个分类规则是 first-match-wins。
+		 */
 		bool matched = true;
 
 		barrier_var(or_id);
@@ -3332,7 +3454,14 @@ int match_layer(u32 layer_id, struct task_ctx *taskc,
 	return -ENOENT;
 }
 
-/* 切换到新的layer */
+/*
+ * 所有“切层”状态更新的集中提交点。
+ *
+ * 它维护旧/新层 task 数和 pinned-node 计数，更新 task_ctx.layer_id，
+ * 失效任务派生 mask，重算 affinity flags，并把任务 vtime 对齐到新层
+ * 当前 LLC 的 vtime_now。它不会搬动正在 DSQ 中的任务；调用时机选择
+ * 在 runnable/hint 路径以避免频繁队列重排。
+ */
 static void switch_to_layer(struct task_struct *p, struct task_ctx *taskc, u64 layer_id, u64 now)
 {
 	struct cpu_ctx *cpuc;
@@ -3675,7 +3804,11 @@ void on_wakeup(struct task_struct *p, struct task_ctx *taskc)
 	lstat_inc(LSTAT_XLAYER_WAKE, layer, cpuc);
 }
 
-/* 当task被加入到队列时，更新task的layer_id */
+/*
+ * 任务每次从非 runnable 进入 runnable 时记录时间，并在 refresh_layer
+ * 为 true 时完成重新分类。select_cpu 在该回调之前，首次任务可能尚未
+ * 分类；本次 enqueue 以及后续唤醒的 select_cpu 使用更新后的 layer_id。
+ */
 void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
@@ -3691,6 +3824,14 @@ void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 		on_wakeup(p, taskc);
 }
 
+/*
+ * 任务真正开始占用 CPU 时提交运行状态：
+ * - 从 queued_runtime 中撤销排队贡献；
+ * - 统计 CPU/LLC/NUMA 迁移并扣 xNUMA token；
+ * - 平移跨 LLC vtime，推进该 LLC 的 vtime_now；
+ * - 设置 CPU 的 preempt/exclusive/owned/open/protected 状态；
+ * - 应用非零 perf target，并记录 running_at。
+ */
 void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 {
 	struct task_struct *preempting;
@@ -3783,12 +3924,24 @@ void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 		}
 	}
 
+	/*
+	 * perf=0 的语义是“不发 hint”，并不会主动把 CPU 从另一个非零
+	 * layer 留下的 performance target 重置为 0。
+	 */
 	if (layer->perf > 0 && cpuc->perf != layer->perf) {
 		scx_bpf_cpuperf_set(task_cpu, layer->perf);
 		cpuc->perf = layer->perf;
 	}
 }
 
+/*
+ * 任务停止运行时结算本次执行：
+ * - 用 running_at 更新 runtime_avg 和 duty_cycle；
+ * - 把 CPU 时间/带宽计入 owned 或 open usage；
+ * - 根据 CPU 连续繁忙时长建立 owned/preempt protection；
+ * - 清理 current_preempt/exclusive/fallback 状态；
+ * - 应用 min_exec_ns 和 yield 计费，再按任务 p->scx.weight 推进 vtime。
+ */
 void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 {
 	struct cpu_ctx *cpuc;
@@ -3859,7 +4012,9 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 
 	/*
 	 * Apply min_exec_us, scale the execution time by the inverse of the
-	 * weight and charge.
+	 * task weight and charge. min_exec_ns only changes this vtime charge;
+	 * it neither delays preemption nor guarantees a minimum residency.
+	 * Note that this is p->scx.weight, not the JSON layer weight.
 	 */
 	if (runtime < task_layer->min_exec_ns) {
 		lstat_inc(LSTAT_MIN_EXEC, task_layer, cpuc);
@@ -3911,6 +4066,16 @@ void BPF_STRUCT_OPS(layered_set_weight, struct task_struct *p, u32 weight)
 		taskc->refresh_layer = true;
 }
 
+/*
+ * 从任务最新 cpus_ptr 派生 affinity 快速标志：
+ * - 是否允许整机 CPU；
+ * - 是否覆盖 layer 静态 cpuset；
+ * - 是否按完整 NUMA node 对齐；
+ * - 是否被固定到唯一 node。
+ *
+ * 这些标志决定能否安全进入 layer DSQ、能否使用全局拓扑 mask，以及
+ * 用户态 pinned demand 统计。set_cpumask 和 switch_to_layer 都会调用。
+ */
 static void refresh_cpus_flags(struct task_ctx *taskc,
 			       const struct cpumask *cpumask)
 {
@@ -4071,6 +4236,13 @@ void BPF_STRUCT_OPS(layered_cpu_release, s32 cpu,
 	scx_bpf_reenqueue_local();
 }
 
+/*
+ * 为新任务创建 task storage 和四组派生 cpumask。
+ *
+ * 初始 layer_id=MAX_LAYERS、refresh_layer=true，首次 runnable 时匹配；
+ * runtime_avg/duty_cycle 以全局 slice 的 1/4 启动，避免新任务在统计值
+ * 尚未收敛时出现 0 成本。若启用 PMU 带宽跟踪，也在此初始化任务 PMU。
+ */
 s32 BPF_STRUCT_OPS(layered_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {

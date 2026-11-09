@@ -46,6 +46,11 @@ __hidden char *format_cgrp_path(struct cgroup *cgrp)
 	char *path = bpf_map_lookup_elem(&cgrp_path_bufs, &zero);
 	u32 len = 0, level, max_level;
 
+	/*
+	 * 从 level 1 开始拼接，所以结果没有前导 '/'；末尾总补 '/'。
+	 * 例如 systemd service 得到 "system.slice/foo.service/"。因此
+	 * CgroupPrefix 配置是否带末尾 '/' 会影响是否误命中同名前缀。
+	 */
 	if (!path) {
 		scx_bpf_error("cgrp_path_buf lookup failed");
 		return NULL;

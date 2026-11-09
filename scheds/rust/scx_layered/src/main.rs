@@ -1451,67 +1451,40 @@ impl Stats {
     }
 }
 
-/* 这个结构不是任务调度热路径数据，而是用户态 CPU 资源分配器的状态。
-
-name
-
-层名称。
-用于日志、统计和调试。
-kind
-
-完整的 LayerKind 配置。
-用户态用它读取 util_range、cpus_range、membw_gb、公共配置等。
-growth_algo
-
-给 layer 增加或释放 CPU 时的拓扑顺序算法。
-与任务 placement 不同。
-core_order
-
-按 NUMA node 保存 core ID 分配顺序。
-外层索引是 node，内层是该 node 的 core 优先级。
-扩容按正向分配，缩容通常按反向释放。
-assigned_llcs
-
-每个 node 中已经完整分配给该层的 LLC。
-主要服务 StickyDynamic 等以 LLC 为单位的动态策略。
-nr_cpus
-
-当前层实际拥有的 CPU 总数。
-nr_llc_cpus
-
-每个 LLC 中，本层拥有多少 CPU。
-nr_node_cpus
-
-每个 NUMA node 中，本层拥有多少 CPU。
-cpus
-
-当前实际分配 CPU bitmap。
-最终同步到 BPF layer.cpus[]。
-allowed_cpus
-
-该层允许被分配的 CPU 范围。
-由配置中的 nodes、llcs、模板 cpuset 等限制得到。
-cpus 必须是它的子集。
-nr_pinned_cpus
-
-每个 node 中为 affinity/pinned 任务需求保留的 CPU 数。
-资源竞争时，先满足不能跨 node 移动的需求。*/
+/// 用户态某一层的动态 CPU 所有权状态。
+///
+/// 它不在每次任务调度的 BPF 热路径中；`Scheduler::step()` 默认每 100ms
+/// 更新这里，再通过 `update_bpf_layer_cpumask()` 把必要状态同步到
+/// BPF `struct layer`。
 #[derive(Debug)]
 struct Layer {
+    /// 配置层名，用于日志和 stats map key。
     name: String,
+    /// 完整策略配置；利用率水位、CPU 上下界、weight 等从这里读取。
     kind: LayerKind,
+    /// CPU 集合扩缩时的拓扑算法；与任务级 `placement` 不同。
     growth_algo: LayerGrowthAlgo,
+    /// `core_order[node_id]` 是该 node 中 core 的分配优先顺序；
+    /// 扩容正向取，普通缩容反向释放。
     core_order: Vec<Vec<usize>>,
 
+    /// StickyDynamic 专用：每个 node 已完整归属本层的 LLC ID。
     assigned_llcs: Vec<Vec<usize>>,
 
+    /// 当前 owned 逻辑 CPU 总数，必须等于 `cpus.weight()`。
     nr_cpus: usize,
+    /// 按 LLC 统计的 owned CPU 数；同步到 BPF 后决定空 LLC DSQ drain。
     nr_llc_cpus: Vec<usize>,
+    /// 按 NUMA node 统计的 owned CPU 数。
     nr_node_cpus: Vec<usize>,
+    /// 当前 owned CPU bitmap；同步到 BPF `layer.cpus[]`。
     cpus: Cpumask,
+    /// 此层允许拥有的 CPU 上限集合，由 nodes、llcs、模板 cpuset 取并集；
+    /// `cpus` 始终应为它的子集。
     allowed_cpus: Cpumask,
 
-    /// Per-node count of CPUs allocated for pinned demand.
+    /// 每个 node 中为 affinity-pinned 需求计入的 CPU 数；统一分配器先
+    /// 满足这部分，再放置可跨 node 的 unpinned 需求。
     nr_pinned_cpus: Vec<usize>,
 }
 
@@ -1569,7 +1542,13 @@ fn calc_peak_aware_target_range(
 }
 
 impl Layer {
-    /* 新建一个 layer */
+    /// 从静态 LayerSpec 创建用户态动态层。
+    ///
+    /// 1. 根据 nodes/llcs 构造 `allowed_cpus`；二者为空表示全机。
+    /// 2. 校验 Confined CPU 范围和 util_range。
+    /// 3. 保存预先生成的 core_order。
+    /// 4. 将实际 owned mask/count 初始化为 0，等待首轮
+    ///    `refresh_cpumasks()` 根据利用率分配。
     fn new(spec: &LayerSpec, topo: &Topology, core_order: &Vec<Vec<usize>>) -> Result<Self> {
         let name = &spec.name;
         let kind = spec.kind.clone();
@@ -1885,32 +1864,56 @@ impl GpuTaskAffinitizer {
     }
 }
 
+/// scx_layered 用户态控制平面的总状态。
+///
+/// BPF 负责每次任务事件；此结构负责持有 BPF 链接、读取统计、计算
+/// CPU 所有权、处理 cgroup regex/GPU/IRQ 等低频控制任务。
 struct Scheduler<'a> {
+    /// 已加载 BPF skeleton；通过它读写 rodata/bss/maps 并 test_run syscall 程序。
     skel: BpfSkel<'a>,
+    /// struct_ops attach link；保持 Some 即维持调度器注册，drop 后 detach。
     struct_ops: Option<libbpf_rs::Link>,
+    /// 拓扑归一化、模板展开后的层配置，索引就是 layer_id。
     layer_specs: Vec<LayerSpec>,
 
+    /// 用户态控制循环周期，即 `step()`/CPU 重分配周期。
     sched_intv: Duration,
+    /// AvgRuntime matcher 的全局强制重匹配序号更新时间；0 表示禁用。
     layer_refresh_intv: Duration,
 
+    /// 全局 owned CPU 池；保证同一 CPU 不被多个非 Open 层重复分配。
     cpu_pool: CpuPool,
+    /// 与 layer_specs 一一对应的用户态动态层状态。
     layers: Vec<Layer>,
+    /// 是否有层请求且内核支持 idle resume latency QoS。
     idle_qos_enabled: bool,
 
+    /// 读取 /proc 调度/进程数据的辅助对象。
     proc_reader: fb_procfs::ProcReader,
+    /// BPF 统计的当前值和上一周期快照，用于计算利用率/带宽增量。
     sched_stats: Stats,
+    /// 每层最近利用率峰值，用于 `util_peak_half_life_ms` 防止过快缩容。
     layer_peak_utils: Vec<f64>,
 
+    /// CgroupRegex ID 到正则；`run()` 启动 watcher 时 take 掉，Prefix 不使用它。
     cgroup_regexes: Option<HashMap<u32, Regex>>,
 
+    /// 每层在 stats 观测窗口内见过的最小/最大 CPU 数。
     nr_layer_cpus_ranges: Vec<(usize, usize)>,
+    /// 每层、每 node 当前是否允许作为跨 NUMA 迁移源，带滞回。
     xnuma_mig_src: Vec<Vec<bool>>,
+    /// 每层、每 node 是否想扩容却未获得 CPU；触发 xNUMA 的必要条件。
     growth_denied: Vec<Vec<bool>>,
+    /// 控制平面累计处理耗时，用于 stats 自身开销核算。
     processing_dur: Duration,
 
+    /// 已探测并可能扁平化/虚拟化后的 CPU/LLC/NUMA 拓扑。
     topo: Arc<Topology>,
+    /// 启用 IRQ balancing 时接管的网络设备及其原始 affinity。
     netdevs: BTreeMap<String, NetDev>,
+    /// 向 `scx_layered --monitor` 提供快照的 stats 服务。
     stats_server: StatsServer<StatsReq, StatsRes>,
+    /// 可选 NVIDIA GPU task NUMA affinity 控制器；与 layer match 分开。
     gpu_task_handler: GpuTaskAffinitizer,
 }
 
@@ -2034,6 +2037,11 @@ fn xnuma_compute_rates(duty_sums: &[f64], allocs: &[usize]) -> XnumaRates {
 }
 
 impl<'a> Scheduler<'a> {
+    /// 把启动时不变或低频变化的 LayerSpec 编码到 BPF `layers[]`。
+    ///
+    /// matches 被展开为固定 OR-of-AND 数组；LayerCommon 的微秒字段转为
+    /// 纳秒；kind/preempt/placement/growth 等 Rust enum 转为 C enum。
+    /// CPU 动态 mask 此时尚未分配，由后续 `refresh_cpumasks()` 写入。
     fn init_layers(
         skel: &mut OpenBpfSkel,
         specs: &[LayerSpec],
@@ -2047,7 +2055,15 @@ impl<'a> Scheduler<'a> {
         let mut cgroup_regex_id = 0;
         let mut cgroup_regexes = HashMap::new();
 
-        /* 遍历每一个 layer 的 spec */
+        /*
+         * 配置到 BPF 的边界：
+         *
+         * LayerSpec/LayerKind 是 serde 生成的用户态对象；这里把热路径
+         * 所需字段转换成固定大小的 BPF `layers[]`。`spec_i` 同时成为
+         * layer ID，所以 JSON 顺序既决定首次匹配优先级，也决定
+         * task_ctx.layer_id/DSQ ID。`comment` 只留在用户态配置中，不会
+         * 进入下面的 BPF 结构。
+         */
         for (spec_i, spec) in specs.iter().enumerate() {
             let layer = &mut skel.maps.bss_data.as_mut().unwrap().layers[spec_i];
 
@@ -2060,6 +2076,7 @@ impl<'a> Scheduler<'a> {
 
                     match and {
                         LayerMatch::CgroupPrefix(prefix) => {
+                            // BPF 用无前导 '/'、有结尾 '/' 的路径做纯字符串前缀匹配。
                             mt.kind = bpf_intf::layer_match_kind_MATCH_CGROUP_PREFIX as i32;
                             copy_into_cstr(&mut mt.cgroup_prefix, prefix.as_str());
                         }
@@ -2265,6 +2282,7 @@ case MATCH_AVG_RUNTIME:
                     ..
                 } = spec.kind.common();
 
+                // JSON 的时间单位是 us，BPF struct layer 统一存 ns。
                 layer.slice_ns = *slice_us * 1000;
                 layer.fifo.write(*fifo);
                 layer.min_exec_ns = min_exec_us * 1000;
@@ -2295,6 +2313,7 @@ case MATCH_AVG_RUNTIME:
                     v => v * 1000,
                 };
                 layer.xllc_mig_min_ns = (xllc_mig_min_us * 1000.0) as u64;
+                // weight 参与用户态 CPU 分配；虽然也镜像到 BPF，热路径不读取它。
                 layer_weights.push(layer.weight.try_into().unwrap());
                 layer.perf = u32::try_from(*perf)?;
 
@@ -2320,6 +2339,7 @@ case MATCH_AVG_RUNTIME:
             });
 
             layer.idle_confined.write(match spec.kind {
+                // 只有 Grouped 有此语义；Confined/Open 固定写 false。
                 LayerKind::Grouped { idle_confined, .. } => idle_confined,
                 _ => false,
             });
@@ -2340,6 +2360,12 @@ case MATCH_AVG_RUNTIME:
             perf_set |= layer.perf > 0;
         }
 
+        /*
+         * 这份按 weight 升序的 rodata 数组目前只有用户态写入；
+         * main.bpf.c 虽声明 layer_iteration_order，却没有读取点。因此它
+         * 当前不产生 BPF dispatch 优先级，实际 weight 效果来自
+         * unified_alloc() 的 CPU 供给竞争。
+         */
         layer_iteration_order.sort_by(|i, j| layer_weights[*i].cmp(&layer_weights[*j]));
         for (idx, layer_idx) in layer_iteration_order.iter().enumerate() {
             skel.maps
@@ -2723,7 +2749,16 @@ case MATCH_AVG_RUNTIME:
         Ok(())
     }
 
-    /*  */
+    /// 创建并 attach 一次完整调度器实例。
+    ///
+    /// 主要阶段：
+    /// 1. 探测/校验 topology，必要时清空配置中的 nodes/llcs；
+    /// 2. open BPF object，在 load 前写 rodata/bss 并选择可选程序；
+    /// 3. load 后填 hint map、PMU、用户态 Layer/CpuPool 和拓扑 map；
+    /// 4. 初始化 task/cpu/LLC/node 辅助状态；
+    /// 5. attach struct_ops，启动 stats、cgroup watcher 所需控制对象。
+    ///
+    /// CPU mask 不在 attach 前强制收敛；首轮用户态 step 会很快完成分配。
     fn init(
         opts: &'a Opts,
         layer_specs: &[LayerSpec],
@@ -3231,6 +3266,11 @@ case MATCH_AVG_RUNTIME:
         }
     }
 
+    /// 把用户态 Layer 的动态 CPU 所有权镜像到 BPF bss。
+    ///
+    /// 先写 serialized bitmap 和各拓扑计数，最后置 `refresh_cpus=1`。
+    /// BPF `refresh_cpumasks()` 消费该标志，更新 kptr cpumask、CPU owner、
+    /// drain 状态和 `cpus_seq`；任务看到新序号后才重建自己的缓存 mask。
     fn update_bpf_layer_cpumask(layer: &Layer, bpf_layer: &mut types::layer) {
         trace!("[{}] Updating BPF CPUs: {}", layer.name, &layer.cpus);
         Self::update_cpumask(&layer.cpus, &mut bpf_layer.cpus);
@@ -3452,112 +3492,19 @@ case MATCH_AVG_RUNTIME:
                         )
                     };
                     self.layer_peak_utils[idx] = peak_util;
-/* AvgRuntime 决定的是：
-
-
-任务属于哪个 layer
-calc_target_nr_cpus() 决定的是：
-
-
-这个 layer 应该拥有多少 CPU
-这是两个不同维度。
-
-为什么动态计算
-假设一个 Confined 层当前有 8 个 CPU，但只消耗 1 个 CPU 的工作量：
-
-继续占有 8 个 CPU 会浪费资源；
-应缩容，把 CPU 归还给其他层。
-反过来，如果只有 2 个 CPU，但有 6 个 CPU 的工作量：
-
-每 CPU 利用率过高；
-应扩容。
-公式：
-
-
-main.rs
-Ln 1517–1524
-
-fn calc_peak_aware_target_range(
-    util: f64,
-    peak_util: f64,
-    util_range: (f64, f64),
-) -> (usize, usize) {
-    let low = (util / util_range.1).ceil() as usize;
-    let high =
-        ((util.max(peak_util) / util_range.0).floor() as usize).max(low);
-    (low, high)
-}
-例如：
-
-
-util = 4.5 个 CPU 的工作量
-util_range = [0.8, 0.9]
-最低 CPU 数：
-
-
-low = ceil(4.5 / 0.9) = 5
-至少要 5 个 CPU，才能让平均每 CPU 利用率不超过 90%。
-
-最高 CPU 数：
-
-
-high = floor(4.5 / 0.8) = 5
-超过 5 个 CPU，平均利用率就会低于 80%。
-
-所以目标是 5。
-
-为什么得到的是 [low, high] 而不是一个值
-这是为了形成滞回区间，避免 CPU 数在边界附近不断抖动。
-
-
-main.rs
-Ln 3378–3405
-
-let (low, high) =
-    calc_peak_aware_target_range(util, peak_util, *util_range);
-let target = layer.cpus.weight().clamp(low, high);
-let target = target.clamp(cpus_range.0, cpus_range.1);
-let membw_target =
-    self.clamp_target_by_membw(layer, membw_limit, membw, target as u64);
-逻辑是：
-
-根据利用率得到允许范围 [low, high]。
-当前 CPU 数如果已经在范围内，保持不变。
-如果低于 low，扩到 low。
-如果高于 high，缩到 high。
-再应用配置的 cpus_range。
-再应用内存带宽限制。
-最后由统一分配器在 layer 之间分配实际 CPU。
-之后 refresh_cpumasks()：
-
-
-main.rs
-Ln 3775–3800
-
-let raw_targets = self.calc_target_nr_cpus();
-let targets: Vec<(usize, usize)> = raw_targets
-    .iter()
-    .enumerate()
-    .map(|(idx, &(target, min))| {
-        let cur = self.layers[idx].nr_cpus;
-        if target < cur {
-            let dampened = cur - (cur - target).div_ceil(2);
-            (dampened.max(min), min)
-        } else {
-            (target, min)
-        }
-    })
-    .collect();
-缩容还会每次只释放一部分 CPU，进一步减少抖动。
-
-对于当前 avgruntime.json：
-
-
-short/mid/long:
-    cpus_range = [5,5]
-所以无论利用率公式算出什么，最终目标都被夹到 5。这里 util_range 的动态伸缩作用实际上被固定 CPU 范围覆盖了。
-
-而 rest 没有 cpus_range，所以它会真正根据 [0.05, 0.60] 动态扩缩。 */
+                    /*
+                     * util 以“CPU 个数”为单位；util=4.5 近似表示 4.5 个
+                     * 逻辑 CPU 的工作量。
+                     *
+                     * low  = ceil(util / util_range.high)：至少需要多少 CPU
+                     * high = floor(util / util_range.low)：至多保留多少 CPU
+                     *
+                     * 当前 owned CPU 数夹在 [low, high] 内，因此落在水位
+                     * 区间时保持不变；随后再夹到 cpus_range。
+                     * `scx_layered-vllm.json` 中 vllm 的 [0.20, 0.80]
+                     * 是宽滞回区间，cpu_load 的 [0.80, 0.95] 则倾向把
+                     * 持续负载压紧。Open 层不走这条计算路径。
+                     */
                     let (low, high) = calc_peak_aware_target_range(util, peak_util, *util_range);
 
                     let membw_limit = match membw_gb {
@@ -3954,6 +3901,18 @@ short/mid/long:
         }
     }
 
+    /// 完成一次全局 CPU 所有权重平衡。
+    ///
+    /// 控制流：
+    /// 1. `calc_target_nr_cpus()` 由利用率水位得到每层独立需求；
+    /// 2. 缩容目标减半阻尼，避免 CPU mask 高频抖动；
+    /// 3. `calc_raw_demands()` 拆成 pinned/unpinned，`unified_alloc()`
+    ///    用 weight、node 容量和拓扑偏好解决全局供给冲突；
+    /// 4. 先按 node 缩容并归还 CpuPool，再按 growth order 扩容；
+    /// 5. 写 BPF layer mask/count，计算 idle_confined 的 fully_allocated；
+    /// 6. Open 层不占 CpuPool，直接观察“池中剩余 CPU ∩ allowed_cpus”；
+    /// 7. test_run BPF syscall 程序，把字节位图转为 bpf_cpumask；
+    /// 8. 更新 fallback CPU、IRQ affinity、idle QoS 等派生状态。
     fn refresh_cpumasks(&mut self) -> Result<()> {
         let layer_is_open = |layer: &Layer| matches!(layer.kind, LayerKind::Open { .. });
 
@@ -3980,7 +3939,8 @@ short/mid/long:
             })
             .collect();
 
-        // Build demands for unified_alloc and compute per-node allocations.
+        // 把“各层想要多少 CPU”交给统一分配器；供给不足时才由 layer
+        // weight 按比例裁决。之后 growth_algo 决定实际挑选哪些 core。
         let demands = self.calc_raw_demands(&targets);
         let nr_nodes = self.topo.nodes.len();
         let node_caps: Vec<usize> = self
@@ -4181,10 +4141,12 @@ short/mid/long:
             }
         }
 
-        // Tell BPF whether all CPUs are allocated.  When the system is
-        // fully allocated, idle_confined layers have nowhere to grow, so
-        // they should be allowed to use open (unprotected) idle CPUs from
-        // other layers.
+        // Tell BPF whether all CPUs are allocated. When true, idle_confined
+        // Grouped 层不再等待扩容，而可借用 unprotected idle CPU。
+        //
+        // 注意当前求和包含 Open 层；Open.nr_cpus 又表示 CPU pool 的剩余
+        // CPU。因此带 catch-all Open 的配置在首轮收敛后通常会使此值为
+        // true，idle_confined 在稳态下可能仍表现为普通 Grouped。
         let total_allocated: usize = self.layers.iter().map(|l| l.nr_cpus).sum();
         let fully_allocated = total_allocated >= total_cpus;
         for (idx, layer) in self.layers.iter().enumerate() {
@@ -4419,6 +4381,11 @@ short/mid/long:
         }
     }
 
+    /// 用户态控制循环的一次 tick（默认 100ms）。
+    ///
+    /// 先从 BPF/proc 读取增量统计，再更新 hint matcher 的 EWMA，随后依次
+    /// 重分配 CPU、更新跨 NUMA 迁移预算、idle QoS 和可选 GPU affinity。
+    /// BPF 每任务热路径不会调用此函数。
     fn step(&mut self) -> Result<()> {
         let started_at = Instant::now();
         self.sched_stats.refresh(
@@ -4707,6 +4674,11 @@ short/mid/long:
         Ok(())
     }
 
+    /// 用户态事件循环。
+    ///
+    /// 到 `sched_intv` 时执行 step；到 AvgRuntime 刷新周期时只递增 BPF
+    /// 序号，不主动遍历任务。其余时间同时处理 stats 请求和动态 cgroup
+    /// regex 事件，直到 Ctrl-C 或 BPF UEI 请求退出。
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
         let mut next_sched_at = Instant::now() + self.sched_intv;
@@ -4866,7 +4838,10 @@ struct HintLayerInfo {
     dsq_insert_below: Option<f64>,
 }
 
-/* 校验 layer 的限制 */
+/// 校验必须在进入 BPF 固定数组前满足的全局配置约束。
+///
+/// 包括层数、最后 `[[]]` catch-all、OR/AND 上限、字符串长度、hint
+/// 组合规则、CPU/util 范围，并建立 hint→layer 的快速索引。
 fn verify_layer_specs(specs: &[LayerSpec]) -> Result<HashMap<u64, HintLayerInfo>> {
     let mut hint_to_layer_map = HashMap::<u64, (usize, String, Option<f64>, Option<f64>)>::new();
 
@@ -5345,6 +5320,8 @@ fn main(opts: Opts) -> Result<()> {
         false => LayerConfig { specs: vec![] },
     };
 
+    // 每个位置参数可以是内联 JSON 或 file:/f: 文件；解析结果按出现顺序
+    // 追加。BPF 匹配是 first-match-wins，所以不能随意重排配置数组。
     for (idx, input) in opts.specs.iter().enumerate() {
         let specs = LayerSpec::parse(input)
             .context(format!("Failed to parse specs[{}] ({:?})", idx, input))?;
@@ -5389,10 +5366,12 @@ fn main(opts: Opts) -> Result<()> {
     for spec in layer_config.specs.iter_mut() {
         let common = spec.kind.common_mut();
 
+        // serde 的 0 在这里解释为“使用 CLI 默认值”，而非 0ns 时间片。
         if common.slice_us == 0 {
             common.slice_us = opts.slice_us;
         }
 
+        // 配置 weight=0 或省略时取 100；显式值最终限制在 [1, 10000]。
         if common.weight == 0 {
             common.weight = DEFAULT_LAYER_WEIGHT;
         }
